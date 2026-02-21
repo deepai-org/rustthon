@@ -29,6 +29,9 @@ ahash = "0.8"
 # For lazy statics
 once_cell = "1"
 
+[build-dependencies]
+cc = "1"
+
 [lib]
 name = "rustthon"
 crate-type = ["cdylib", "rlib"]

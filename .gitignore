@@ -1,1 +1,44 @@
+# Rust
 /target
+**/*.rs.bk
+
+# C build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.dylib
+*.so
+*.dll
+*.exe
+*.out
+*.dSYM/
+
+# Test binaries (compiled C tests)
+test_abi
+test_ext_driver
+test_gc_torture
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+._*
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

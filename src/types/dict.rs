@@ -60,6 +60,15 @@ const DKIX_EMPTY: isize = -1;
 const DKIX_DUMMY: isize = -2;
 const DK_LOG2_MIN: u8 = 3; // minimum index table size = 8
 
+/// Global dict version counter, bumped on every mutation.
+static mut DICT_VERSION_COUNTER: u64 = 0;
+
+#[inline]
+unsafe fn next_dict_version() -> u64 {
+    DICT_VERSION_COUNTER = DICT_VERSION_COUNTER.wrapping_add(1);
+    DICT_VERSION_COUNTER
+}
+
 // ─── Type object ───
 
 static mut DICT_TYPE: RawPyTypeObject = {
@@ -290,7 +299,7 @@ unsafe fn dict_resize(d: *mut PyDictObject, min_used: isize) {
 pub unsafe extern "C" fn PyDict_New() -> *mut RawPyObject {
     let obj = crate::object::gc::_PyObject_GC_New(&mut DICT_TYPE) as *mut PyDictObject;
     (*obj).ma_used = 0;
-    (*obj).ma_version_tag = 0;
+    (*obj).ma_version_tag = next_dict_version();
     (*obj).ma_keys = alloc_keys(DK_LOG2_MIN);
     (*obj).ma_values = ptr::null_mut();
     obj as *mut RawPyObject
@@ -353,6 +362,7 @@ pub unsafe extern "C" fn PyDict_SetItem(
         }
         (*d).ma_used += 1;
     }
+    (*d).ma_version_tag = next_dict_version();
     0
 }
 
@@ -429,6 +439,7 @@ pub unsafe extern "C" fn PyDict_DelItem(
     entry.me_value = ptr::null_mut();
     entry.me_hash = 0;
     (*d).ma_used -= 1;
+    (*d).ma_version_tag = next_dict_version();
     0
 }
 
@@ -568,6 +579,7 @@ pub unsafe extern "C" fn PyDict_Clear(dict: *mut RawPyObject) {
     }
     (*d).ma_keys = alloc_keys(DK_LOG2_MIN);
     (*d).ma_used = 0;
+    (*d).ma_version_tag = next_dict_version();
 }
 
 #[no_mangle]
