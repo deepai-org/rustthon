@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdio.h>
 
 typedef intptr_t Py_ssize_t;
 typedef struct _object PyObject;
@@ -77,13 +78,13 @@ extern int PyObject_TypeCheck(PyObject *o, void *tp);
  */
 
 static int parse_tuple_va(PyObject *args, const char *format, va_list va) {
-    if (!args || !format) return 0;
+    if (!args || !format) { return 0; }
 
     Py_ssize_t nargs = 0;
-    if (PyTuple_Check(args)) {
+    int is_tuple = PyTuple_Check(args);
+    if (is_tuple) {
         nargs = PyTuple_Size(args);
     }
-
     Py_ssize_t arg_idx = 0;
     int optional = 0;
     const char *p = format;

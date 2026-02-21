@@ -107,7 +107,7 @@ pub unsafe extern "C" fn PyList_New(size: isize) -> *mut RawPyObject {
         return ptr::null_mut();
     }
     // GC-tracked allocation
-    let obj = crate::object::gc::_PyObject_GC_New(&mut PyList_Type) as *mut PyListObject;
+    let obj = crate::object::gc::_PyObject_GC_New(list_type()) as *mut PyListObject;
     (*obj).ob_base.ob_size = size;
     if size > 0 {
         (*obj).ob_item = alloc_items(size as usize);

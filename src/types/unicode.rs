@@ -96,6 +96,7 @@ pub static mut PyUnicode_Type: RawPyTypeObject = {
     tp
 };
 
+/// Override pointer — set by sync_types_from_dylib() so the binary uses the
 pub unsafe fn unicode_type() -> *mut RawPyTypeObject {
     &mut PyUnicode_Type
 }

@@ -15,6 +15,46 @@ pub fn initialize() {
 
     // Create the main thread state
     thread_state::init_thread_state();
+
+    // Initialize module search paths
+    init_search_paths();
+}
+
+/// Set up module search paths from environment and common locations.
+fn init_search_paths() {
+    use crate::module::registry::add_search_path;
+
+    // PYTHONPATH environment variable
+    if let Ok(pythonpath) = std::env::var("PYTHONPATH") {
+        for p in pythonpath.split(':') {
+            if !p.is_empty() {
+                add_search_path(p.to_string());
+            }
+        }
+    }
+
+    // Homebrew Python 3.11 site-packages (macOS arm64)
+    let homebrew_paths = [
+        "/opt/homebrew/lib/python3.11/site-packages",
+        "/opt/homebrew/lib/python3.11/lib-dynload",
+    ];
+    for p in &homebrew_paths {
+        if std::path::Path::new(p).exists() {
+            add_search_path(p.to_string());
+        }
+    }
+
+    // Standard CPython 3.11 locations (system Python)
+    let system_paths = [
+        "/usr/local/lib/python3.11/site-packages",
+        "/usr/local/lib/python3.11/lib-dynload",
+        "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/site-packages",
+    ];
+    for p in &system_paths {
+        if std::path::Path::new(p).exists() {
+            add_search_path(p.to_string());
+        }
+    }
 }
 
 /// Finalize the interpreter.

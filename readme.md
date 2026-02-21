@@ -21,23 +21,52 @@ The interpreter successfully executes Python code with:
 | `if`/`elif`/`else` | Working |
 | `while` loops | Working |
 | `print()`, `len()`, `range()`, `type()`, `int()`, `str()` | Working |
+| `import` of native C extensions | Working |
 | REPL mode | Working |
+
+## Native Import
+
+Rustthon can import and call prebuilt C extensions directly from Python source code:
+
+```python
+import ujson
+print(ujson.encode({"hello": "world", "n": 42, "pi": 3.14}))
+# {"hello":"world","n":42,"pi":3.14}
+```
+
+The VM's `import` statement finds `.cpython-311-darwin.so` files on `PYTHONPATH`, loads them via `dlopen`, calls `PyInit_<module>`, and makes the resulting module object available for attribute access and function calls.
 
 ## C Extension Compatibility
 
-Rustthon loads and runs real-world C extensions from PyPI. This works in two modes:
+Rustthon loads and runs real-world C extensions from PyPI. This works in three modes:
 
 1. **Source compilation** — Extensions compiled against Rustthon's own `include/Python.h` header, linked to `librustthon.dylib`.
 2. **Prebuilt binary wheels** — Extensions compiled against real CPython 3.11 (pip wheels), loaded at runtime via `dlopen` with no recompilation.
+3. **Native import** — Prebuilt extensions loaded via Python's `import` statement from source code executed by the VM.
 
-| Extension | Self-Built | Prebuilt Wheel |
-|-----------|------------|----------------|
-| markupsafe 3.0.3 | 18/18 pass | 18/18 pass |
-| ujson 5.11.0 | 48/48 pass | 50/50 pass |
+| Extension | Type | Tests |
+|-----------|------|-------|
+| markupsafe 3.0.3 | Self-built | 18/18 pass |
+| ujson 5.11.0 | Self-built | 48/48 pass |
+| markupsafe 3.0.3 | Prebuilt wheel | 18/18 pass |
+| ujson 5.11.0 | Prebuilt wheel | 68/68 pass |
+| propcache (Cython) | Prebuilt wheel | 20/20 pass |
+| bcrypt (PyO3) | Prebuilt wheel | 10/10 pass |
+| ujson 5.11.0 | Native import | 9/9 pass |
 
 The prebuilt wheel tests use `.so` files extracted directly from pip wheels (`cp311-cp311-macosx_11_0_arm64`). These were compiled by their upstream projects against CPython 3.11 headers — Rustthon was not involved in their compilation.
 
-## CPython 3.11 ABI Compatibility
+## Architecture
+
+### Thin Binary Design
+
+The `rustthon` executable is a ~70-line C shim (`csrc/main.c`) that `dlopen`s `librustthon.dylib` and calls `rustthon_main()`. **All** interpreter logic — types, VM, compiler, GC, C API — lives in the dylib.
+
+This design is critical on macOS. When Rust compiles both a binary and cdylib from the same source, static globals (`PyFloat_Type`, `_Py_TrueStruct`, etc.) exist at **different addresses** in each image. C extensions resolve data symbols via `RTLD_DEFAULT`, which returns the binary's addresses, while API function calls go through the dylib. This causes inline type checks like `Py_TYPE(obj) == &PyFloat_Type` to fail silently.
+
+By making the binary a thin shim that immediately enters the dylib, there is exactly **one** copy of every global. No sync, no redirect, no split-brain.
+
+### CPython 3.11 ABI Compatibility
 
 250+ exported C API symbols. Every built-in type matches CPython 3.11 byte-for-byte in memory layout, verified by a C test suite that directly reads struct internals through pointer arithmetic.
 
@@ -87,22 +116,15 @@ How it works:
 | `PyArg_ParseTuple` | `s` `s#` `z` `y` `y#` `i` `l` `n` `f` `d` `O` `O!` `p` `S` `U` `\|` `:` `;` |
 | `Py_BuildValue` | `s` `s#` `y` `y#` `i` `l` `n` `f` `d` `O` `N` `()` `[]` `{}` |
 
-## Prebuilt Extension Loading (macOS)
-
-Loading prebuilt CPython extensions on macOS requires special handling due to the two-level namespace. The host process must load `librustthon.dylib` with `RTLD_GLOBAL | RTLD_LAZY` to force all exported symbols into the flat namespace. Without `RTLD_GLOBAL`, macOS isolates symbol namespaces and the prebuilt `.so` cannot resolve Rustthon's C API symbols.
-
-```c
-void *rt = dlopen("librustthon.dylib", RTLD_GLOBAL | RTLD_LAZY);
-Py_Initialize();
-void *ext = dlopen("ujson.cpython-311-darwin.so", RTLD_LAZY);
-```
-
 ## File Structure
 
 ```
+csrc/
+├── main.c              # Thin binary shim (dlopen librustthon.dylib → rustthon_main)
+└── varargs.c           # C implementations of variadic API functions
+
 src/
-├── lib.rs              # Crate root
-├── main.rs             # REPL + file execution entry point
+├── lib.rs              # Crate root + rustthon_main() entry point
 ├── object/
 │   ├── pyobject.rs     # RawPyObject, RawPyVarObject, PyGCHead, PyObjectWithData<T>
 │   ├── typeobj.rs      # RawPyTypeObject, PyType_Type, PyBaseObject_Type, PyType_Ready
@@ -141,9 +163,6 @@ src/
 └── module/
     └── registry.rs     # sys.modules equivalent
 
-csrc/
-└── varargs.c           # C implementations of variadic API functions
-
 include/
 └── Python.h            # CPython 3.11 compatible header for extension compilation
 
@@ -160,22 +179,27 @@ build.rs                # cc crate build script for varargs.c
 | `test_markupsafe.c` | 18 | Self-compiled markupsafe |
 | `test_ujson.c` | 48 | Self-compiled ujson |
 | `test_prebuilt.c` | 68 | Prebuilt pip wheel `.so` files |
-| **TOTAL** | **379** | |
+| `test_cython.c` | 20 | Cython-compiled extension |
+| `test_bcrypt.c` | 10 | PyO3 bcrypt extension |
+| **TOTAL** | **409** | |
 
-### Build & Run Tests
+All 8 suites run via `./run_tests.sh`.
+
+### Build & Run
 
 ```bash
+# Build the dylib
 cargo build --release
 
-# ABI + GC + protocol tests (link directly)
-cc -o test_abi tests/test_abi.c -L target/release -lrustthon -Wl,-rpath,target/release
-cc -o test_gc tests/test_gc_torture.c -L target/release -lrustthon -Wl,-rpath,target/release
-cc -o test_ext tests/test_ext_driver.c -L target/release -lrustthon -Wl,-rpath,target/release
+# Build the thin binary shim
+cc -o target/release/rustthon csrc/main.c -ldl
 
-# Self-compiled extension tests (link directly)
-cc -o test_markupsafe tests/test_markupsafe.c -L target/release -lrustthon -Wl,-rpath,target/release
-cc -o test_ujson tests/test_ujson.c -L target/release -lrustthon -Wl,-rpath,target/release
+# Run Python source
+PYTHONPATH=/path/to/extensions ./target/release/rustthon script.py
 
-# Prebuilt wheel tests (dlopen, no linking)
-cc -o test_prebuilt tests/test_prebuilt.c -ldl
+# Run the REPL
+./target/release/rustthon
+
+# Run all test suites
+./run_tests.sh
 ```

@@ -8,10 +8,23 @@ use crate::object::typeobj::{PyCFunction, PyMethodDef, RawPyTypeObject, METH_NOA
 use std::os::raw::{c_char, c_int};
 use std::ptr;
 
+/// tp_call for PyCFunction objects — enables call dispatch via type slot.
+unsafe extern "C" fn cfunction_tp_call(
+    func: *mut RawPyObject,
+    args: *mut RawPyObject,
+    kwargs: *mut RawPyObject,
+) -> *mut RawPyObject {
+    call_cfunction(func, args, kwargs)
+}
+
 static mut CFUNCTION_TYPE: RawPyTypeObject = {
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"builtin_function_or_method\0".as_ptr() as *const _;
     tp.tp_basicsize = 0;
+    // Set tp_call and tp_getattro in static initializer so BOTH binary
+    // and dylib copies have them (init_cfunction_type only runs in binary).
+    tp.tp_call = Some(cfunction_tp_call);
+    tp.tp_getattro = Some(cfunction_getattro);
     tp
 };
 
@@ -20,7 +33,8 @@ pub unsafe fn cfunction_type() -> *mut RawPyTypeObject {
 }
 
 pub unsafe fn init_cfunction_type() {
-    CFUNCTION_TYPE.tp_getattro = Some(cfunction_getattro);
+    // No-op — slots are now set in the static initializer.
+    // Kept for compatibility with init_types() call chain.
 }
 
 pub struct CFunctionData {
@@ -155,7 +169,6 @@ pub unsafe fn call_cfunction(
         meth(self_obj, ptr::null_mut())
     } else if flags & METH_O != 0 {
         // METH_O: func(self, arg)
-        // arg is the single positional argument
         if !args.is_null() && crate::types::tuple::PyTuple_Check(args) != 0 {
             let arg = crate::types::tuple::PyTuple_GetItem(args, 0);
             meth(self_obj, arg)

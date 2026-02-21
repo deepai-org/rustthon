@@ -298,7 +298,7 @@ unsafe fn dict_resize(d: *mut PyDictObject, min_used: isize) {
 
 #[no_mangle]
 pub unsafe extern "C" fn PyDict_New() -> *mut RawPyObject {
-    let obj = crate::object::gc::_PyObject_GC_New(&mut PyDict_Type) as *mut PyDictObject;
+    let obj = crate::object::gc::_PyObject_GC_New(dict_type()) as *mut PyDictObject;
     (*obj).ma_used = 0;
     (*obj).ma_version_tag = next_dict_version();
     (*obj).ma_keys = alloc_keys(DK_LOG2_MIN);

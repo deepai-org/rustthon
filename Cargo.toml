@@ -34,11 +34,14 @@ cc = "1"
 
 [lib]
 name = "rustthon"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
-[[bin]]
-name = "rustthon"
-path = "src/main.rs"
+# The binary is a thin shim that dlopen's librustthon.dylib.
+# It must NOT statically link the library (to avoid duplicate globals).
+# We build it separately via build.rs or a manual cc invocation.
+# [[bin]]
+# name = "rustthon"
+# path = "src/main.rs"
 
 [profile.release]
 lto = true

@@ -128,6 +128,9 @@ compile test_cython/test_cython.c  test_cython_bin    "-ldl"
 # Phase 5: PyO3 bcrypt
 compile test_bcrypt/test_bcrypt.c  test_bcrypt_bin    "-ldl"
 
+# Thin binary shim (for native import tests)
+compile csrc/main.c               rustthon_bin       "-ldl"
+
 printf "\n"
 
 # ── Step 2: Run all test suites ──

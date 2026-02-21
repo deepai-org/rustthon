@@ -60,7 +60,7 @@ unsafe extern "C" fn tuple_dealloc(obj: *mut RawPyObject) {
 pub unsafe extern "C" fn PyTuple_New(size: isize) -> *mut RawPyObject {
     if size < 0 { return ptr::null_mut(); }
     // GC-tracked var-size allocation: GC_HEAD + 24 + 8*size
-    let obj = crate::object::gc::_PyObject_GC_NewVar(&mut PyTuple_Type, size);
+    let obj = crate::object::gc::_PyObject_GC_NewVar(tuple_type(), size);
     obj as *mut RawPyObject
 }
 

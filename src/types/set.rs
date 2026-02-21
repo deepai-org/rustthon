@@ -250,7 +250,7 @@ unsafe extern "C" fn set_dealloc(obj: *mut RawPyObject) {
 
 #[no_mangle]
 pub unsafe extern "C" fn PySet_New(_iterable: *mut RawPyObject) -> *mut RawPyObject {
-    let obj = crate::object::gc::_PyObject_GC_New(&mut PySet_Type) as *mut PySetObject;
+    let obj = crate::object::gc::_PyObject_GC_New(set_type()) as *mut PySetObject;
     set_init(obj);
     obj as *mut RawPyObject
 }

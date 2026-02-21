@@ -124,7 +124,7 @@ static PyObject *call_int1(PyObject *func, long a) {
 
 int main(int argc, char *argv[]) {
     const char *rustthon_path = getenv("RUSTTHON_LIB");
-    if (!rustthon_path) rustthon_path = "target/debug/librustthon.dylib";
+    if (!rustthon_path) rustthon_path = "target/release/librustthon.dylib";
 
     const char *cython_so = getenv("CYTHON_SO");
     if (!cython_so) cython_so = "test_cython/hello.cpython-311-darwin.so";
