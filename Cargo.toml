@@ -1,0 +1,43 @@
+[package]
+name = "rustthon"
+version = "0.1.0"
+edition = "2021"
+description = "A CPython-extension compatible Python interpreter written in Rust"
+
+[dependencies]
+# Python parsing - don't reinvent the wheel
+rustpython-parser = "0.4"
+rustpython-ast = "0.4"
+
+# FFI and low-level
+libc = "0.2"
+
+# For the GIL emulation and thread safety
+parking_lot = "0.12"
+
+# For ordered dicts (Python 3.7+ guarantees insertion order)
+indexmap = "2"
+
+# For bigint support (Python ints are arbitrary precision)
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"
+
+# For hashing
+ahash = "0.8"
+
+# For lazy statics
+once_cell = "1"
+
+[lib]
+name = "rustthon"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "rustthon"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
