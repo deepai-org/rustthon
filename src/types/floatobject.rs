@@ -21,7 +21,8 @@ pub struct PyFloatObject {
 // Static size assertion
 const _: () = assert!(std::mem::size_of::<PyFloatObject>() == 24);
 
-static mut FLOAT_TYPE: RawPyTypeObject = {
+#[no_mangle]
+pub static mut PyFloat_Type: RawPyTypeObject = {
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"float\0".as_ptr() as *const _;
     tp.tp_basicsize = 24; // size_of::<PyFloatObject>()
@@ -29,7 +30,7 @@ static mut FLOAT_TYPE: RawPyTypeObject = {
 };
 
 pub unsafe fn float_type() -> *mut RawPyTypeObject {
-    &mut FLOAT_TYPE
+    &mut PyFloat_Type
 }
 
 /// Extract the f64 value from a float object.
@@ -74,10 +75,6 @@ pub unsafe extern "C" fn PyFloat_Check(obj: *mut RawPyObject) -> c_int {
     if (*obj).ob_type == float_type() { 1 } else { 0 }
 }
 
-#[no_mangle]
-pub static mut PyFloat_Type: *mut RawPyTypeObject = std::ptr::null_mut();
-
 pub unsafe fn init_float_type() {
-    FLOAT_TYPE.tp_dealloc = Some(float_dealloc);
-    PyFloat_Type = float_type();
+    PyFloat_Type.tp_dealloc = Some(float_dealloc);
 }

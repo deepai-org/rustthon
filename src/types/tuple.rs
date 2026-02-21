@@ -29,7 +29,8 @@ unsafe fn ob_item(obj: *mut PyTupleObject) -> *mut *mut RawPyObject {
     (obj as *mut u8).add(TUPLE_HEADER_SIZE) as *mut *mut RawPyObject
 }
 
-static mut TUPLE_TYPE: RawPyTypeObject = {
+#[no_mangle]
+pub static mut PyTuple_Type: RawPyTypeObject = {
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"tuple\0".as_ptr() as *const _;
     tp.tp_basicsize = TUPLE_HEADER_SIZE as isize; // 24
@@ -38,7 +39,7 @@ static mut TUPLE_TYPE: RawPyTypeObject = {
 };
 
 pub unsafe fn tuple_type() -> *mut RawPyTypeObject {
-    &mut TUPLE_TYPE
+    &mut PyTuple_Type
 }
 
 unsafe extern "C" fn tuple_dealloc(obj: *mut RawPyObject) {
@@ -59,7 +60,7 @@ unsafe extern "C" fn tuple_dealloc(obj: *mut RawPyObject) {
 pub unsafe extern "C" fn PyTuple_New(size: isize) -> *mut RawPyObject {
     if size < 0 { return ptr::null_mut(); }
     // GC-tracked var-size allocation: GC_HEAD + 24 + 8*size
-    let obj = crate::object::gc::_PyObject_GC_NewVar(&mut TUPLE_TYPE, size);
+    let obj = crate::object::gc::_PyObject_GC_NewVar(&mut PyTuple_Type, size);
     obj as *mut RawPyObject
 }
 
@@ -146,11 +147,7 @@ pub unsafe extern "C" fn PyTuple_Check(obj: *mut RawPyObject) -> c_int {
     if (*obj).ob_type == tuple_type() { 1 } else { 0 }
 }
 
-#[no_mangle]
-pub static mut PyTuple_Type: *mut RawPyTypeObject = ptr::null_mut();
-
 pub unsafe fn init_tuple_type() {
-    TUPLE_TYPE.tp_dealloc = Some(tuple_dealloc);
-    TUPLE_TYPE.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_TUPLE_SUBCLASS | PY_TPFLAGS_HAVE_GC;
-    PyTuple_Type = tuple_type();
+    PyTuple_Type.tp_dealloc = Some(tuple_dealloc);
+    PyTuple_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_TUPLE_SUBCLASS | PY_TPFLAGS_HAVE_GC;
 }

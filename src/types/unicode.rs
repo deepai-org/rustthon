@@ -87,7 +87,8 @@ fn state_is_ascii(state: u32) -> bool {
 
 // ─── Type object ───
 
-static mut UNICODE_TYPE: RawPyTypeObject = {
+#[no_mangle]
+pub static mut PyUnicode_Type: RawPyTypeObject = {
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"str\0".as_ptr() as *const _;
     tp.tp_basicsize = ASCII_HEADER as isize;
@@ -96,7 +97,7 @@ static mut UNICODE_TYPE: RawPyTypeObject = {
 };
 
 pub unsafe fn unicode_type() -> *mut RawPyTypeObject {
-    &mut UNICODE_TYPE
+    &mut PyUnicode_Type
 }
 
 unsafe extern "C" fn unicode_dealloc(obj: *mut RawPyObject) {
@@ -549,11 +550,15 @@ pub unsafe extern "C" fn PyUnicode_DecodeUTF8(
     create_unicode(&string)
 }
 
+/// _PyUnicode_Ready — ensure a unicode object is in canonical form.
+/// In CPython 3.11 this is mostly a no-op (all new strings are "ready").
+/// Prebuilt extensions still reference this symbol.
 #[no_mangle]
-pub static mut PyUnicode_Type: *mut RawPyTypeObject = ptr::null_mut();
+pub unsafe extern "C" fn _PyUnicode_Ready(_obj: *mut RawPyObject) -> std::os::raw::c_int {
+    0 // Already ready — all our strings are created in canonical PEP 393 form
+}
 
 pub unsafe fn init_unicode_type() {
-    UNICODE_TYPE.tp_dealloc = Some(unicode_dealloc);
-    UNICODE_TYPE.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_UNICODE_SUBCLASS;
-    PyUnicode_Type = unicode_type();
+    PyUnicode_Type.tp_dealloc = Some(unicode_dealloc);
+    PyUnicode_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_UNICODE_SUBCLASS;
 }

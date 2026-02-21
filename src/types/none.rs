@@ -12,6 +12,10 @@ static mut NONE_TYPE: RawPyTypeObject = {
     tp
 };
 
+pub unsafe fn none_type() -> *mut RawPyTypeObject {
+    &mut NONE_TYPE
+}
+
 #[no_mangle]
 pub static mut _Py_NoneStruct: RawPyObject = RawPyObject {
     ob_refcnt: AtomicIsize::new(1),

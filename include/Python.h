@@ -5,6 +5,10 @@
  * C extensions to compile against librustthon.dylib.
  *
  * All struct layouts match CPython 3.11 byte-for-byte, verified by 196 C tests.
+ *
+ * This header works for BOTH:
+ *   1. Extensions compiled against Rustthon (uses _Rustthon_Exc_* functions via macros)
+ *   2. Prebuilt extensions compiled against CPython 3.11 (uses DATA symbols directly)
  */
 
 #ifndef Py_PYTHON_H
@@ -60,13 +64,126 @@ typedef struct {
     { { 1, (PyTypeObject*)(type) }, (size) }
 
 /* ═══════════════════════════════════════════════════════
- *  Forward declaration of struct _typeobject (enough for tp_name access)
+ *  Function pointer typedefs (for PyTypeObject)
  * ═══════════════════════════════════════════════════════ */
 
+typedef void (*destructor)(PyObject *);
+typedef PyObject *(*getattrfunc)(PyObject *, char *);
+typedef int (*setattrfunc)(PyObject *, char *, PyObject *);
+typedef PyObject *(*reprfunc)(PyObject *);
+typedef Py_hash_t (*hashfunc)(PyObject *);
+typedef PyObject *(*ternaryfunc)(PyObject *, PyObject *, PyObject *);
+typedef PyObject *(*binaryfunc)(PyObject *, PyObject *);
+typedef PyObject *(*unaryfunc)(PyObject *);
+typedef int (*inquiry)(PyObject *);
+typedef Py_ssize_t (*lenfunc)(PyObject *);
+typedef PyObject *(*ssizeargfunc)(PyObject *, Py_ssize_t);
+typedef int (*ssizeobjargproc)(PyObject *, Py_ssize_t, PyObject *);
+typedef int (*objobjargproc)(PyObject *, PyObject *, PyObject *);
+typedef int (*objobjproc)(PyObject *, PyObject *);
+typedef PyObject *(*getiterfunc)(PyObject *);
+typedef PyObject *(*iternextfunc)(PyObject *);
+typedef int (*visitproc)(PyObject *, void *);
+typedef int (*traverseproc)(PyObject *, visitproc, void *);
+typedef int (*initproc)(PyObject *, PyObject *, PyObject *);
+typedef PyObject *(*allocfunc)(PyTypeObject *, Py_ssize_t);
+typedef PyObject *(*newfunc)(PyTypeObject *, PyObject *, PyObject *);
+typedef void (*freefunc)(void *);
+typedef PyObject *(*richcmpfunc)(PyObject *, PyObject *, int);
+typedef int (*getbufferproc)(PyObject *, void *, int);
+typedef void (*releasebufferproc)(PyObject *, void *);
+
+/* Method suite structs (forward declarations) */
+typedef struct PyNumberMethods PyNumberMethods;
+typedef struct PySequenceMethods PySequenceMethods;
+typedef struct PyMappingMethods PyMappingMethods;
+typedef struct PyBufferProcs PyBufferProcs;
+
+/* ═══════════════════════════════════════════════════════
+ *  Full PyTypeObject (struct _typeobject) — matches CPython 3.11
+ *  This is the actual struct, not a forward declaration.
+ * ═══════════════════════════════════════════════════════ */
+
+typedef struct PyMethodDef PyMethodDef;
+typedef struct PyMemberDef PyMemberDef;
+typedef struct PyGetSetDef PyGetSetDef;
+
 struct _typeobject {
-    PyVarObject ob_base;
+    /* PyVarObject header */
+    PyObject ob_base;
+    Py_ssize_t ob_size;
+
+    /* Type info */
     const char *tp_name;
-    /* ... remaining fields not needed by most extensions */
+    Py_ssize_t tp_basicsize;
+    Py_ssize_t tp_itemsize;
+
+    /* Standard methods */
+    destructor tp_dealloc;
+    Py_ssize_t tp_vectorcall_offset;
+    getattrfunc tp_getattr;
+    setattrfunc tp_setattr;
+    void *tp_as_async;              /* PyAsyncMethods* */
+    reprfunc tp_repr;
+
+    /* Method suites */
+    PyNumberMethods *tp_as_number;
+    PySequenceMethods *tp_as_sequence;
+    PyMappingMethods *tp_as_mapping;
+
+    /* More standard ops */
+    hashfunc tp_hash;
+    ternaryfunc tp_call;
+    reprfunc tp_str;
+    binaryfunc tp_getattro;
+    objobjargproc tp_setattro;
+
+    /* Buffer protocol */
+    PyBufferProcs *tp_as_buffer;
+
+    /* Flags */
+    unsigned long tp_flags;
+
+    /* Documentation */
+    const char *tp_doc;
+
+    /* GC traversal */
+    traverseproc tp_traverse;
+    inquiry tp_clear;
+
+    /* Rich comparison */
+    richcmpfunc tp_richcompare;
+
+    /* Weak reference support */
+    Py_ssize_t tp_weaklistoffset;
+
+    /* Iterators */
+    getiterfunc tp_iter;
+    iternextfunc tp_iternext;
+
+    /* Attribute descriptor / subclassing */
+    PyMethodDef *tp_methods;
+    PyMemberDef *tp_members;
+    PyGetSetDef *tp_getset;
+    PyTypeObject *tp_base;
+    PyObject *tp_dict;
+    ternaryfunc tp_descr_get;
+    objobjargproc tp_descr_set;
+    Py_ssize_t tp_dictoffset;
+    initproc tp_init;
+    allocfunc tp_alloc;
+    newfunc tp_new;
+    freefunc tp_free;
+    inquiry tp_is_gc;
+    PyObject *tp_bases;
+    PyObject *tp_mro;
+    PyObject *tp_cache;
+    PyObject *tp_subclasses;
+    PyObject *tp_weaklist;
+    destructor tp_del;
+    unsigned int tp_version_tag;
+    destructor tp_finalize;
+    void *tp_vectorcall;
 };
 
 /* ═══════════════════════════════════════════════════════
@@ -97,32 +214,42 @@ extern void Py_DecRef(PyObject *op);
  *  None singleton
  * ═══════════════════════════════════════════════════════ */
 
-extern PyObject *_Py_None(void);
-#define Py_None         (_Py_None())
+extern PyObject _Py_NoneStruct;
+#define Py_None         (&_Py_NoneStruct)
 #define Py_RETURN_NONE  do { Py_INCREF(Py_None); return Py_None; } while (0)
 
+/* Function accessor (backward compat for Rustthon-compiled extensions) */
+extern PyObject *_Py_None(void);
+
 /* ═══════════════════════════════════════════════════════
- *  Bool singletons
+ *  Bool singletons — actual static structs
  * ═══════════════════════════════════════════════════════ */
 
-extern PyObject *_Py_True(void);
-extern PyObject *_Py_False(void);
-#define Py_True         (_Py_True())
-#define Py_False        (_Py_False())
+struct _longobject {
+    PyVarObject ob_base;
+    uint32_t ob_digit[1];
+};
+
+extern struct _longobject _Py_TrueStruct;
+extern struct _longobject _Py_FalseStruct;
+#define Py_True         ((PyObject *)&_Py_TrueStruct)
+#define Py_False        ((PyObject *)&_Py_FalseStruct)
 #define Py_RETURN_TRUE  do { Py_INCREF(Py_True); return Py_True; } while (0)
 #define Py_RETURN_FALSE do { Py_INCREF(Py_False); return Py_False; } while (0)
 
+/* Function accessors (backward compat) */
+extern PyObject *_Py_True(void);
+extern PyObject *_Py_False(void);
+
 extern PyObject *PyBool_FromLong(long v);
 extern int PyBool_Check(PyObject *obj);
+extern PyTypeObject PyBool_Type;
 
 /* ═══════════════════════════════════════════════════════
  *  Long (int)
  * ═══════════════════════════════════════════════════════ */
 
-typedef struct {
-    PyVarObject ob_base;
-    uint32_t ob_digit[1];
-} PyLongObject;
+typedef struct _longobject PyLongObject;
 
 extern PyObject *PyLong_FromLong(long v);
 extern PyObject *PyLong_FromLongLong(long long v);
@@ -203,11 +330,7 @@ typedef PyCompactUnicodeObject PyUnicodeObject;
 /* PyUnicode_READY is a no-op for compact strings (always ready). Returns 0 on success. */
 #define PyUnicode_READY(op)     0
 
-/* Data access macros — the core of PEP 393.
- * For compact strings, data is inline after the struct header:
- *   ASCII compact:     data at offset 48 (sizeof(PyASCIIObject))
- *   Non-ASCII compact: data at offset 72 (sizeof(PyCompactUnicodeObject))
- */
+/* Data access macros — the core of PEP 393. */
 #define _PyUnicode_COMPACT_DATA(op) \
     (PyUnicode_IS_ASCII(op) \
      ? (void*)((PyASCIIObject*)(op) + 1) \
@@ -252,6 +375,7 @@ extern PyObject *PyUnicode_Join(PyObject *sep, PyObject *seq);
 extern int PyUnicode_CompareWithASCIIString(PyObject *obj, const char *string);
 extern void PyUnicode_InternInPlace(PyObject **p);
 extern PyObject *PyUnicode_InternFromString(const char *s);
+extern int _PyUnicode_Ready(PyObject *op);
 extern PyTypeObject PyUnicode_Type;
 
 /* ═══════════════════════════════════════════════════════
@@ -409,6 +533,8 @@ extern PyObject *PyObject_CallMethod(PyObject *obj, const char *name, const char
 extern PyObject *PyObject_CallFunctionObjArgs(PyObject *callable, ...);
 extern int PyObject_IsInstance(PyObject *inst, PyObject *cls);
 extern int PyIter_Check(PyObject *obj);
+extern PyObject *PyObject_GenericGetAttr(PyObject *obj, PyObject *name);
+extern int PyObject_GenericSetAttr(PyObject *obj, PyObject *name, PyObject *value);
 
 /* Rich comparison constants */
 #define Py_LT   0
@@ -425,12 +551,12 @@ extern int PyIter_Check(PyObject *obj);
 typedef PyObject *(*PyCFunction)(PyObject *, PyObject *);
 typedef PyObject *(*PyCFunctionWithKeywords)(PyObject *, PyObject *, PyObject *);
 
-typedef struct {
+struct PyMethodDef {
     const char *ml_name;
     PyCFunction ml_meth;
     int ml_flags;
     const char *ml_doc;
-} PyMethodDef;
+};
 
 /* Method flags */
 #define METH_VARARGS    0x0001
@@ -440,6 +566,7 @@ typedef struct {
 
 /* Type flags */
 #define Py_TPFLAGS_DEFAULT              (1UL << 0)
+#define Py_TPFLAGS_READY                (1UL << 12)
 #define Py_TPFLAGS_HAVE_GC             (1UL << 14)
 #define Py_TPFLAGS_LONG_SUBCLASS       (1UL << 24)
 #define Py_TPFLAGS_LIST_SUBCLASS       (1UL << 25)
@@ -447,18 +574,21 @@ typedef struct {
 #define Py_TPFLAGS_BYTES_SUBCLASS      (1UL << 27)
 #define Py_TPFLAGS_UNICODE_SUBCLASS    (1UL << 28)
 #define Py_TPFLAGS_DICT_SUBCLASS       (1UL << 29)
+#define Py_TPFLAGS_BASETYPE            (1UL << 10)
+#define Py_TPFLAGS_HAVE_VECTORCALL     (1UL << 11)
 
 extern int PyType_IsSubtype(PyTypeObject *a, PyTypeObject *b);
 extern int PyType_Ready(PyTypeObject *tp);
 extern PyObject *PyType_GenericNew(PyTypeObject *tp, PyObject *args, PyObject *kwargs);
 extern PyObject *PyType_GenericAlloc(PyTypeObject *tp, Py_ssize_t nitems);
 
+/* Metaclass and base type */
+extern PyTypeObject PyType_Type;
+extern PyTypeObject PyBaseObject_Type;
+
 /* ═══════════════════════════════════════════════════════
  *  Module definition
  * ═══════════════════════════════════════════════════════ */
-
-/* GC traversal callback type (needed by module_traverse) */
-typedef int (*visitproc)(PyObject *, void *);
 
 typedef struct {
     PyObject ob_base;
@@ -523,15 +653,38 @@ extern void PyErr_Restore(PyObject *type, PyObject *value, PyObject *traceback);
 extern void PyErr_NormalizeException(PyObject **type, PyObject **value, PyObject **traceback);
 extern void PyErr_SetNone(PyObject *type);
 extern int PyErr_ExceptionMatches(PyObject *exc);
+extern int PyErr_GivenExceptionMatches(PyObject *err, PyObject *exc);
 extern PyObject *PyErr_Format(PyObject *type, const char *format, ...);
 extern int PyErr_BadArgument(void);
 extern PyObject *PyErr_NoMemory(void);
 extern PyObject *PyErr_NewException(const char *name, PyObject *base, PyObject *dict);
 
-/* Exception type singletons.
- * In CPython these are global PyObject* variables. We implement them as
- * function calls that return stable sentinel pointers, then use macros
- * to make "PyExc_TypeError" etc. work transparently. */
+/* Exception type singletons — DATA symbols (PyObject* pointers).
+ * Prebuilt extensions reference these as: extern PyObject *PyExc_TypeError;
+ * Rustthon-compiled extensions can also use the _Rustthon_Exc_* functions via macros. */
+
+extern PyObject *PyExc_BaseException;
+extern PyObject *PyExc_Exception;
+extern PyObject *PyExc_TypeError;
+extern PyObject *PyExc_ValueError;
+extern PyObject *PyExc_OverflowError;
+extern PyObject *PyExc_RuntimeError;
+extern PyObject *PyExc_KeyError;
+extern PyObject *PyExc_IndexError;
+extern PyObject *PyExc_AttributeError;
+extern PyObject *PyExc_StopIteration;
+extern PyObject *PyExc_MemoryError;
+extern PyObject *PyExc_SystemError;
+extern PyObject *PyExc_OSError;
+extern PyObject *PyExc_IOError;
+extern PyObject *PyExc_NotImplementedError;
+extern PyObject *PyExc_UnicodeDecodeError;
+extern PyObject *PyExc_UnicodeEncodeError;
+extern PyObject *PyExc_UnicodeError;
+extern PyObject *PyExc_LookupError;
+extern PyObject *PyExc_ArithmeticError;
+
+/* Backward-compat function accessors for Rustthon-compiled extensions */
 extern PyObject *_Rustthon_Exc_TypeError(void);
 extern PyObject *_Rustthon_Exc_ValueError(void);
 extern PyObject *_Rustthon_Exc_OverflowError(void);
@@ -542,15 +695,12 @@ extern PyObject *_Rustthon_Exc_AttributeError(void);
 extern PyObject *_Rustthon_Exc_StopIteration(void);
 extern PyObject *_Rustthon_Exc_MemoryError(void);
 
-#define PyExc_TypeError         (_Rustthon_Exc_TypeError())
-#define PyExc_ValueError        (_Rustthon_Exc_ValueError())
-#define PyExc_OverflowError     (_Rustthon_Exc_OverflowError())
-#define PyExc_RuntimeError      (_Rustthon_Exc_RuntimeError())
-#define PyExc_KeyError          (_Rustthon_Exc_KeyError())
-#define PyExc_IndexError        (_Rustthon_Exc_IndexError())
-#define PyExc_AttributeError    (_Rustthon_Exc_AttributeError())
-#define PyExc_StopIteration     (_Rustthon_Exc_StopIteration())
-#define PyExc_MemoryError       (_Rustthon_Exc_MemoryError())
+/* ═══════════════════════════════════════════════════════
+ *  Recursion guard (stubs — prevent extensions from crashing)
+ * ═══════════════════════════════════════════════════════ */
+
+#define Py_EnterRecursiveCall(where) (0)
+#define Py_LeaveRecursiveCall()      do {} while (0)
 
 /* ═══════════════════════════════════════════════════════
  *  Memory management

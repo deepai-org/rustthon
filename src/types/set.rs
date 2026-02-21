@@ -47,7 +47,8 @@ const _: () = assert!(std::mem::size_of::<PySetObject>() == 200);
 
 // ─── Type object ───
 
-static mut SET_TYPE: RawPyTypeObject = {
+#[no_mangle]
+pub static mut PySet_Type: RawPyTypeObject = {
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"set\0".as_ptr() as *const _;
     tp.tp_basicsize = 200; // sizeof(PySetObject)
@@ -56,7 +57,7 @@ static mut SET_TYPE: RawPyTypeObject = {
 };
 
 pub unsafe fn set_type() -> *mut RawPyTypeObject {
-    &mut SET_TYPE
+    &mut PySet_Type
 }
 
 // ─── Hashing and equality (reuse dict's) ───
@@ -249,7 +250,7 @@ unsafe extern "C" fn set_dealloc(obj: *mut RawPyObject) {
 
 #[no_mangle]
 pub unsafe extern "C" fn PySet_New(_iterable: *mut RawPyObject) -> *mut RawPyObject {
-    let obj = crate::object::gc::_PyObject_GC_New(&mut SET_TYPE) as *mut PySetObject;
+    let obj = crate::object::gc::_PyObject_GC_New(&mut PySet_Type) as *mut PySetObject;
     set_init(obj);
     obj as *mut RawPyObject
 }
@@ -358,11 +359,7 @@ pub unsafe extern "C" fn PySet_Check(obj: *mut RawPyObject) -> c_int {
     if (*obj).ob_type == set_type() { 1 } else { 0 }
 }
 
-#[no_mangle]
-pub static mut PySet_Type: *mut RawPyTypeObject = ptr::null_mut();
-
 pub unsafe fn init_set_type() {
-    SET_TYPE.tp_dealloc = Some(set_dealloc);
-    SET_TYPE.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_HAVE_GC;
-    PySet_Type = set_type();
+    PySet_Type.tp_dealloc = Some(set_dealloc);
+    PySet_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_HAVE_GC;
 }

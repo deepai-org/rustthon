@@ -496,48 +496,7 @@ pub unsafe extern "C" fn Py_IsNone(obj: *mut RawPyObject) -> c_int {
     if crate::types::none::is_none(obj) { 1 } else { 0 }
 }
 
-/// PyType_IsSubtype
-#[no_mangle]
-pub unsafe extern "C" fn PyType_IsSubtype(
-    a: *mut RawPyTypeObject,
-    b: *mut RawPyTypeObject,
-) -> c_int {
-    if a == b {
-        return 1;
-    }
-    // Walk the MRO (simplified: just check tp_base chain)
-    let mut current = a;
-    while !current.is_null() {
-        if current == b {
-            return 1;
-        }
-        current = (*current).tp_base;
-    }
-    0
-}
-
-/// PyType_Ready - finalize a type object
-#[no_mangle]
-pub unsafe extern "C" fn PyType_Ready(tp: *mut RawPyTypeObject) -> c_int {
-    if tp.is_null() {
-        return -1;
-    }
-    // Set tp_base to object if not set
-    // Set ob_type to type if not set
-    // Inherit slots from base
-    // This is simplified - CPython's PyType_Ready is very complex
-    0
-}
-
-/// PyType_GenericNew
-#[no_mangle]
-pub unsafe extern "C" fn PyType_GenericNew(
-    tp: *mut RawPyTypeObject,
-    _args: *mut RawPyObject,
-    _kwargs: *mut RawPyObject,
-) -> *mut RawPyObject {
-    crate::runtime::memory::_PyObject_New(tp)
-}
+// PyType_IsSubtype, PyType_Ready, and PyType_GenericNew are in object/typeobj.rs
 
 /// PyObject_CallMethod — call a method on an object by name.
 /// The format argument is ignored (simplified); only used for no-arg calls in ujson.
@@ -589,7 +548,7 @@ pub unsafe extern "C" fn PyObject_IsInstance(
     let inst_type = (*inst).ob_type;
     let cls_type = cls as *mut RawPyTypeObject;
     // Check if inst's type matches cls directly or via subtype chain
-    PyType_IsSubtype(inst_type, cls_type)
+    crate::object::typeobj::PyType_IsSubtype(inst_type, cls_type)
 }
 
 /// PyIter_Check — check if an object provides the iterator protocol.
@@ -613,15 +572,4 @@ pub unsafe extern "C" fn PyByteArray_Check(_obj: *mut RawPyObject) -> c_int {
     0
 }
 
-/// PyType_GenericAlloc
-#[no_mangle]
-pub unsafe extern "C" fn PyType_GenericAlloc(
-    tp: *mut RawPyTypeObject,
-    nitems: isize,
-) -> *mut RawPyObject {
-    if nitems == 0 {
-        crate::runtime::memory::_PyObject_New(tp)
-    } else {
-        crate::runtime::memory::_PyObject_NewVar(tp, nitems) as *mut RawPyObject
-    }
-}
+// PyType_GenericAlloc is in object/typeobj.rs

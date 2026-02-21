@@ -71,7 +71,8 @@ unsafe fn next_dict_version() -> u64 {
 
 // ─── Type object ───
 
-static mut DICT_TYPE: RawPyTypeObject = {
+#[no_mangle]
+pub static mut PyDict_Type: RawPyTypeObject = {
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"dict\0".as_ptr() as *const _;
     tp.tp_basicsize = 48; // sizeof(PyDictObject)
@@ -80,7 +81,7 @@ static mut DICT_TYPE: RawPyTypeObject = {
 };
 
 pub unsafe fn dict_type() -> *mut RawPyTypeObject {
-    &mut DICT_TYPE
+    &mut PyDict_Type
 }
 
 // ─── Hashing and equality ───
@@ -297,7 +298,7 @@ unsafe fn dict_resize(d: *mut PyDictObject, min_used: isize) {
 
 #[no_mangle]
 pub unsafe extern "C" fn PyDict_New() -> *mut RawPyObject {
-    let obj = crate::object::gc::_PyObject_GC_New(&mut DICT_TYPE) as *mut PyDictObject;
+    let obj = crate::object::gc::_PyObject_GC_New(&mut PyDict_Type) as *mut PyDictObject;
     (*obj).ma_used = 0;
     (*obj).ma_version_tag = next_dict_version();
     (*obj).ma_keys = alloc_keys(DK_LOG2_MIN);
@@ -631,11 +632,7 @@ pub unsafe extern "C" fn PyDict_Check(obj: *mut RawPyObject) -> c_int {
     if (*obj).ob_type == dict_type() { 1 } else { 0 }
 }
 
-#[no_mangle]
-pub static mut PyDict_Type: *mut RawPyTypeObject = ptr::null_mut();
-
 pub unsafe fn init_dict_type() {
-    DICT_TYPE.tp_dealloc = Some(dict_dealloc);
-    DICT_TYPE.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_DICT_SUBCLASS | PY_TPFLAGS_HAVE_GC;
-    PyDict_Type = dict_type();
+    PyDict_Type.tp_dealloc = Some(dict_dealloc);
+    PyDict_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_DICT_SUBCLASS | PY_TPFLAGS_HAVE_GC;
 }

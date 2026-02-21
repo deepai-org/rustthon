@@ -408,3 +408,312 @@ impl RawPyTypeObject {
         }
     }
 }
+
+// ─── Metaclass and base type objects ───
+
+/// The metaclass: type of all types.
+#[no_mangle]
+pub static mut PyType_Type: RawPyTypeObject = {
+    let mut tp = RawPyTypeObject::zeroed();
+    tp.tp_name = b"type\0".as_ptr() as *const _;
+    tp.tp_basicsize = std::mem::size_of::<RawPyTypeObject>() as isize;
+    tp
+};
+
+/// The base class: object.
+#[no_mangle]
+pub static mut PyBaseObject_Type: RawPyTypeObject = {
+    let mut tp = RawPyTypeObject::zeroed();
+    tp.tp_name = b"object\0".as_ptr() as *const _;
+    tp.tp_basicsize = std::mem::size_of::<RawPyObject>() as isize;
+    tp
+};
+
+// ─── Default slot function implementations ───
+
+/// PyType_GenericAlloc — default allocator for new instances.
+/// Allocates tp_basicsize + nitems * tp_itemsize bytes via calloc.
+#[no_mangle]
+pub unsafe extern "C" fn PyType_GenericAlloc(
+    tp: *mut RawPyTypeObject,
+    nitems: PySsizeT,
+) -> *mut RawPyObject {
+    let basic = (*tp).tp_basicsize as usize;
+    let item = (*tp).tp_itemsize as usize;
+    let total = basic + (nitems.max(0) as usize) * item;
+    let obj = libc::calloc(1, total) as *mut RawPyObject;
+    if obj.is_null() {
+        eprintln!("Fatal: out of memory in PyType_GenericAlloc");
+        std::process::abort();
+    }
+    std::ptr::write(
+        &mut (*obj).ob_refcnt,
+        std::sync::atomic::AtomicIsize::new(1),
+    );
+    (*obj).ob_type = tp;
+    obj
+}
+
+/// PyType_GenericNew — default __new__ that calls tp_alloc.
+#[no_mangle]
+pub unsafe extern "C" fn PyType_GenericNew(
+    tp: *mut RawPyTypeObject,
+    _args: *mut RawPyObject,
+    _kwds: *mut RawPyObject,
+) -> *mut RawPyObject {
+    if let Some(alloc) = (*tp).tp_alloc {
+        alloc(tp, 0)
+    } else {
+        PyType_GenericAlloc(tp, 0)
+    }
+}
+
+/// Default __init__ — no-op.
+unsafe extern "C" fn default_init(
+    _self: *mut RawPyObject,
+    _args: *mut RawPyObject,
+    _kwds: *mut RawPyObject,
+) -> c_int {
+    0
+}
+
+/// PyObject_GenericGetAttr — look up attribute in type's tp_dict.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_GenericGetAttr(
+    obj: *mut RawPyObject,
+    name: *mut RawPyObject,
+) -> *mut RawPyObject {
+    // Walk the type's MRO/tp_dict to find the attribute
+    if obj.is_null() || name.is_null() {
+        return ptr::null_mut();
+    }
+    let tp = (*obj).ob_type;
+    if tp.is_null() {
+        return ptr::null_mut();
+    }
+    // Check tp_dict of the type
+    let dict = (*tp).tp_dict;
+    if !dict.is_null() {
+        let result = crate::types::dict::PyDict_GetItem(dict, name);
+        if !result.is_null() {
+            (*result).incref();
+            return result;
+        }
+    }
+    // Walk tp_base chain
+    let mut base = (*tp).tp_base;
+    while !base.is_null() {
+        let bdict = (*base).tp_dict;
+        if !bdict.is_null() {
+            let result = crate::types::dict::PyDict_GetItem(bdict, name);
+            if !result.is_null() {
+                (*result).incref();
+                return result;
+            }
+        }
+        base = (*base).tp_base;
+    }
+    // Attribute not found — set AttributeError
+    crate::runtime::error::PyErr_SetString(
+        crate::runtime::error::_Rustthon_Exc_AttributeError(),
+        b"attribute not found\0".as_ptr() as *const c_char,
+    );
+    ptr::null_mut()
+}
+
+/// PyObject_GenericSetAttr — set attribute in instance or type dict.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_GenericSetAttr(
+    obj: *mut RawPyObject,
+    name: *mut RawPyObject,
+    value: *mut RawPyObject,
+) -> c_int {
+    // For now, set on the type's tp_dict (simplified — real CPython has
+    // instance dicts, data descriptors, etc.)
+    if obj.is_null() || name.is_null() {
+        return -1;
+    }
+    let tp = (*obj).ob_type;
+    if tp.is_null() {
+        return -1;
+    }
+    let dict = (*tp).tp_dict;
+    if dict.is_null() {
+        return -1;
+    }
+    crate::types::dict::PyDict_SetItem(dict, name, value)
+}
+
+// PyObject_Free is in runtime/memory.rs
+
+// ─── Py_TPFLAGS_READY ───
+pub const PY_TPFLAGS_READY: u64 = 1 << 12;
+
+// ─── PyType_Ready — initialize a type object ───
+
+/// PyType_Ready — called by C extensions to initialize their custom types.
+/// Inherits slots from the base type, sets metaclass, creates tp_dict.
+#[no_mangle]
+pub unsafe extern "C" fn PyType_Ready(tp: *mut RawPyTypeObject) -> c_int {
+    if tp.is_null() {
+        return -1;
+    }
+
+    // Already initialized?
+    if (*tp).tp_flags & PY_TPFLAGS_READY != 0 {
+        return 0;
+    }
+
+    // 1. Set base type if not set
+    if (*tp).tp_base.is_null() {
+        (*tp).tp_base = &mut PyBaseObject_Type;
+    }
+
+    // 2. Set metaclass if not set
+    if (*tp).ob_base.ob_type.is_null() {
+        (*tp).ob_base.ob_type = &mut PyType_Type;
+    }
+
+    // 3. Ensure base is ready first
+    let base = (*tp).tp_base;
+    if !base.is_null() && (*base).tp_flags & PY_TPFLAGS_READY == 0 {
+        let ret = PyType_Ready(base);
+        if ret < 0 {
+            return ret;
+        }
+    }
+
+    // 4. Inherit slots from base
+    let base = (*tp).tp_base;
+    if !base.is_null() {
+        // Inherit basicsize if not set
+        if (*tp).tp_basicsize == 0 {
+            (*tp).tp_basicsize = (*base).tp_basicsize;
+        }
+
+        // Inherit function slots if null
+        macro_rules! inherit_slot {
+            ($slot:ident) => {
+                if (*tp).$slot.is_none() && (*base).$slot.is_some() {
+                    (*tp).$slot = (*base).$slot;
+                }
+            };
+        }
+
+        inherit_slot!(tp_dealloc);
+        inherit_slot!(tp_repr);
+        inherit_slot!(tp_hash);
+        inherit_slot!(tp_call);
+        inherit_slot!(tp_str);
+        inherit_slot!(tp_getattro);
+        inherit_slot!(tp_setattro);
+        inherit_slot!(tp_richcompare);
+        inherit_slot!(tp_iter);
+        inherit_slot!(tp_iternext);
+        inherit_slot!(tp_init);
+        inherit_slot!(tp_alloc);
+        inherit_slot!(tp_new);
+        inherit_slot!(tp_free);
+        inherit_slot!(tp_is_gc);
+        inherit_slot!(tp_del);
+        inherit_slot!(tp_finalize);
+        inherit_slot!(tp_traverse);
+        inherit_slot!(tp_clear);
+
+        // Inherit pointer-based slots (null check)
+        macro_rules! inherit_ptr_slot {
+            ($slot:ident) => {
+                if (*tp).$slot.is_null() && !(*base).$slot.is_null() {
+                    (*tp).$slot = (*base).$slot;
+                }
+            };
+        }
+
+        inherit_ptr_slot!(tp_as_number);
+        inherit_ptr_slot!(tp_as_sequence);
+        inherit_ptr_slot!(tp_as_mapping);
+        inherit_ptr_slot!(tp_as_buffer);
+    }
+
+    // 5. Initialize tp_dict if null
+    if (*tp).tp_dict.is_null() {
+        (*tp).tp_dict = crate::types::dict::PyDict_New();
+    }
+
+    // 6. Create tp_bases tuple if null
+    if (*tp).tp_bases.is_null() && !(*tp).tp_base.is_null() {
+        let bases = crate::types::tuple::PyTuple_New(1);
+        let base_obj = (*tp).tp_base as *mut RawPyObject;
+        (*base_obj).incref();
+        crate::types::tuple::PyTuple_SetItem(bases, 0, base_obj);
+        (*tp).tp_bases = bases;
+    }
+
+    // 7. Merge base flags (subtype bits)
+    if !base.is_null() {
+        (*tp).tp_flags |= (*base).tp_flags & (
+            PY_TPFLAGS_LONG_SUBCLASS
+            | PY_TPFLAGS_LIST_SUBCLASS
+            | PY_TPFLAGS_TUPLE_SUBCLASS
+            | PY_TPFLAGS_BYTES_SUBCLASS
+            | PY_TPFLAGS_UNICODE_SUBCLASS
+            | PY_TPFLAGS_DICT_SUBCLASS
+        );
+    }
+
+    // 8. Set default flags
+    (*tp).tp_flags |= PY_TPFLAGS_DEFAULT | PY_TPFLAGS_READY;
+
+    // 9. Set immortal refcount on type object
+    (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
+
+    0
+}
+
+/// Initialize PyBaseObject_Type and PyType_Type with default slots.
+/// Must be called early in init_types(), before any other type init.
+pub unsafe fn init_base_types() {
+    // PyBaseObject_Type gets default slot implementations
+    PyBaseObject_Type.tp_alloc = Some(PyType_GenericAlloc);
+    PyBaseObject_Type.tp_new = Some(PyType_GenericNew);
+    PyBaseObject_Type.tp_init = Some(default_init);
+    PyBaseObject_Type.tp_free = Some(crate::runtime::memory::PyObject_Free);
+    PyBaseObject_Type.tp_getattro = Some(PyObject_GenericGetAttr);
+    PyBaseObject_Type.tp_setattro = Some(PyObject_GenericSetAttr);
+    PyBaseObject_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_READY;
+    PyBaseObject_Type.ob_base.ob_type = &mut PyType_Type;
+    PyBaseObject_Type.ob_base.ob_refcnt =
+        std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
+
+    // PyType_Type — metaclass of all types
+    PyType_Type.tp_base = &mut PyBaseObject_Type;
+    PyType_Type.tp_alloc = Some(PyType_GenericAlloc);
+    PyType_Type.tp_new = Some(PyType_GenericNew);
+    PyType_Type.tp_init = Some(default_init);
+    PyType_Type.tp_free = Some(crate::runtime::memory::PyObject_Free);
+    PyType_Type.tp_getattro = Some(PyObject_GenericGetAttr);
+    PyType_Type.tp_setattro = Some(PyObject_GenericSetAttr);
+    PyType_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_READY;
+    PyType_Type.ob_base.ob_type = &mut PyType_Type; // type's type is type
+    PyType_Type.ob_base.ob_refcnt =
+        std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
+}
+
+/// PyType_IsSubtype — check if `a` is a subtype of `b`.
+#[no_mangle]
+pub unsafe extern "C" fn PyType_IsSubtype(
+    a: *mut RawPyTypeObject,
+    b: *mut RawPyTypeObject,
+) -> c_int {
+    if a.is_null() || b.is_null() {
+        return 0;
+    }
+    let mut tp = a;
+    while !tp.is_null() {
+        if tp == b {
+            return 1;
+        }
+        tp = (*tp).tp_base;
+    }
+    0
+}

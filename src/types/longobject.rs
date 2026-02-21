@@ -43,7 +43,8 @@ unsafe fn ob_digit(obj: *mut PyLongObject) -> *mut Digit {
 
 // ─── Type object ───
 
-static mut LONG_TYPE: RawPyTypeObject = {
+#[no_mangle]
+pub static mut PyLong_Type: RawPyTypeObject = {
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"int\0".as_ptr() as *const _;
     tp.tp_basicsize = LONG_HEADER_SIZE as isize; // 24
@@ -52,7 +53,7 @@ static mut LONG_TYPE: RawPyTypeObject = {
 };
 
 pub unsafe fn long_type() -> *mut RawPyTypeObject {
-    &mut LONG_TYPE
+    &mut PyLong_Type
 }
 
 unsafe extern "C" fn long_dealloc(obj: *mut RawPyObject) {
@@ -445,9 +446,6 @@ pub unsafe extern "C" fn PyLong_Check(obj: *mut RawPyObject) -> c_int {
     }
 }
 
-#[no_mangle]
-pub static mut PyLong_Type: *mut RawPyTypeObject = std::ptr::null_mut();
-
 /// PyLong_FromString — parse a C string as an integer in the given base.
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_FromString(
@@ -560,8 +558,7 @@ pub unsafe extern "C" fn PyNumber_ToBase(
 }
 
 pub unsafe fn init_long_type() {
-    LONG_TYPE.tp_dealloc = Some(long_dealloc);
-    LONG_TYPE.tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
+    PyLong_Type.tp_dealloc = Some(long_dealloc);
+    PyLong_Type.tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
         | crate::object::typeobj::PY_TPFLAGS_LONG_SUBCLASS;
-    PyLong_Type = long_type();
 }

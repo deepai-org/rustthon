@@ -164,15 +164,51 @@ pub unsafe extern "C" fn PyErr_SetNone(exc_type: *mut RawPyObject) {
 }
 
 /// PyErr_ExceptionMatches - check if the current exception matches a given type.
+/// Walks the tp_base chain to check subclass relationships.
 #[no_mangle]
 pub unsafe extern "C" fn PyErr_ExceptionMatches(exc: *mut RawPyObject) -> i32 {
     with_error(|state| {
-        if state.exc_type == exc {
-            1
-        } else {
-            0 // TODO: check subclass relationships
+        if state.exc_type.is_null() || exc.is_null() {
+            return 0;
         }
+        if state.exc_type == exc {
+            return 1;
+        }
+        // Walk tp_base chain of the current exception type
+        let exc_tp = exc as *mut RawPyTypeObject;
+        let mut cur = state.exc_type as *mut RawPyTypeObject;
+        while !cur.is_null() {
+            if cur as *mut RawPyObject == exc || cur == exc_tp {
+                return 1;
+            }
+            cur = (*cur).tp_base;
+        }
+        0
     })
+}
+
+/// PyErr_GivenExceptionMatches - check if a given exception matches a type.
+#[no_mangle]
+pub unsafe extern "C" fn PyErr_GivenExceptionMatches(
+    err: *mut RawPyObject,
+    exc: *mut RawPyObject,
+) -> i32 {
+    if err.is_null() || exc.is_null() {
+        return 0;
+    }
+    if err == exc {
+        return 1;
+    }
+    // Walk tp_base chain
+    let exc_tp = exc as *mut RawPyTypeObject;
+    let mut cur = err as *mut RawPyTypeObject;
+    while !cur.is_null() {
+        if cur == exc_tp {
+            return 1;
+        }
+        cur = (*cur).tp_base;
+    }
+    0
 }
 
 /// PyErr_Format - set error with a formatted string.
@@ -227,37 +263,142 @@ pub unsafe extern "C" fn PyErr_NewException(
 }
 
 // ─── Exception type singletons ───
-// These are stable pointers that C extensions compare against.
-// We use static allocations (via Lazy) to ensure pointer stability.
+// Prebuilt C extensions expect these as DATA symbols: `extern PyObject *PyExc_TypeError;`
+// Each points to a real PyTypeObject with proper inheritance chain.
 
-use once_cell::sync::Lazy;
-use crate::object::SendPtr;
+use crate::object::typeobj::RawPyTypeObject;
 
-macro_rules! exc_singleton {
-    ($name:ident, $cname:ident, $label:expr) => {
-        static $name: Lazy<SendPtr<RawPyObject>> = Lazy::new(|| unsafe {
-            let obj = crate::types::unicode::create_from_str($label);
-            // Make immortal
-            (*obj).ob_refcnt = std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
-            SendPtr(obj)
-        });
+// Pointer variables matching CPython ABI
+#[no_mangle] pub static mut PyExc_BaseException: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_Exception: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_TypeError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_ValueError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_OverflowError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_RuntimeError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_KeyError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_IndexError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_AttributeError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_StopIteration: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_MemoryError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_SystemError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_OSError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_NotImplementedError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_UnicodeDecodeError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_UnicodeEncodeError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_UnicodeError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_LookupError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_ArithmeticError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_IOError: *mut RawPyObject = ptr::null_mut();
 
-        #[no_mangle]
-        pub unsafe extern "C" fn $cname() -> *mut RawPyObject {
-            $name.get()
-        }
-    };
+/// Allocate an exception type object with the given name and base.
+/// Returns a pointer to a heap-allocated, immortal RawPyTypeObject.
+unsafe fn alloc_exc_type(name: &[u8], base: *mut RawPyTypeObject) -> *mut RawPyObject {
+    let tp = libc::calloc(1, std::mem::size_of::<RawPyTypeObject>()) as *mut RawPyTypeObject;
+    if tp.is_null() {
+        eprintln!("Fatal: out of memory allocating exception type");
+        std::process::abort();
+    }
+    // Copy zeroed template
+    std::ptr::write(tp, RawPyTypeObject::zeroed());
+
+    // Set fields
+    (*tp).tp_name = name.as_ptr() as *const c_char;
+    (*tp).ob_base.ob_type = &mut crate::object::typeobj::PyType_Type;
+    (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
+    (*tp).tp_basicsize = std::mem::size_of::<RawPyObject>() as isize;
+    (*tp).tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
+        | crate::object::typeobj::PY_TPFLAGS_READY;
+
+    // Set base type
+    if !base.is_null() {
+        (*tp).tp_base = base;
+        // Create tp_bases tuple
+        let bases = crate::types::tuple::PyTuple_New(1);
+        let base_obj = base as *mut RawPyObject;
+        (*base_obj).incref();
+        crate::types::tuple::PyTuple_SetItem(bases, 0, base_obj);
+        (*tp).tp_bases = bases;
+    }
+
+    // Inherit default slots from base
+    if !base.is_null() {
+        if (*tp).tp_alloc.is_none() { (*tp).tp_alloc = (*base).tp_alloc; }
+        if (*tp).tp_new.is_none() { (*tp).tp_new = (*base).tp_new; }
+        if (*tp).tp_init.is_none() { (*tp).tp_init = (*base).tp_init; }
+        if (*tp).tp_free.is_none() { (*tp).tp_free = (*base).tp_free; }
+        if (*tp).tp_dealloc.is_none() { (*tp).tp_dealloc = (*base).tp_dealloc; }
+        if (*tp).tp_getattro.is_none() { (*tp).tp_getattro = (*base).tp_getattro; }
+    }
+
+    tp as *mut RawPyObject
 }
 
-exc_singleton!(EXC_TYPE_ERROR, _Rustthon_Exc_TypeError, "TypeError");
-exc_singleton!(EXC_VALUE_ERROR, _Rustthon_Exc_ValueError, "ValueError");
-exc_singleton!(EXC_OVERFLOW_ERROR, _Rustthon_Exc_OverflowError, "OverflowError");
-exc_singleton!(EXC_RUNTIME_ERROR, _Rustthon_Exc_RuntimeError, "RuntimeError");
-exc_singleton!(EXC_KEY_ERROR, _Rustthon_Exc_KeyError, "KeyError");
-exc_singleton!(EXC_INDEX_ERROR, _Rustthon_Exc_IndexError, "IndexError");
-exc_singleton!(EXC_ATTRIBUTE_ERROR, _Rustthon_Exc_AttributeError, "AttributeError");
-exc_singleton!(EXC_STOP_ITERATION, _Rustthon_Exc_StopIteration, "StopIteration");
-exc_singleton!(EXC_MEMORY_ERROR, _Rustthon_Exc_MemoryError, "MemoryError");
+/// Initialize the exception type hierarchy. Must be called after base types are ready.
+pub unsafe fn init_exceptions() {
+    // BaseException
+    PyExc_BaseException = alloc_exc_type(
+        b"BaseException\0", &mut crate::object::typeobj::PyBaseObject_Type);
+
+    let base_exc = PyExc_BaseException as *mut RawPyTypeObject;
+
+    // Exception
+    PyExc_Exception = alloc_exc_type(b"Exception\0", base_exc);
+    let exc = PyExc_Exception as *mut RawPyTypeObject;
+
+    // Direct subclasses of Exception
+    PyExc_TypeError = alloc_exc_type(b"TypeError\0", exc);
+    PyExc_ValueError = alloc_exc_type(b"ValueError\0", exc);
+    PyExc_RuntimeError = alloc_exc_type(b"RuntimeError\0", exc);
+    PyExc_AttributeError = alloc_exc_type(b"AttributeError\0", exc);
+    PyExc_StopIteration = alloc_exc_type(b"StopIteration\0", exc);
+    PyExc_MemoryError = alloc_exc_type(b"MemoryError\0", exc);
+    PyExc_SystemError = alloc_exc_type(b"SystemError\0", exc);
+    PyExc_OSError = alloc_exc_type(b"OSError\0", exc);
+    PyExc_IOError = PyExc_OSError; // IOError is an alias for OSError
+
+    // Intermediate base classes
+    PyExc_LookupError = alloc_exc_type(b"LookupError\0", exc);
+    let lookup = PyExc_LookupError as *mut RawPyTypeObject;
+    PyExc_KeyError = alloc_exc_type(b"KeyError\0", lookup);
+    PyExc_IndexError = alloc_exc_type(b"IndexError\0", lookup);
+
+    PyExc_ArithmeticError = alloc_exc_type(b"ArithmeticError\0", exc);
+    let arith = PyExc_ArithmeticError as *mut RawPyTypeObject;
+    PyExc_OverflowError = alloc_exc_type(b"OverflowError\0", arith);
+
+    // RuntimeError subclass
+    let runtime = PyExc_RuntimeError as *mut RawPyTypeObject;
+    PyExc_NotImplementedError = alloc_exc_type(b"NotImplementedError\0", runtime);
+
+    // ValueError subclasses
+    let val = PyExc_ValueError as *mut RawPyTypeObject;
+    PyExc_UnicodeError = alloc_exc_type(b"UnicodeError\0", val);
+    let unicode_err = PyExc_UnicodeError as *mut RawPyTypeObject;
+    PyExc_UnicodeDecodeError = alloc_exc_type(b"UnicodeDecodeError\0", unicode_err);
+    PyExc_UnicodeEncodeError = alloc_exc_type(b"UnicodeEncodeError\0", unicode_err);
+}
+
+// Backward-compatible function accessors for Rustthon-compiled extensions.
+// Our include/Python.h uses macros like #define PyExc_TypeError (_Rustthon_Exc_TypeError())
+
+#[no_mangle]
+pub unsafe extern "C" fn _Rustthon_Exc_TypeError() -> *mut RawPyObject { PyExc_TypeError }
+#[no_mangle]
+pub unsafe extern "C" fn _Rustthon_Exc_ValueError() -> *mut RawPyObject { PyExc_ValueError }
+#[no_mangle]
+pub unsafe extern "C" fn _Rustthon_Exc_OverflowError() -> *mut RawPyObject { PyExc_OverflowError }
+#[no_mangle]
+pub unsafe extern "C" fn _Rustthon_Exc_RuntimeError() -> *mut RawPyObject { PyExc_RuntimeError }
+#[no_mangle]
+pub unsafe extern "C" fn _Rustthon_Exc_KeyError() -> *mut RawPyObject { PyExc_KeyError }
+#[no_mangle]
+pub unsafe extern "C" fn _Rustthon_Exc_IndexError() -> *mut RawPyObject { PyExc_IndexError }
+#[no_mangle]
+pub unsafe extern "C" fn _Rustthon_Exc_AttributeError() -> *mut RawPyObject { PyExc_AttributeError }
+#[no_mangle]
+pub unsafe extern "C" fn _Rustthon_Exc_StopIteration() -> *mut RawPyObject { PyExc_StopIteration }
+#[no_mangle]
+pub unsafe extern "C" fn _Rustthon_Exc_MemoryError() -> *mut RawPyObject { PyExc_MemoryError }
 
 // ─── Internal helpers ───
 

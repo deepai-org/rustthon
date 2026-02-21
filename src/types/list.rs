@@ -21,7 +21,8 @@ pub struct PyListObject {
 
 const _: () = assert!(std::mem::size_of::<PyListObject>() == 40);
 
-static mut LIST_TYPE: RawPyTypeObject = {
+#[no_mangle]
+pub static mut PyList_Type: RawPyTypeObject = {
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"list\0".as_ptr() as *const _;
     tp.tp_basicsize = 40; // size_of::<PyListObject>()
@@ -30,7 +31,7 @@ static mut LIST_TYPE: RawPyTypeObject = {
 };
 
 pub unsafe fn list_type() -> *mut RawPyTypeObject {
-    &mut LIST_TYPE
+    &mut PyList_Type
 }
 
 // ─── Internal helpers ───
@@ -106,7 +107,7 @@ pub unsafe extern "C" fn PyList_New(size: isize) -> *mut RawPyObject {
         return ptr::null_mut();
     }
     // GC-tracked allocation
-    let obj = crate::object::gc::_PyObject_GC_New(&mut LIST_TYPE) as *mut PyListObject;
+    let obj = crate::object::gc::_PyObject_GC_New(&mut PyList_Type) as *mut PyListObject;
     (*obj).ob_base.ob_size = size;
     if size > 0 {
         (*obj).ob_item = alloc_items(size as usize);
@@ -271,11 +272,7 @@ pub unsafe extern "C" fn PyList_Check(obj: *mut RawPyObject) -> c_int {
     if (*obj).ob_type == list_type() { 1 } else { 0 }
 }
 
-#[no_mangle]
-pub static mut PyList_Type: *mut RawPyTypeObject = ptr::null_mut();
-
 pub unsafe fn init_list_type() {
-    LIST_TYPE.tp_dealloc = Some(list_dealloc);
-    LIST_TYPE.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_LIST_SUBCLASS | PY_TPFLAGS_HAVE_GC;
-    PyList_Type = list_type();
+    PyList_Type.tp_dealloc = Some(list_dealloc);
+    PyList_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_LIST_SUBCLASS | PY_TPFLAGS_HAVE_GC;
 }

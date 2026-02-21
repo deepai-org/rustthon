@@ -1,4 +1,8 @@
- Rustthon is alive!
+ Rustthon
+
+  A CPython 3.11 ABI-compatible Python interpreter written in Rust.
+  Runs real C extensions from PyPI — including prebuilt binary wheels
+  compiled against CPython 3.11 — without modification.
 
   What's running right now
 
@@ -33,16 +37,40 @@
   │ REPL mode                                         │ Working │
   └───────────────────────────────────────────────────┴─────────┘
 
+  C Extension Compatibility
+
+  Rustthon loads and runs real-world C extensions from PyPI. This works
+  in two modes:
+
+  1. Source compilation: Extensions compiled against Rustthon's own
+     include/Python.h header, linked to librustthon.dylib.
+
+  2. Prebuilt binary wheels: Extensions compiled against real CPython 3.11
+     (pip wheels), loaded at runtime via dlopen with no recompilation.
+
+  ┌─────────────────────────┬──────────────┬──────────────────┐
+  │       Extension         │  Self-Built  │ Prebuilt Wheel   │
+  ├─────────────────────────┼──────────────┼──────────────────┤
+  │ markupsafe 3.0.3        │  18/18 pass  │  18/18 pass      │
+  ├─────────────────────────┼──────────────┼──────────────────┤
+  │ ujson 5.11.0            │  48/48 pass  │  50/50 pass      │
+  └─────────────────────────┴──────────────┴──────────────────┘
+
+  The prebuilt wheel tests use .so files extracted directly from pip
+  wheels (cp311-cp311-macosx_11_0_arm64). These were compiled by their
+  upstream projects against CPython 3.11 headers — Rustthon was not
+  involved in their compilation.
+
   CPython 3.11 ABI Compatibility
 
-  234 exported C API symbols. Every built-in type matches CPython 3.11
+  250+ exported C API symbols. Every built-in type matches CPython 3.11
   byte-for-byte in memory layout, verified by a C test suite that
   directly reads struct internals through pointer arithmetic.
 
   Type layouts:
   - int: PyLongObject (24B header + u32 digit array), 30-bit digits, sign in ob_size
   - float: PyFloatObject (16B ob_base + 8B ob_fval = 24B)
-  - bool: PyLongObject subtype, True/False singletons
+  - bool: PyLongObject subtype, True/False as static _Py_TrueStruct/_Py_FalseStruct
   - str: PyASCIIObject (48B) for ASCII, PyCompactUnicodeObject (72B) for non-ASCII
   - bytes: PyBytesObject (32B header + inline ob_sval[N+1])
   - list: PyListObject (40B: ob_base + ob_item + allocated), GC-tracked
@@ -50,7 +78,14 @@
   - dict: PyDictObject (48B) + PyDictKeysObject compact hash table, GC-tracked
   - set: PySetObject (200B with inline smalltable[8]), GC-tracked
 
+  Type objects are exported as actual ~400-byte RawPyTypeObject structs
+  (DATA symbols), not pointers — matching what prebuilt extensions expect
+  when they reference PyLong_Type, PyFloat_Type, etc.
+
   Infrastructure:
+  - PyType_Type and PyBaseObject_Type metaclass hierarchy
+  - PyType_Ready with real slot inheritance from base types
+  - Exception hierarchy as real PyTypeObject instances with tp_base chains
   - 16-byte PyGC_Head prepended before all GC-tracked objects
   - All allocation via libc::calloc/malloc (not std::alloc)
   - Three-tier allocator: PyMem_Raw*, PyMem_*, PyObject_*
@@ -83,33 +118,22 @@
        macOS linker to ensure the C symbols survive LTO and appear in the
        final librustthon.dylib.
 
-  Why this is necessary:
-
-    Virtually every C extension calls PyArg_ParseTuple to unpack its arguments.
-    Without a real implementation, no extension can receive data from Python.
-    The old Rust stubs just returned 1 (success) without actually writing to
-    the output pointers, which meant every extension would read uninitialized
-    memory and crash.
-
   Supported format characters:
 
     PyArg_ParseTuple:  s s# z y y# i l n f d O O! p S U | : ;
     Py_BuildValue:     s s# y y# i l n f d O N () [] {}
 
-  Linker details (macOS):
+  Prebuilt Extension Loading (macOS)
 
-    The `cc` crate compiles varargs.c into libvarargs.a. Normally, with LTO
-    enabled and no Rust code referencing the symbols, the linker strips them.
-    Two linker flags prevent this:
+  Loading prebuilt CPython extensions on macOS requires special handling
+  due to the two-level namespace. The host process must load librustthon.dylib
+  with RTLD_GLOBAL | RTLD_LAZY to force all exported symbols into the flat
+  namespace. Without RTLD_GLOBAL, macOS isolates symbol namespaces and the
+  prebuilt .so cannot resolve Rustthon's C API symbols.
 
-    - `-Wl,-force_load,<path>/libvarargs.a` — forces all object files from
-      the archive into the link, even if unreferenced.
-
-    - `-Wl,-exported_symbols_list,<file>` — adds the C function names to the
-      dylib's export table. Without this, rustc's auto-generated export list
-      only includes #[no_mangle] Rust symbols.
-
-    Both flags are emitted from build.rs via `cargo:rustc-cdylib-link-arg`.
+    void *rt = dlopen("librustthon.dylib", RTLD_GLOBAL | RTLD_LAZY);
+    Py_Initialize();
+    void *ext = dlopen("ujson.cpython-311-darwin.so", RTLD_LAZY);
 
   File structure
 
@@ -118,12 +142,12 @@
   ├── main.rs             # REPL + file execution entry point
   ├── object/
   │   ├── pyobject.rs     # RawPyObject, RawPyVarObject, PyGCHead, PyObjectWithData<T>
-  │   ├── typeobj.rs      # Full RawPyTypeObject with all slot function pointers
+  │   ├── typeobj.rs      # RawPyTypeObject, PyType_Type, PyBaseObject_Type, PyType_Ready
   │   ├── refcount.rs     # Py_IncRef/DecRef exports
   │   └── gc.rs           # GC allocation (_PyObject_GC_New) and tracking
   ├── types/
   │   ├── none.rs         # None singleton (_Py_NoneStruct)
-  │   ├── boolobject.rs   # Bool as int subtype, True/False singletons
+  │   ├── boolobject.rs   # Bool as int subtype, _Py_TrueStruct/_Py_FalseStruct statics
   │   ├── longobject.rs   # int (30-bit digit arrays, CPython layout)
   │   ├── floatobject.rs  # float (ob_fval at offset 16)
   │   ├── unicode.rs      # str (three-tier: ASCII compact / non-ASCII compact)
@@ -136,7 +160,7 @@
   │   └── funcobject.rs   # PyCFunction wrapper + dispatch
   ├── runtime/
   │   ├── memory.rs       # PyMem_Malloc/Free, PyObject_Init
-  │   ├── error.rs        # Thread-local exception state
+  │   ├── error.rs        # Exception hierarchy (real PyTypeObject instances)
   │   ├── thread_state.rs # PyThreadState, PyInterpreterState
   │   ├── gil.rs          # GIL emulation (Mutex-based)
   │   └── interp.rs       # Py_Initialize/Finalize
@@ -157,28 +181,43 @@
   csrc/
   └── varargs.c           # C implementations of variadic API functions
 
+  include/
+  └── Python.h            # CPython 3.11 compatible header for extension compilation
+
   build.rs                # cc crate build script for varargs.c
 
-  ABI Test Suites
+  Test Suites
 
-  tests/test_abi.c — Phase 1: Direct struct access. Creates objects via
-  the C API, then reads ob_digit[], ob_fval, ob_item[], inline data at
-  hardcoded byte offsets. 97 tests verifying every type layout.
+  ┌──────────────────────────────┬───────┬─────────────────────────────────────┐
+  │          Test Suite          │ Tests │          What it verifies           │
+  ├──────────────────────────────┼───────┼─────────────────────────────────────┤
+  │ test_abi.c                   │   97  │ Struct layouts at byte offsets      │
+  ├──────────────────────────────┼───────┼─────────────────────────────────────┤
+  │ test_gc_torture.c            │   99  │ GC headers, cycles, allocator      │
+  ├──────────────────────────────┼───────┼─────────────────────────────────────┤
+  │ test_ext_driver.c            │   49  │ Full C API protocol                │
+  ├──────────────────────────────┼───────┼─────────────────────────────────────┤
+  │ test_markupsafe.c            │   18  │ Self-compiled markupsafe           │
+  ├──────────────────────────────┼───────┼─────────────────────────────────────┤
+  │ test_ujson.c                 │   48  │ Self-compiled ujson                │
+  ├──────────────────────────────┼───────┼─────────────────────────────────────┤
+  │ test_prebuilt.c              │   68  │ Prebuilt pip wheel .so files       │
+  ├──────────────────────────────┼───────┼─────────────────────────────────────┤
+  │ TOTAL                        │  379  │                                    │
+  └──────────────────────────────┴───────┴─────────────────────────────────────┘
 
-  tests/test_gc_torture.c — Phase 2: Memory and GC stress. Allocator
-  tiers, GC header arithmetic, circular references (list<->dict,
-  self-referencing list, 3-way cycles), 10000-allocation stress tests,
-  refcount integrity. 99 tests.
+  Build & run tests:
 
-  Build:
+    cargo build --release
+
+    # ABI + GC + protocol tests (link directly)
     cc -o test_abi tests/test_abi.c -L target/release -lrustthon -Wl,-rpath,target/release
-    cc -o test_gc_torture tests/test_gc_torture.c -L target/release -lrustthon -Wl,-rpath,target/release
+    cc -o test_gc tests/test_gc_torture.c -L target/release -lrustthon -Wl,-rpath,target/release
+    cc -o test_ext tests/test_ext_driver.c -L target/release -lrustthon -Wl,-rpath,target/release
 
-  Next steps
+    # Self-compiled extension tests (link directly)
+    cc -o test_markupsafe tests/test_markupsafe.c -L target/release -lrustthon -Wl,-rpath,target/release
+    cc -o test_ujson tests/test_ujson.c -L target/release -lrustthon -Wl,-rpath,target/release
 
-  1. Debug C extension module loading (PyModuleDef -> method dispatch -> PyObject_Call)
-  2. Fill in PyType_Ready — inheriting slots from base types
-  3. String interning — for faster attribute lookups
-  4. For-loop iteration protocol — proper tp_iter/tp_iternext
-  5. Exception type objects — PyExc_TypeError, PyExc_ValueError, etc.
-  6. Function definitions — compile to separate CodeObjects with proper argument handling
+    # Prebuilt wheel tests (dlopen, no linking)
+    cc -o test_prebuilt tests/test_prebuilt.c -ldl

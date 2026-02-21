@@ -5,12 +5,16 @@
 //! True: ob_size=1, ob_digit[0]=1
 //! False: ob_size=0
 
-use crate::object::pyobject::RawPyObject;
+use crate::object::pyobject::{RawPyObject, RawPyVarObject};
 use crate::object::typeobj::RawPyTypeObject;
 use crate::object::SendPtr;
+use crate::types::longobject::Digit;
 use std::sync::atomic::AtomicIsize;
 
-static mut BOOL_TYPE: RawPyTypeObject = {
+// ─── Type object (actual struct, not pointer) ───
+
+#[no_mangle]
+pub static mut PyBool_Type: RawPyTypeObject = {
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"bool\0".as_ptr() as *const _;
     // Same as PyLongObject: header 24 bytes, itemsize 4 (digit)
@@ -20,43 +24,61 @@ static mut BOOL_TYPE: RawPyTypeObject = {
 };
 
 pub unsafe fn bool_type() -> *mut RawPyTypeObject {
-    &mut BOOL_TYPE
+    &mut PyBool_Type
 }
 
-// ─── Singleton pointers (heap-allocated PyLongObjects) ───
+// ─── Static True/False structs ───
+// Prebuilt CPython extensions expect _Py_TrueStruct and _Py_FalseStruct
+// to be actual static data symbols (struct _longobject), not heap-allocated.
 
-/// Wrapper to make *mut RawPyObject Send
-struct BoolPtr(*mut RawPyObject);
-unsafe impl Send for BoolPtr {}
-unsafe impl Sync for BoolPtr {}
+/// A PyLongObject with exactly 1 digit inline.
+/// Layout: RawPyVarObject (24 bytes) + 1 Digit (4 bytes) = 28 bytes.
+#[repr(C)]
+pub struct PyLongObject1Digit {
+    pub ob_base: RawPyVarObject,
+    pub ob_digit: [Digit; 1],
+}
+
+unsafe impl Send for PyLongObject1Digit {}
+unsafe impl Sync for PyLongObject1Digit {}
+
+// True: ob_size=1, ob_digit[0]=1
+#[no_mangle]
+pub static mut _Py_TrueStruct: PyLongObject1Digit = PyLongObject1Digit {
+    ob_base: RawPyVarObject {
+        ob_base: RawPyObject {
+            ob_refcnt: AtomicIsize::new(isize::MAX / 2), // immortal
+            ob_type: std::ptr::null_mut(), // set in init_bool_type
+        },
+        ob_size: 1,
+    },
+    ob_digit: [1],
+};
+
+// False: ob_size=0, ob_digit[0]=0
+#[no_mangle]
+pub static mut _Py_FalseStruct: PyLongObject1Digit = PyLongObject1Digit {
+    ob_base: RawPyVarObject {
+        ob_base: RawPyObject {
+            ob_refcnt: AtomicIsize::new(isize::MAX / 2), // immortal
+            ob_type: std::ptr::null_mut(), // set in init_bool_type
+        },
+        ob_size: 0,
+    },
+    ob_digit: [0],
+};
+
+// ─── Singleton accessors ───
 
 use once_cell::sync::Lazy;
 
-static TRUE_PTR: Lazy<BoolPtr> = Lazy::new(|| unsafe {
-    let obj = crate::types::longobject::create_long_from_i64_with_type(1, &mut BOOL_TYPE);
-    (*obj).ob_refcnt = AtomicIsize::new(isize::MAX / 2); // immortal
-    BoolPtr(obj)
+pub static PY_TRUE: Lazy<SendPtr<RawPyObject>> = Lazy::new(|| unsafe {
+    SendPtr(&mut _Py_TrueStruct as *mut PyLongObject1Digit as *mut RawPyObject)
 });
 
-static FALSE_PTR: Lazy<BoolPtr> = Lazy::new(|| unsafe {
-    let obj = crate::types::longobject::create_long_from_i64_with_type(0, &mut BOOL_TYPE);
-    (*obj).ob_refcnt = AtomicIsize::new(isize::MAX / 2); // immortal
-    BoolPtr(obj)
+pub static PY_FALSE: Lazy<SendPtr<RawPyObject>> = Lazy::new(|| unsafe {
+    SendPtr(&mut _Py_FalseStruct as *mut PyLongObject1Digit as *mut RawPyObject)
 });
-
-pub static PY_TRUE: Lazy<SendPtr<RawPyObject>> = Lazy::new(|| {
-    SendPtr(TRUE_PTR.0)
-});
-
-pub static PY_FALSE: Lazy<SendPtr<RawPyObject>> = Lazy::new(|| {
-    SendPtr(FALSE_PTR.0)
-});
-
-// ─── Exported singleton symbols ───
-// C extensions use `&_Py_TrueStruct` and `&_Py_FalseStruct` as pointers.
-// Since our True/False are heap-allocated (flexible array), we export
-// pointer-to-pointer symbols. The `_Py_True()` and `_Py_False()` functions
-// are the primary interface.
 
 // ─── C API ───
 
@@ -75,12 +97,12 @@ pub unsafe extern "C" fn PyBool_FromLong(v: std::os::raw::c_long) -> *mut RawPyO
 
 #[no_mangle]
 pub unsafe extern "C" fn _Py_True() -> *mut RawPyObject {
-    PY_TRUE.get()
+    &mut _Py_TrueStruct as *mut PyLongObject1Digit as *mut RawPyObject
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn _Py_False() -> *mut RawPyObject {
-    PY_FALSE.get()
+    &mut _Py_FalseStruct as *mut PyLongObject1Digit as *mut RawPyObject
 }
 
 pub unsafe fn is_true(obj: *mut RawPyObject) -> bool {
@@ -108,7 +130,10 @@ pub unsafe extern "C" fn PyBool_Check(obj: *mut RawPyObject) -> std::os::raw::c_
 }
 
 pub unsafe fn init_bool_type() {
-    BOOL_TYPE.tp_base = crate::types::longobject::long_type();
-    BOOL_TYPE.tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
+    PyBool_Type.tp_base = crate::types::longobject::long_type();
+    PyBool_Type.tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
         | crate::object::typeobj::PY_TPFLAGS_LONG_SUBCLASS;
+    // Wire ob_type on static singletons
+    _Py_TrueStruct.ob_base.ob_base.ob_type = &mut PyBool_Type;
+    _Py_FalseStruct.ob_base.ob_base.ob_type = &mut PyBool_Type;
 }

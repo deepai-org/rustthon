@@ -31,7 +31,8 @@ unsafe fn ob_sval(obj: *mut PyBytesObject) -> *mut u8 {
     (obj as *mut u8).add(BYTES_HEADER_SIZE)
 }
 
-static mut BYTES_TYPE: RawPyTypeObject = {
+#[no_mangle]
+pub static mut PyBytes_Type: RawPyTypeObject = {
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"bytes\0".as_ptr() as *const _;
     tp.tp_basicsize = BYTES_HEADER_SIZE as isize; // 32
@@ -40,7 +41,7 @@ static mut BYTES_TYPE: RawPyTypeObject = {
 };
 
 pub unsafe fn bytes_type() -> *mut RawPyTypeObject {
-    &mut BYTES_TYPE
+    &mut PyBytes_Type
 }
 
 unsafe extern "C" fn bytes_dealloc(obj: *mut RawPyObject) {
@@ -187,11 +188,7 @@ pub unsafe extern "C" fn PyBytes_Concat(
     *bytes = new_obj;
 }
 
-#[no_mangle]
-pub static mut PyBytes_Type: *mut RawPyTypeObject = ptr::null_mut();
-
 pub unsafe fn init_bytes_type() {
-    BYTES_TYPE.tp_dealloc = Some(bytes_dealloc);
-    BYTES_TYPE.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_BYTES_SUBCLASS;
-    PyBytes_Type = bytes_type();
+    PyBytes_Type.tp_dealloc = Some(bytes_dealloc);
+    PyBytes_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_BYTES_SUBCLASS;
 }
