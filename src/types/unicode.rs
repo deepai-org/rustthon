@@ -558,6 +558,77 @@ pub unsafe extern "C" fn _PyUnicode_Ready(_obj: *mut RawPyObject) -> std::os::ra
     0 // Already ready — all our strings are created in canonical PEP 393 form
 }
 
+/// PyUnicode_AsUTF8String — encode a unicode object as UTF-8, returning a bytes object.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_AsUTF8String(
+    obj: *mut RawPyObject,
+) -> *mut RawPyObject {
+    PyUnicode_AsEncodedString(obj, b"utf-8\0".as_ptr() as *const c_char, ptr::null())
+}
+
+/// _PyUnicode_FastCopyCharacters — copy characters between unicode objects.
+/// Used by Cython for string building. Simplified: copies byte-by-byte.
+#[no_mangle]
+pub unsafe extern "C" fn _PyUnicode_FastCopyCharacters(
+    to: *mut RawPyObject,
+    to_start: isize,
+    from: *mut RawPyObject,
+    from_start: isize,
+    how_many: isize,
+) {
+    if to.is_null() || from.is_null() || how_many <= 0 {
+        return;
+    }
+    // Get the kind (bytes per character) of each string
+    let to_ascii = to as *mut PyASCIIObject;
+    let from_ascii = from as *mut PyASCIIObject;
+    let to_kind = ((*to_ascii).state >> 2) & 0x7;
+    let from_kind = ((*from_ascii).state >> 2) & 0x7;
+
+    // Determine data pointers
+    let to_is_ascii = ((*to_ascii).state >> 6) & 1 != 0;
+    let from_is_ascii = ((*from_ascii).state >> 6) & 1 != 0;
+    let to_data = if to_is_ascii {
+        (to as *mut u8).add(48) // ASCII: data at offset 48
+    } else {
+        (to as *mut u8).add(72) // Compact: data at offset 72
+    };
+    let from_data = if from_is_ascii {
+        (from as *mut u8).add(48)
+    } else {
+        (from as *mut u8).add(72)
+    };
+
+    let to_char_size = to_kind.max(1) as usize;
+    let from_char_size = from_kind.max(1) as usize;
+
+    if to_char_size == from_char_size {
+        // Same kind — direct memcpy
+        let nbytes = how_many as usize * to_char_size;
+        std::ptr::copy_nonoverlapping(
+            from_data.add(from_start as usize * from_char_size),
+            to_data.add(to_start as usize * to_char_size),
+            nbytes,
+        );
+    } else {
+        // Different kinds — character-by-character copy
+        for i in 0..how_many as usize {
+            let ch = match from_char_size {
+                1 => *from_data.add(from_start as usize + i) as u32,
+                2 => *(from_data.add((from_start as usize + i) * 2) as *const u16) as u32,
+                4 => *(from_data.add((from_start as usize + i) * 4) as *const u32),
+                _ => 0,
+            };
+            match to_char_size {
+                1 => *to_data.add(to_start as usize + i) = ch as u8,
+                2 => *(to_data.add((to_start as usize + i) * 2) as *mut u16) = ch as u16,
+                4 => *(to_data.add((to_start as usize + i) * 4) as *mut u32) = ch,
+                _ => {}
+            }
+        }
+    }
+}
+
 pub unsafe fn init_unicode_type() {
     PyUnicode_Type.tp_dealloc = Some(unicode_dealloc);
     PyUnicode_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_UNICODE_SUBCLASS;

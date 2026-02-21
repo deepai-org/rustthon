@@ -136,10 +136,7 @@ pub unsafe extern "C" fn PyTuple_GetSlice(
     new_tuple
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn PyTuple_Pack(n: isize) -> *mut RawPyObject {
-    PyTuple_New(n)
-}
+// PyTuple_Pack is implemented in csrc/varargs.c (requires C variadic args)
 
 #[no_mangle]
 pub unsafe extern "C" fn PyTuple_Check(obj: *mut RawPyObject) -> c_int {

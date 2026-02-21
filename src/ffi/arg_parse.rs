@@ -50,6 +50,15 @@ extern "C" {
     ) -> *mut RawPyObject;
 }
 
+/// PyArg_ValidateKeywordArguments — check that keyword argument names are strings.
+/// Used by Cython. Simplified: always returns 1 (valid).
+#[no_mangle]
+pub unsafe extern "C" fn PyArg_ValidateKeywordArguments(
+    _kwargs: *mut RawPyObject,
+) -> c_int {
+    1 // Simplified: assume all keyword args are valid strings
+}
+
 /// Force the linker to keep all varargs symbols by referencing them.
 #[used]
 static VARARGS_SYMS: [unsafe extern "C" fn(); 0] = [];

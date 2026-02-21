@@ -636,3 +636,22 @@ PyObject *PyObject_CallMethod(PyObject *obj, const char *name, const char *forma
     Py_DecRef(args);
     return result;
 }
+
+/* ═══════════════════════════════════════════════════════
+ *  PyTuple_Pack  (variadic)
+ * ═══════════════════════════════════════════════════════ */
+
+PyObject *PyTuple_Pack(Py_ssize_t n, ...) {
+    va_list ap;
+    PyObject *tuple = PyTuple_New(n);
+    if (!tuple) return (PyObject *)0;
+
+    va_start(ap, n);
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *item = va_arg(ap, PyObject *);
+        Py_IncRef(item);  /* SetItem steals a ref, so incref first */
+        PyTuple_SetItem(tuple, i, item);
+    }
+    va_end(ap);
+    return tuple;
+}

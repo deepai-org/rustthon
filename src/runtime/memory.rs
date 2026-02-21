@@ -156,6 +156,37 @@ pub unsafe extern "C" fn _PyObject_New(
     PyObject_Init(obj, tp)
 }
 
+/// PyMemoryView_FromMemory — create a memoryview from a C buffer.
+/// Simplified: creates a bytes object instead (memoryview not fully implemented).
+#[no_mangle]
+pub unsafe extern "C" fn PyMemoryView_FromMemory(
+    mem: *mut std::os::raw::c_char,
+    size: isize,
+    _flags: std::os::raw::c_int,
+) -> *mut RawPyObject {
+    if mem.is_null() || size < 0 {
+        return std::ptr::null_mut();
+    }
+    // Create a bytes object from the memory (simplified stand-in for memoryview)
+    crate::types::bytes::PyBytes_FromStringAndSize(mem, size)
+}
+
+/// PyOS_snprintf — safe snprintf wrapper.
+/// This is a variadic C function. Since we can't handle varargs in Rust,
+/// we provide a stub that handles the simple case.
+#[no_mangle]
+pub unsafe extern "C" fn PyOS_snprintf(
+    buf: *mut std::os::raw::c_char,
+    size: usize,
+    format: *const std::os::raw::c_char,
+    // varargs follow — but Rust can't capture them
+) -> () {
+    // Best-effort: just copy the format string
+    if !buf.is_null() && size > 0 && !format.is_null() {
+        libc::snprintf(buf, size, format);
+    }
+}
+
 /// _PyObject_NewVar - allocate and initialize a new variable-size object
 #[no_mangle]
 pub unsafe extern "C" fn _PyObject_NewVar(

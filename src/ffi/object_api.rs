@@ -429,11 +429,28 @@ pub unsafe extern "C" fn PyObject_Call(
     let tp = (*callable).ob_type;
     if !tp.is_null() {
         if let Some(tp_call) = (*tp).tp_call {
-            return tp_call(callable, args, kwargs);
+            let result = tp_call(callable, args, kwargs);
+            if result.is_null() {
+                // Debug: check if an error was set
+                let err = crate::runtime::error::PyErr_Occurred();
+                if !err.is_null() {
+                    let etp = err as *mut crate::object::typeobj::RawPyTypeObject;
+                    if !(*etp).tp_name.is_null() {
+                        let name = std::ffi::CStr::from_ptr((*etp).tp_name);
+                        eprintln!("[rustthon] PyObject_Call: tp_call returned NULL, exception: {:?}", name);
+                    }
+                } else {
+                    eprintln!("[rustthon] PyObject_Call: tp_call returned NULL, no exception set");
+                }
+            }
+            return result;
         }
     }
     // Not callable
-    // TODO: Set TypeError
+    eprintln!("[rustthon] PyObject_Call: not callable, tp={:?}, tp_call=None",
+        if !tp.is_null() && !(*tp).tp_name.is_null() {
+            std::ffi::CStr::from_ptr((*tp).tp_name).to_str().unwrap_or("???")
+        } else { "null" });
     ptr::null_mut()
 }
 
@@ -570,6 +587,146 @@ pub unsafe extern "C" fn PyIter_Check(obj: *mut RawPyObject) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn PyByteArray_Check(_obj: *mut RawPyObject) -> c_int {
     0
+}
+
+/// PyObject_Format — format an object using the __format__ protocol.
+/// Falls back to str() for now.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_Format(
+    obj: *mut RawPyObject,
+    format_spec: *mut RawPyObject,
+) -> *mut RawPyObject {
+    // Simplified: just call str()
+    PyObject_Str(obj)
+}
+
+/// PyObject_ClearWeakRefs — clear all weak references to an object.
+/// No-op for now since we don't have full weakref support.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_ClearWeakRefs(obj: *mut RawPyObject) {
+    // No-op: weak reference list clearing
+}
+
+/// PyObject_GenericGetDict — get the __dict__ of an object.
+/// For types with tp_dictoffset, returns the instance dict.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_GenericGetDict(
+    obj: *mut RawPyObject,
+    _context: *mut std::os::raw::c_void,
+) -> *mut RawPyObject {
+    if obj.is_null() {
+        return ptr::null_mut();
+    }
+    let tp = (*obj).ob_type;
+    if tp.is_null() {
+        return ptr::null_mut();
+    }
+    let offset = (*tp).tp_dictoffset;
+    if offset > 0 {
+        let dict_ptr = (obj as *mut u8).add(offset as usize) as *mut *mut RawPyObject;
+        let dict = *dict_ptr;
+        if dict.is_null() {
+            // Create a new dict for this instance
+            let new_dict = crate::types::dict::PyDict_New();
+            *dict_ptr = new_dict;
+            (*new_dict).incref();
+            return new_dict;
+        }
+        (*dict).incref();
+        return dict;
+    }
+    // No dict support
+    ptr::null_mut()
+}
+
+/// PyObject_GenericSetDict — set the __dict__ of an object.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_GenericSetDict(
+    obj: *mut RawPyObject,
+    value: *mut RawPyObject,
+    _context: *mut std::os::raw::c_void,
+) -> c_int {
+    if obj.is_null() {
+        return -1;
+    }
+    let tp = (*obj).ob_type;
+    if tp.is_null() {
+        return -1;
+    }
+    let offset = (*tp).tp_dictoffset;
+    if offset > 0 {
+        let dict_ptr = (obj as *mut u8).add(offset as usize) as *mut *mut RawPyObject;
+        if !value.is_null() {
+            (*value).incref();
+        }
+        let old = *dict_ptr;
+        *dict_ptr = value;
+        if !old.is_null() {
+            (*old).decref();
+        }
+        return 0;
+    }
+    -1
+}
+
+/// PyNumber_Index — call __index__ to get an integer.
+/// Returns the object itself if it's already an int, or calls nb_index.
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_Index(obj: *mut RawPyObject) -> *mut RawPyObject {
+    if obj.is_null() {
+        return ptr::null_mut();
+    }
+    // If it's already an int, return it
+    let tp = (*obj).ob_type;
+    if tp == &mut crate::types::longobject::PyLong_Type as *mut _ {
+        (*obj).incref();
+        return obj;
+    }
+    // Try nb_index
+    if !tp.is_null() && !(*tp).tp_as_number.is_null() {
+        if let Some(nb_index) = (*(*tp).tp_as_number).nb_index {
+            return nb_index(obj);
+        }
+    }
+    ptr::null_mut()
+}
+
+/// PyMethod_New — create a bound method from a function and an instance.
+#[no_mangle]
+pub unsafe extern "C" fn PyMethod_New(
+    func: *mut RawPyObject,
+    self_obj: *mut RawPyObject,
+) -> *mut RawPyObject {
+    // Simplified: create a tuple (func, self) as a method stand-in.
+    // A real implementation would use a PyMethodObject type.
+    if func.is_null() {
+        return ptr::null_mut();
+    }
+    let method = crate::types::tuple::PyTuple_New(2);
+    (*func).incref();
+    crate::types::tuple::PyTuple_SET_ITEM(method, 0, func);
+    if !self_obj.is_null() {
+        (*self_obj).incref();
+    }
+    crate::types::tuple::PyTuple_SET_ITEM(method, 1, self_obj);
+    method
+}
+
+/// PyCMethod_New — create a C method (PyO3 stable ABI).
+/// Simplified: delegates to PyMethod_New.
+#[no_mangle]
+pub unsafe extern "C" fn PyCMethod_New(
+    ml: *mut crate::object::typeobj::PyMethodDef,
+    self_obj: *mut RawPyObject,
+    module: *mut RawPyObject,
+    cls: *mut crate::object::typeobj::RawPyTypeObject,
+) -> *mut RawPyObject {
+    if ml.is_null() {
+        return ptr::null_mut();
+    }
+    // Create a PyCFunction wrapper and return it
+    let func = crate::types::funcobject::PyCFunction_NewEx(ml, self_obj, module);
+    func
 }
 
 // PyType_GenericAlloc is in object/typeobj.rs

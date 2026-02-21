@@ -70,11 +70,14 @@ unsafe fn obj_from_gc_head(gc: *mut PyGCHead) -> *mut RawPyObject {
 pub unsafe extern "C" fn _PyObject_GC_New(
     tp: *mut RawPyTypeObject,
 ) -> *mut RawPyObject {
-    let obj_size = if !tp.is_null() {
-        (*tp).tp_basicsize as usize
-    } else {
-        std::mem::size_of::<RawPyObject>()
-    };
+    if tp.is_null() {
+        eprintln!("[rustthon] FATAL: _PyObject_GC_New called with NULL type pointer!");
+        eprintln!("  This usually means a C extension failed to create a type (PyType_FromSpec* returned NULL)");
+        eprintln!("  but the extension continued to use the NULL type pointer.");
+        // Don't abort — return null so the caller can handle the error
+        return std::ptr::null_mut();
+    }
+    let obj_size = (*tp).tp_basicsize as usize;
 
     let total = GC_HEAD_SIZE + obj_size;
     let raw = libc::calloc(1, total) as *mut u8;
@@ -87,6 +90,15 @@ pub unsafe extern "C" fn _PyObject_GC_New(
     let obj = raw.add(GC_HEAD_SIZE) as *mut RawPyObject;
     std::ptr::write(&mut (*obj).ob_refcnt, AtomicIsize::new(1));
     (*obj).ob_type = tp;
+
+    // Debug: trace large object allocations (CyFunction etc.)
+    if obj_size > 100 {
+        let tp_name = if !tp.is_null() && !(*tp).tp_name.is_null() {
+            std::ffi::CStr::from_ptr((*tp).tp_name).to_str().unwrap_or("???")
+        } else { "(null tp)" };
+        eprintln!("[rustthon] _PyObject_GC_New: tp={:p} name={} basicsize={} -> obj={:p}, ob_type={:p}",
+            tp, tp_name, obj_size, obj, (*obj).ob_type);
+    }
 
     // Track the object
     PyObject_GC_Track(obj as *mut c_void);

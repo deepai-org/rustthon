@@ -196,6 +196,18 @@ pub unsafe extern "C" fn PyThreadState_Clear(tstate: *mut PyThreadState) {
     }
 }
 
+/// PyInterpreterState_GetID — return a unique ID for the interpreter.
+#[no_mangle]
+pub unsafe extern "C" fn PyInterpreterState_GetID(
+    interp: *mut PyInterpreterState,
+) -> i64 {
+    if interp.is_null() {
+        return -1;
+    }
+    // Return a stable ID based on the pointer
+    interp as i64
+}
+
 /// PyThreadState_Delete
 #[no_mangle]
 pub unsafe extern "C" fn PyThreadState_Delete(tstate: *mut PyThreadState) {

@@ -6,7 +6,7 @@
 
 use crate::object::pyobject::RawPyObject;
 use std::cell::RefCell;
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int};
 use std::ptr;
 
 /// Thread-local error state, matching CPython's error indicator.
@@ -289,6 +289,11 @@ use crate::object::typeobj::RawPyTypeObject;
 #[no_mangle] pub static mut PyExc_LookupError: *mut RawPyObject = ptr::null_mut();
 #[no_mangle] pub static mut PyExc_ArithmeticError: *mut RawPyObject = ptr::null_mut();
 #[no_mangle] pub static mut PyExc_IOError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_ImportError: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_DeprecationWarning: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_RuntimeWarning: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_UserWarning: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static mut PyExc_Warning: *mut RawPyObject = ptr::null_mut();
 
 /// Allocate an exception type object with the given name and base.
 /// Returns a pointer to a heap-allocated, immortal RawPyTypeObject.
@@ -376,6 +381,16 @@ pub unsafe fn init_exceptions() {
     let unicode_err = PyExc_UnicodeError as *mut RawPyTypeObject;
     PyExc_UnicodeDecodeError = alloc_exc_type(b"UnicodeDecodeError\0", unicode_err);
     PyExc_UnicodeEncodeError = alloc_exc_type(b"UnicodeEncodeError\0", unicode_err);
+
+    // ImportError
+    PyExc_ImportError = alloc_exc_type(b"ImportError\0", exc);
+
+    // Warning hierarchy
+    PyExc_Warning = alloc_exc_type(b"Warning\0", exc);
+    let warn = PyExc_Warning as *mut RawPyTypeObject;
+    PyExc_DeprecationWarning = alloc_exc_type(b"DeprecationWarning\0", warn);
+    PyExc_RuntimeWarning = alloc_exc_type(b"RuntimeWarning\0", warn);
+    PyExc_UserWarning = alloc_exc_type(b"UserWarning\0", warn);
 }
 
 // Backward-compatible function accessors for Rustthon-compiled extensions.
@@ -421,3 +436,113 @@ pub fn clear_error() {
         PyErr_Clear();
     }
 }
+
+// ─── Warning APIs (needed by Cython and PyO3) ───
+
+/// PyErr_WarnEx — issue a warning. category is the warning class, stacklevel is ignored.
+#[no_mangle]
+pub unsafe extern "C" fn PyErr_WarnEx(
+    category: *mut RawPyObject,
+    message: *const c_char,
+    _stacklevel: isize,
+) -> c_int {
+    if !message.is_null() {
+        let msg = std::ffi::CStr::from_ptr(message).to_string_lossy();
+        eprintln!("Warning: {}", msg);
+    }
+    0 // success
+}
+
+/// PyErr_WarnFormat — issue a warning with printf-style formatting.
+/// Simplified: just passes format string directly.
+#[no_mangle]
+pub unsafe extern "C" fn PyErr_WarnFormat(
+    category: *mut RawPyObject,
+    _stacklevel: isize,
+    format: *const c_char,
+) -> c_int {
+    PyErr_WarnEx(category, format, _stacklevel)
+}
+
+/// PyErr_Print — print the current exception to stderr and clear it.
+#[no_mangle]
+pub unsafe extern "C" fn PyErr_Print() {
+    PyErr_PrintEx(1)
+}
+
+/// PyErr_PrintEx — print the current exception. set_sys_last_vars is ignored.
+#[no_mangle]
+pub unsafe extern "C" fn PyErr_PrintEx(_set_sys_last_vars: c_int) {
+    let mut ptype: *mut RawPyObject = ptr::null_mut();
+    let mut pvalue: *mut RawPyObject = ptr::null_mut();
+    let mut ptb: *mut RawPyObject = ptr::null_mut();
+    PyErr_Fetch(&mut ptype, &mut pvalue, &mut ptb);
+    if !ptype.is_null() {
+        let tp = ptype as *mut RawPyTypeObject;
+        let name = if !(*tp).tp_name.is_null() {
+            std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy().into_owned()
+        } else {
+            "Exception".to_string()
+        };
+        eprintln!("{}", name);
+    }
+}
+
+/// PyErr_WriteUnraisable — print a warning about an exception that can't be raised.
+#[no_mangle]
+pub unsafe extern "C" fn PyErr_WriteUnraisable(obj: *mut RawPyObject) {
+    eprintln!("Exception ignored in: {:p}", obj);
+    PyErr_Clear();
+}
+
+/// PyErr_NewExceptionWithDoc — like PyErr_NewException but with a docstring.
+#[no_mangle]
+pub unsafe extern "C" fn PyErr_NewExceptionWithDoc(
+    name: *const c_char,
+    doc: *const c_char,
+    base: *mut RawPyObject,
+    dict: *mut RawPyObject,
+) -> *mut RawPyObject {
+    // Delegate to PyErr_NewException (ignoring doc for now)
+    PyErr_NewException(name, base, dict)
+}
+
+// ─── Exception object APIs (needed by PyO3) ───
+
+/// PyException_GetTraceback — get the traceback from an exception instance.
+#[no_mangle]
+pub unsafe extern "C" fn PyException_GetTraceback(
+    _exc: *mut RawPyObject,
+) -> *mut RawPyObject {
+    // Simplified: no traceback support yet
+    ptr::null_mut()
+}
+
+/// PyException_SetTraceback — set the traceback on an exception instance.
+#[no_mangle]
+pub unsafe extern "C" fn PyException_SetTraceback(
+    _exc: *mut RawPyObject,
+    _tb: *mut RawPyObject,
+) -> c_int {
+    0 // success (no-op)
+}
+
+/// PyException_GetCause — get the __cause__ of an exception.
+#[no_mangle]
+pub unsafe extern "C" fn PyException_GetCause(
+    _exc: *mut RawPyObject,
+) -> *mut RawPyObject {
+    ptr::null_mut()
+}
+
+/// PyException_SetCause — set the __cause__ of an exception.
+#[no_mangle]
+pub unsafe extern "C" fn PyException_SetCause(
+    _exc: *mut RawPyObject,
+    _cause: *mut RawPyObject,
+) {
+    // No-op for now
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn _Rustthon_Exc_ImportError() -> *mut RawPyObject { PyExc_ImportError }

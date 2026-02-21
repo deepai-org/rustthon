@@ -22,7 +22,8 @@ fn main() {
          _PyArg_UnpackTuple\n\
          _Py_BuildValue\n\
          __Py_BuildValue_SizeT\n\
-         _Py_VaBuildValue\n"
+         _Py_VaBuildValue\n\
+         _PyTuple_Pack\n"
     ).unwrap();
     println!("cargo:rustc-cdylib-link-arg=-Wl,-exported_symbols_list,{}", exports_path.display());
 }

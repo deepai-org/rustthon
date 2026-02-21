@@ -12,11 +12,52 @@ static mut MODULE_TYPE: RawPyTypeObject = {
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"module\0".as_ptr() as *const _;
     tp.tp_basicsize = 0;
+    tp.tp_getattro = Some(module_getattro);
+    tp.tp_setattro = Some(module_setattro);
     tp
 };
 
 pub unsafe fn module_type() -> *mut RawPyTypeObject {
     &mut MODULE_TYPE
+}
+
+/// module_getattro — lookup attribute in module __dict__
+unsafe extern "C" fn module_getattro(
+    obj: *mut RawPyObject,
+    name: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let dict = PyModule_GetDict(obj);
+    if dict.is_null() {
+        return ptr::null_mut();
+    }
+    let result = crate::types::dict::PyDict_GetItem(dict, name);
+    if !result.is_null() {
+        (*result).incref();
+        return result;
+    }
+    // Attribute not found — set AttributeError
+    crate::runtime::error::PyErr_SetString(
+        crate::runtime::error::PyExc_AttributeError,
+        b"module has no attribute\0".as_ptr() as *const _,
+    );
+    ptr::null_mut()
+}
+
+/// module_setattro — set attribute in module __dict__
+unsafe extern "C" fn module_setattro(
+    obj: *mut RawPyObject,
+    name: *mut RawPyObject,
+    value: *mut RawPyObject,
+) -> c_int {
+    let dict = PyModule_GetDict(obj);
+    if dict.is_null() {
+        return -1;
+    }
+    if value.is_null() {
+        // Delete attribute
+        return crate::types::dict::PyDict_DelItem(dict, name);
+    }
+    crate::types::dict::PyDict_SetItem(dict, name, value)
 }
 
 /// Module definition (matches CPython's PyModuleDef)
@@ -270,10 +311,121 @@ unsafe fn get_module_state(module: *mut RawPyObject) -> *mut c_void {
     MODULE_STATES.lock().0.get(&(module as usize)).copied().unwrap_or(ptr::null_mut())
 }
 
-/// PyModuleDef_Init
+/// PyModule_NewObject — create a new empty module with a PyObject name.
+#[no_mangle]
+pub unsafe extern "C" fn PyModule_NewObject(name: *mut RawPyObject) -> *mut RawPyObject {
+    if name.is_null() {
+        return ptr::null_mut();
+    }
+    let name_str = crate::types::unicode::unicode_value(name).to_string();
+    let dict = crate::types::dict::PyDict_New();
+
+    // Set __name__
+    (*name).incref();
+    crate::types::dict::PyDict_SetItemString(dict, b"__name__\0".as_ptr() as *const _, name);
+
+    let module = PyObjectWithData::alloc(
+        &mut MODULE_TYPE,
+        ModuleData {
+            name: name_str,
+            dict,
+            def: ptr::null_mut(),
+        },
+    );
+    module as *mut RawPyObject
+}
+
+// PEP 489 multi-phase init slot IDs
+const PY_MOD_CREATE: c_int = 1;
+const PY_MOD_EXEC: c_int = 2;
+
+/// Type for Py_mod_exec callback: int (*)(PyObject *module)
+type PyModExecFunc = unsafe extern "C" fn(*mut RawPyObject) -> c_int;
+
+/// PyModuleDef_Init — PEP 489 multi-phase module initialization.
+///
+/// For multi-phase init (Cython, modern extensions), we:
+/// 1. Create the module via PyModule_Create2 (skipping the Py_mod_create callback
+///    which expects a ModuleSpec we don't have)
+/// 2. Call the Py_mod_exec callback to populate the module with functions
+///
+/// This approach works because the Py_mod_create callback in Cython just calls
+/// PyModule_NewObject anyway — we accomplish the same thing directly.
 #[no_mangle]
 pub unsafe extern "C" fn PyModuleDef_Init(def: *mut PyModuleDef) -> *mut RawPyObject {
-    // Multi-phase init: return the def itself as a module
-    // (simplified - full impl would handle slots)
-    PyModule_Create2(def, 1013) // PYTHON_API_VERSION
+    if def.is_null() {
+        return ptr::null_mut();
+    }
+
+    // Always create module via PyModule_Create2 first
+    eprintln!("[rustthon] PyModuleDef_Init: creating module via PyModule_Create2");
+    let module = PyModule_Create2(def, 1013);
+    if module.is_null() {
+        eprintln!("[rustthon] PyModuleDef_Init: PyModule_Create2 returned null!");
+        return ptr::null_mut();
+    }
+    eprintln!("[rustthon] PyModuleDef_Init: module created at {:p}", module);
+
+    // If multi-phase init slots exist, find and call Py_mod_exec
+    if !(*def).m_slots.is_null() {
+        let mut slot = (*def).m_slots;
+        while (*slot).slot != 0 || !(*slot).value.is_null() {
+            if (*slot).slot == 0 && (*slot).value.is_null() {
+                break;
+            }
+            if (*slot).slot == PY_MOD_EXEC && !(*slot).value.is_null() {
+                let exec_func: PyModExecFunc = std::mem::transmute((*slot).value);
+                            eprintln!("[rustthon] before Py_mod_exec: checking thread state...");
+                let tstate = crate::runtime::thread_state::_PyThreadState_UncheckedGet();
+                eprintln!("[rustthon]   tstate = {:p}", tstate);
+                if !tstate.is_null() {
+                    eprintln!("[rustthon]   tstate->interp = {:p}", (*tstate).interp);
+                    if !(*tstate).interp.is_null() {
+                        let id = crate::runtime::thread_state::PyInterpreterState_GetID((*tstate).interp);
+                        eprintln!("[rustthon]   interp ID = {}", id);
+                    }
+                }
+                eprintln!("[rustthon] calling Py_mod_exec callback...");
+                let result = exec_func(module);
+                eprintln!("[rustthon] Py_mod_exec returned {}", result);
+                if result != 0 {
+                    // Fetch and print the exception Cython set
+                    let mut ptype: *mut RawPyObject = ptr::null_mut();
+                    let mut pvalue: *mut RawPyObject = ptr::null_mut();
+                    let mut ptb: *mut RawPyObject = ptr::null_mut();
+                    crate::runtime::error::PyErr_Fetch(&mut ptype, &mut pvalue, &mut ptb);
+                    if !ptype.is_null() {
+                        let tp = ptype as *mut crate::object::typeobj::RawPyTypeObject;
+                        let tp_name = if !(*tp).tp_name.is_null() {
+                            std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy().into_owned()
+                        } else {
+                            "???".to_string()
+                        };
+                        if !pvalue.is_null() {
+                            let val_str = crate::ffi::object_api::PyObject_Str(pvalue);
+                            if !val_str.is_null() {
+                                let msg = crate::types::unicode::PyUnicode_AsUTF8(val_str);
+                                if !msg.is_null() {
+                                    let s = std::ffi::CStr::from_ptr(msg).to_string_lossy();
+                                    eprintln!("[rustthon] Py_mod_exec exception: {}: {}", tp_name, s);
+                                } else {
+                                    eprintln!("[rustthon] Py_mod_exec exception: {} (value not stringifiable)", tp_name);
+                                }
+                            } else {
+                                eprintln!("[rustthon] Py_mod_exec exception: {} (str() returned null)", tp_name);
+                            }
+                        } else {
+                            eprintln!("[rustthon] Py_mod_exec exception: {} (no value)", tp_name);
+                        }
+                    } else {
+                        eprintln!("[rustthon] Py_mod_exec returned -1 but no exception was set!");
+                    }
+                    return ptr::null_mut();
+                }
+            }
+            slot = slot.add(1);
+        }
+    }
+
+    module
 }

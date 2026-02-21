@@ -162,6 +162,22 @@ pub unsafe extern "C" fn PyImport_ImportModuleLevel(
     PyImport_ImportModule(name)
 }
 
+/// PyImport_ImportModuleLevelObject — import with PyObject name (Cython uses this).
+#[no_mangle]
+pub unsafe extern "C" fn PyImport_ImportModuleLevelObject(
+    name: *mut RawPyObject,
+    _globals: *mut RawPyObject,
+    _locals: *mut RawPyObject,
+    _fromlist: *mut RawPyObject,
+    _level: c_int,
+) -> *mut RawPyObject {
+    if name.is_null() {
+        return ptr::null_mut();
+    }
+    let name_str = crate::types::unicode::PyUnicode_AsUTF8(name);
+    PyImport_ImportModule(name_str)
+}
+
 /// PyImport_Import
 #[no_mangle]
 pub unsafe extern "C" fn PyImport_Import(name: *mut RawPyObject) -> *mut RawPyObject {
@@ -191,9 +207,9 @@ pub unsafe extern "C" fn PyImport_AddModule(name: *const c_char) -> *mut RawPyOb
         return module; // Borrowed reference
     }
 
-    // Create empty module
+    // Create proper module object (not a dict!)
     let name_obj = crate::types::unicode::PyUnicode_FromString(name);
-    let module = crate::types::dict::PyDict_New(); // Simplified - should be proper module object
+    let module = crate::types::moduleobject::PyModule_NewObject(name_obj);
     crate::module::registry::register_module(&name_str, module);
     (*name_obj).decref();
     module

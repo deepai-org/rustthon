@@ -68,3 +68,9 @@ pub unsafe extern "C" fn Py_GetVersion() -> *const std::os::raw::c_char {
 pub unsafe extern "C" fn Py_GetPlatform() -> *const std::os::raw::c_char {
     b"darwin\0".as_ptr() as *const std::os::raw::c_char
 }
+
+/// Py_Version — CPython 3.11 version as a single integer.
+/// Format: (major << 24) | (minor << 16) | (micro << 8) | (level << 4) | serial
+/// 3.11.0 final = 0x030B00F0
+#[no_mangle]
+pub static Py_Version: u32 = 0x030B_00F0;

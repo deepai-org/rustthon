@@ -566,7 +566,7 @@ pub unsafe extern "C" fn PyType_Ready(tp: *mut RawPyTypeObject) -> c_int {
 
     // 1. Set base type if not set
     if (*tp).tp_base.is_null() {
-        (*tp).tp_base = &mut PyBaseObject_Type;
+        (*tp).tp_base = std::ptr::addr_of_mut!(PyBaseObject_Type);
     }
 
     // 2. Set metaclass if not set
@@ -575,6 +575,20 @@ pub unsafe extern "C" fn PyType_Ready(tp: *mut RawPyTypeObject) -> c_int {
     }
 
     // 3. Ensure base is ready first
+    let base = (*tp).tp_base;
+    if !base.is_null() {
+        // Check alignment before dereferencing
+        let base_addr = base as usize;
+        if base_addr % std::mem::align_of::<RawPyTypeObject>() != 0 {
+            eprintln!("[rustthon] PyType_Ready: MISALIGNED tp_base={:p} (alignment {}), tp={:p} tp_name={:?}",
+                base, std::mem::align_of::<RawPyTypeObject>(), tp,
+                if !(*tp).tp_name.is_null() {
+                    std::ffi::CStr::from_ptr((*tp).tp_name).to_str().unwrap_or("???")
+                } else { "(null)" });
+            // Try to continue with &PyBaseObject_Type instead
+            (*tp).tp_base = &mut PyBaseObject_Type;
+        }
+    }
     let base = (*tp).tp_base;
     if !base.is_null() && (*base).tp_flags & PY_TPFLAGS_READY == 0 {
         let ret = PyType_Ready(base);
@@ -658,6 +672,7 @@ pub unsafe extern "C" fn PyType_Ready(tp: *mut RawPyTypeObject) -> c_int {
             | PY_TPFLAGS_BYTES_SUBCLASS
             | PY_TPFLAGS_UNICODE_SUBCLASS
             | PY_TPFLAGS_DICT_SUBCLASS
+            | PY_TPFLAGS_TYPE_SUBCLASS
         );
     }
 
@@ -693,7 +708,7 @@ pub unsafe fn init_base_types() {
     PyType_Type.tp_free = Some(crate::runtime::memory::PyObject_Free);
     PyType_Type.tp_getattro = Some(PyObject_GenericGetAttr);
     PyType_Type.tp_setattro = Some(PyObject_GenericSetAttr);
-    PyType_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_READY;
+    PyType_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_READY | PY_TPFLAGS_TYPE_SUBCLASS;
     PyType_Type.ob_base.ob_type = &mut PyType_Type; // type's type is type
     PyType_Type.ob_base.ob_refcnt =
         std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
@@ -716,4 +731,360 @@ pub unsafe extern "C" fn PyType_IsSubtype(
         tp = (*tp).tp_base;
     }
     0
+}
+
+/// PyType_GetFlags — return tp_flags of a type (stable ABI).
+#[no_mangle]
+pub unsafe extern "C" fn PyType_GetFlags(tp: *mut RawPyTypeObject) -> u64 {
+    if tp.is_null() {
+        return 0;
+    }
+    (*tp).tp_flags
+}
+
+/// Slot IDs for PyType_GetSlot / PyType_FromSpec.
+/// Values from CPython 3.11 Include/typeslots.h — these are part of the stable ABI.
+const PY_BF_GETBUFFER: c_int = 1;
+const PY_BF_RELEASEBUFFER: c_int = 2;
+const PY_MP_ASS_SUBSCRIPT: c_int = 3;
+const PY_MP_LENGTH: c_int = 4;
+const PY_MP_SUBSCRIPT: c_int = 5;
+const PY_NB_ADD: c_int = 7;
+const PY_NB_BOOL: c_int = 9;
+const PY_NB_FLOAT: c_int = 11;
+const PY_NB_INDEX: c_int = 13;
+const PY_NB_INT: c_int = 26;
+const PY_NB_MULTIPLY: c_int = 29;
+const PY_NB_SUBTRACT: c_int = 36;
+const PY_SQ_ITEM: c_int = 44;
+const PY_SQ_LENGTH: c_int = 45;
+const PY_TP_ALLOC: c_int = 47;
+const PY_TP_BASE: c_int = 48;
+// const PY_TP_BASES: c_int = 49;
+const PY_TP_CALL: c_int = 50;
+const PY_TP_CLEAR: c_int = 51;
+const PY_TP_DEALLOC: c_int = 52;
+// const PY_TP_DEL: c_int = 53;
+const PY_TP_DESCR_GET: c_int = 54;
+const PY_TP_DESCR_SET: c_int = 55;
+const PY_TP_DOC: c_int = 56;
+const PY_TP_GETATTR: c_int = 57;
+const PY_TP_GETATTRO: c_int = 58;
+const PY_TP_HASH: c_int = 59;
+const PY_TP_INIT: c_int = 60;
+// const PY_TP_IS_GC: c_int = 61;
+const PY_TP_ITER: c_int = 62;
+const PY_TP_ITERNEXT: c_int = 63;
+const PY_TP_METHODS: c_int = 64;
+const PY_TP_NEW: c_int = 65;
+const PY_TP_REPR: c_int = 66;
+const PY_TP_RICHCOMPARE: c_int = 67;
+const PY_TP_SETATTR: c_int = 68;
+const PY_TP_SETATTRO: c_int = 69;
+const PY_TP_STR: c_int = 70;
+const PY_TP_TRAVERSE: c_int = 71;
+const PY_TP_MEMBERS: c_int = 72;
+const PY_TP_GETSET: c_int = 73;
+const PY_TP_FREE: c_int = 74;
+const PY_TP_FINALIZE: c_int = 80;
+
+/// PyType_GetSlot — get a slot function from a type (stable ABI).
+#[no_mangle]
+pub unsafe extern "C" fn PyType_GetSlot(
+    tp: *mut RawPyTypeObject,
+    slot: c_int,
+) -> *mut c_void {
+    if tp.is_null() {
+        return ptr::null_mut();
+    }
+    match slot {
+        PY_TP_DEALLOC => (*tp).tp_dealloc.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_REPR => (*tp).tp_repr.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_HASH => (*tp).tp_hash.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_CALL => (*tp).tp_call.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_STR => (*tp).tp_str.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_GETATTRO => (*tp).tp_getattro.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_SETATTRO => (*tp).tp_setattro.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_TRAVERSE => (*tp).tp_traverse.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_CLEAR => (*tp).tp_clear.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_RICHCOMPARE => (*tp).tp_richcompare.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_ITER => (*tp).tp_iter.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_ITERNEXT => (*tp).tp_iternext.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_METHODS => (*tp).tp_methods as *mut c_void,
+        PY_TP_MEMBERS => (*tp).tp_members as *mut c_void,
+        PY_TP_GETSET => (*tp).tp_getset as *mut c_void,
+        PY_TP_BASE => (*tp).tp_base as *mut c_void,
+        PY_TP_INIT => (*tp).tp_init.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_ALLOC => (*tp).tp_alloc.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_NEW => (*tp).tp_new.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_FREE => (*tp).tp_free.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_FINALIZE => (*tp).tp_finalize.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        PY_TP_DOC => (*tp).tp_doc as *mut c_void,
+        _ => ptr::null_mut(),
+    }
+}
+
+/// PyType_Spec slot entry, matching CPython.
+#[repr(C)]
+pub struct PyType_Slot {
+    pub slot: c_int,
+    pub pfunc: *mut c_void,
+}
+
+/// PyType_Spec, matching CPython.
+#[repr(C)]
+pub struct PyType_Spec {
+    pub name: *const c_char,
+    pub basicsize: c_int,
+    pub itemsize: c_int,
+    pub flags: u32,
+    pub slots: *mut PyType_Slot,
+}
+
+/// PyType_FromModuleAndSpec — create a type from a module and spec (stable ABI).
+/// This is how PyO3 and Cython create heap types.
+#[no_mangle]
+pub unsafe extern "C" fn PyType_FromModuleAndSpec(
+    module: *mut RawPyObject,
+    spec: *mut PyType_Spec,
+    bases: *mut RawPyObject,
+) -> *mut RawPyObject {
+    if spec.is_null() {
+        return ptr::null_mut();
+    }
+
+    // Allocate a new type object
+    let tp = libc::calloc(1, std::mem::size_of::<RawPyTypeObject>()) as *mut RawPyTypeObject;
+    if tp.is_null() {
+        return ptr::null_mut();
+    }
+    std::ptr::write(tp, RawPyTypeObject::zeroed());
+
+    (*tp).tp_name = (*spec).name;
+    (*tp).tp_basicsize = (*spec).basicsize as PySsizeT;
+    (*tp).tp_itemsize = (*spec).itemsize as PySsizeT;
+    (*tp).tp_flags = (*spec).flags as u64;
+    (*tp).ob_base.ob_type = &mut PyType_Type;
+    (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+
+    // Process slots
+    if !(*spec).slots.is_null() {
+        let mut slot_ptr = (*spec).slots;
+        while (*slot_ptr).slot != 0 || !(*slot_ptr).pfunc.is_null() {
+            let slot_id = (*slot_ptr).slot;
+            let pfunc = (*slot_ptr).pfunc;
+            if slot_id == 0 && pfunc.is_null() {
+                break;
+            }
+            match slot_id {
+                PY_TP_DEALLOC => (*tp).tp_dealloc = Some(std::mem::transmute(pfunc)),
+                PY_TP_REPR => (*tp).tp_repr = Some(std::mem::transmute(pfunc)),
+                PY_TP_HASH => (*tp).tp_hash = Some(std::mem::transmute(pfunc)),
+                PY_TP_CALL => (*tp).tp_call = Some(std::mem::transmute(pfunc)),
+                PY_TP_STR => (*tp).tp_str = Some(std::mem::transmute(pfunc)),
+                PY_TP_GETATTRO => (*tp).tp_getattro = Some(std::mem::transmute(pfunc)),
+                PY_TP_SETATTRO => (*tp).tp_setattro = Some(std::mem::transmute(pfunc)),
+                PY_TP_DOC => (*tp).tp_doc = pfunc as *const c_char,
+                PY_TP_TRAVERSE => (*tp).tp_traverse = Some(std::mem::transmute(pfunc)),
+                PY_TP_CLEAR => (*tp).tp_clear = Some(std::mem::transmute(pfunc)),
+                PY_TP_RICHCOMPARE => (*tp).tp_richcompare = Some(std::mem::transmute(pfunc)),
+                PY_TP_ITER => (*tp).tp_iter = Some(std::mem::transmute(pfunc)),
+                PY_TP_ITERNEXT => (*tp).tp_iternext = Some(std::mem::transmute(pfunc)),
+                PY_TP_METHODS => (*tp).tp_methods = pfunc as *mut PyMethodDef,
+                PY_TP_MEMBERS => (*tp).tp_members = pfunc as *mut PyMemberDef,
+                PY_TP_GETSET => (*tp).tp_getset = pfunc as *mut PyGetSetDef,
+                PY_TP_INIT => (*tp).tp_init = Some(std::mem::transmute(pfunc)),
+                PY_TP_ALLOC => (*tp).tp_alloc = Some(std::mem::transmute(pfunc)),
+                PY_TP_NEW => (*tp).tp_new = Some(std::mem::transmute(pfunc)),
+                PY_TP_FREE => (*tp).tp_free = Some(std::mem::transmute(pfunc)),
+                PY_TP_FINALIZE => (*tp).tp_finalize = Some(std::mem::transmute(pfunc)),
+                PY_TP_DESCR_GET => (*tp).tp_descr_get = Some(std::mem::transmute(pfunc)),
+                PY_TP_BASE => { /* handled separately below */ },
+                _ => {
+                    eprintln!("[rustthon] PyType_FromModuleAndSpec: ignoring unknown slot_id={}", slot_id);
+                } // Unknown slot, ignore
+            }
+            slot_ptr = slot_ptr.add(1);
+        }
+    }
+
+    // Handle Py_tp_base from slots (if specified)
+    if !(*spec).slots.is_null() {
+        let mut slot_ptr2 = (*spec).slots;
+        while (*slot_ptr2).slot != 0 || !(*slot_ptr2).pfunc.is_null() {
+            if (*slot_ptr2).slot == PY_TP_BASE && !(*slot_ptr2).pfunc.is_null() {
+                (*tp).tp_base = (*slot_ptr2).pfunc as *mut RawPyTypeObject;
+            }
+            if (*slot_ptr2).slot == 0 && (*slot_ptr2).pfunc.is_null() {
+                break;
+            }
+            slot_ptr2 = slot_ptr2.add(1);
+        }
+    }
+
+    // Handle bases argument — extract primary base from tuple
+    if (*tp).tp_base.is_null() && !bases.is_null() {
+        if crate::types::tuple::PyTuple_Check(bases) != 0 {
+            let size = crate::types::tuple::PyTuple_Size(bases);
+            if size > 0 {
+                let first = crate::types::tuple::PyTuple_GetItem(bases, 0);
+                if !first.is_null() {
+                    (*tp).tp_base = first as *mut RawPyTypeObject;
+                }
+            }
+        } else {
+            // Single type object passed directly
+            (*tp).tp_base = bases as *mut RawPyTypeObject;
+        }
+    }
+
+    // Store bases tuple on the type
+    if !bases.is_null() && (*tp).tp_bases.is_null() {
+        (*bases).incref();
+        (*tp).tp_bases = bases;
+    }
+
+    // Call PyType_Ready to finalize
+    let ret = PyType_Ready(tp);
+    if ret < 0 {
+        eprintln!("[rustthon] PyType_FromModuleAndSpec: PyType_Ready failed for {:?}",
+            if !(*spec).name.is_null() {
+                std::ffi::CStr::from_ptr((*spec).name).to_str().unwrap_or("???")
+            } else { "(null)" });
+        libc::free(tp as *mut c_void);
+        return ptr::null_mut();
+    }
+
+    tp as *mut RawPyObject
+}
+
+/// PyType_FromSpecWithBases — create a type from a spec with explicit bases.
+/// This is what Cython calls for CPython < 3.12.
+#[no_mangle]
+pub unsafe extern "C" fn PyType_FromSpecWithBases(
+    spec: *mut PyType_Spec,
+    bases: *mut RawPyObject,
+) -> *mut RawPyObject {
+    if spec.is_null() {
+        return ptr::null_mut();
+    }
+
+    // Extract the primary base type from bases
+    let mut base_type: *mut RawPyTypeObject = ptr::null_mut();
+    if !bases.is_null() {
+        // bases can be a tuple of types, or a single type
+        if crate::types::tuple::PyTuple_Check(bases) != 0 {
+            let size = crate::types::tuple::PyTuple_Size(bases);
+            if size > 0 {
+                let first = crate::types::tuple::PyTuple_GetItem(bases, 0);
+                if !first.is_null() {
+                    base_type = first as *mut RawPyTypeObject;
+                }
+            }
+        } else {
+            // Single type object passed directly
+            base_type = bases as *mut RawPyTypeObject;
+        }
+    }
+
+    // Allocate a new type object
+    let tp = libc::calloc(1, std::mem::size_of::<RawPyTypeObject>()) as *mut RawPyTypeObject;
+    if tp.is_null() {
+        return ptr::null_mut();
+    }
+    std::ptr::write(tp, RawPyTypeObject::zeroed());
+
+    (*tp).tp_name = (*spec).name;
+    (*tp).tp_basicsize = (*spec).basicsize as PySsizeT;
+    (*tp).tp_itemsize = (*spec).itemsize as PySsizeT;
+    (*tp).tp_flags = (*spec).flags as u64;
+    (*tp).ob_base.ob_type = &mut PyType_Type;
+    (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+
+    // Set base type if extracted from bases
+    if !base_type.is_null() {
+        (*tp).tp_base = base_type;
+    }
+
+    // Process slots
+    if !(*spec).slots.is_null() {
+        let mut slot_ptr = (*spec).slots;
+        while (*slot_ptr).slot != 0 || !(*slot_ptr).pfunc.is_null() {
+            let slot_id = (*slot_ptr).slot;
+            let pfunc = (*slot_ptr).pfunc;
+            if slot_id == 0 && pfunc.is_null() {
+                break;
+            }
+            match slot_id {
+                PY_TP_DEALLOC => (*tp).tp_dealloc = Some(std::mem::transmute(pfunc)),
+                PY_TP_REPR => (*tp).tp_repr = Some(std::mem::transmute(pfunc)),
+                PY_TP_HASH => (*tp).tp_hash = Some(std::mem::transmute(pfunc)),
+                PY_TP_CALL => (*tp).tp_call = Some(std::mem::transmute(pfunc)),
+                PY_TP_STR => (*tp).tp_str = Some(std::mem::transmute(pfunc)),
+                PY_TP_GETATTRO => (*tp).tp_getattro = Some(std::mem::transmute(pfunc)),
+                PY_TP_SETATTRO => (*tp).tp_setattro = Some(std::mem::transmute(pfunc)),
+                PY_TP_DOC => (*tp).tp_doc = pfunc as *const c_char,
+                PY_TP_TRAVERSE => (*tp).tp_traverse = Some(std::mem::transmute(pfunc)),
+                PY_TP_CLEAR => (*tp).tp_clear = Some(std::mem::transmute(pfunc)),
+                PY_TP_RICHCOMPARE => (*tp).tp_richcompare = Some(std::mem::transmute(pfunc)),
+                PY_TP_ITER => (*tp).tp_iter = Some(std::mem::transmute(pfunc)),
+                PY_TP_ITERNEXT => (*tp).tp_iternext = Some(std::mem::transmute(pfunc)),
+                PY_TP_METHODS => (*tp).tp_methods = pfunc as *mut PyMethodDef,
+                PY_TP_MEMBERS => (*tp).tp_members = pfunc as *mut PyMemberDef,
+                PY_TP_GETSET => (*tp).tp_getset = pfunc as *mut PyGetSetDef,
+                PY_TP_INIT => (*tp).tp_init = Some(std::mem::transmute(pfunc)),
+                PY_TP_ALLOC => (*tp).tp_alloc = Some(std::mem::transmute(pfunc)),
+                PY_TP_NEW => (*tp).tp_new = Some(std::mem::transmute(pfunc)),
+                PY_TP_FREE => (*tp).tp_free = Some(std::mem::transmute(pfunc)),
+                PY_TP_FINALIZE => (*tp).tp_finalize = Some(std::mem::transmute(pfunc)),
+                PY_TP_DESCR_GET => (*tp).tp_descr_get = Some(std::mem::transmute(pfunc)),
+                PY_TP_BASE => {
+                    // Override base type from slot
+                    (*tp).tp_base = pfunc as *mut RawPyTypeObject;
+                },
+                _ => {} // Unknown slot, ignore
+            }
+            slot_ptr = slot_ptr.add(1);
+        }
+    }
+
+    // Store bases tuple on the type
+    if !bases.is_null() {
+        (*bases).incref();
+        (*tp).tp_bases = bases;
+    }
+
+    // Call PyType_Ready to finalize
+    let ret = PyType_Ready(tp);
+    if ret < 0 {
+        eprintln!("[rustthon] PyType_FromSpecWithBases: PyType_Ready failed for {:?}",
+            if !(*spec).name.is_null() {
+                std::ffi::CStr::from_ptr((*spec).name).to_str().unwrap_or("???")
+            } else { "(null)" });
+        libc::free(tp as *mut c_void);
+        return ptr::null_mut();
+    }
+
+    eprintln!("[rustthon] PyType_FromSpecWithBases: created type {:?} at {:p}, basicsize={}, base={:p}",
+        if !(*spec).name.is_null() {
+            std::ffi::CStr::from_ptr((*spec).name).to_str().unwrap_or("???")
+        } else { "(null)" },
+        tp, (*tp).tp_basicsize, (*tp).tp_base);
+
+    tp as *mut RawPyObject
+}
+
+/// PyType_FromSpec — create a type from a spec (no bases).
+#[no_mangle]
+pub unsafe extern "C" fn PyType_FromSpec(
+    spec: *mut PyType_Spec,
+) -> *mut RawPyObject {
+    PyType_FromSpecWithBases(spec, ptr::null_mut())
+}
+
+/// PyType_Modified — notify that a type's dict has been modified.
+/// No-op in our implementation (no method caches to invalidate).
+#[no_mangle]
+pub unsafe extern "C" fn PyType_Modified(_tp: *mut RawPyTypeObject) {
+    // No-op: we don't have method resolution caches to invalidate
 }
