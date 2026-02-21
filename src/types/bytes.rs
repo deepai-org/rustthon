@@ -10,6 +10,7 @@
 
 use crate::object::pyobject::{RawPyObject, RawPyVarObject};
 use crate::object::typeobj::{RawPyTypeObject, PY_TPFLAGS_DEFAULT, PY_TPFLAGS_BYTES_SUBCLASS};
+use crate::object::SyncUnsafeCell;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
 
@@ -32,16 +33,16 @@ unsafe fn ob_sval(obj: *mut PyBytesObject) -> *mut u8 {
 }
 
 #[no_mangle]
-pub static mut PyBytes_Type: RawPyTypeObject = {
+pub static PyBytes_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"bytes\0".as_ptr() as *const _;
     tp.tp_basicsize = BYTES_HEADER_SIZE as isize; // 32
     tp.tp_itemsize = 1; // each item is 1 byte
     tp
-};
+});
 
-pub unsafe fn bytes_type() -> *mut RawPyTypeObject {
-    &mut PyBytes_Type
+pub fn bytes_type() -> *mut RawPyTypeObject {
+    PyBytes_Type.get()
 }
 
 unsafe extern "C" fn bytes_dealloc(obj: *mut RawPyObject) {
@@ -69,20 +70,24 @@ unsafe fn alloc_bytes(size: usize) -> *mut RawPyObject {
     raw as *mut RawPyObject
 }
 
-pub unsafe fn create_bytes_from_slice(data: &[u8]) -> *mut RawPyObject {
-    let obj = alloc_bytes(data.len());
-    let b = obj as *mut PyBytesObject;
-    let dest = ob_sval(b);
-    ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
-    // Null terminator already set by calloc
-    obj
+pub fn create_bytes_from_slice(data: &[u8]) -> *mut RawPyObject {
+    unsafe {
+        let obj = alloc_bytes(data.len());
+        let b = obj as *mut PyBytesObject;
+        let dest = ob_sval(b);
+        ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
+        // Null terminator already set by calloc
+        obj
+    }
 }
 
-pub unsafe fn bytes_value(obj: *mut RawPyObject) -> &'static [u8] {
-    let b = obj as *mut PyBytesObject;
-    let len = (*b).ob_base.ob_size as usize;
-    let data = ob_sval(b);
-    std::slice::from_raw_parts(data, len)
+pub fn bytes_value(obj: *mut RawPyObject) -> &'static [u8] {
+    unsafe {
+        let b = obj as *mut PyBytesObject;
+        let len = (*b).ob_base.ob_size as usize;
+        let data = ob_sval(b);
+        std::slice::from_raw_parts(data, len)
+    }
 }
 
 // ─── C API ───
@@ -189,6 +194,6 @@ pub unsafe extern "C" fn PyBytes_Concat(
 }
 
 pub unsafe fn init_bytes_type() {
-    PyBytes_Type.tp_dealloc = Some(bytes_dealloc);
-    PyBytes_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_BYTES_SUBCLASS;
+    (*PyBytes_Type.get()).tp_dealloc = Some(bytes_dealloc);
+    (*PyBytes_Type.get()).tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_BYTES_SUBCLASS;
 }

@@ -25,6 +25,7 @@
 
 use crate::object::pyobject::RawPyObject;
 use crate::object::typeobj::{RawPyTypeObject, PY_TPFLAGS_DEFAULT, PY_TPFLAGS_UNICODE_SUBCLASS};
+use crate::object::SyncUnsafeCell;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
@@ -88,17 +89,17 @@ fn state_is_ascii(state: u32) -> bool {
 // ─── Type object ───
 
 #[no_mangle]
-pub static mut PyUnicode_Type: RawPyTypeObject = {
+pub static PyUnicode_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"str\0".as_ptr() as *const _;
     tp.tp_basicsize = ASCII_HEADER as isize;
     tp.tp_itemsize = 0;
     tp
-};
+});
 
 /// Override pointer — set by sync_types_from_dylib() so the binary uses the
-pub unsafe fn unicode_type() -> *mut RawPyTypeObject {
-    &mut PyUnicode_Type
+pub fn unicode_type() -> *mut RawPyTypeObject {
+    PyUnicode_Type.get()
 }
 
 unsafe extern "C" fn unicode_dealloc(obj: *mut RawPyObject) {
@@ -240,24 +241,26 @@ unsafe fn create_unicode(s: &str) -> *mut RawPyObject {
 /// Get the string value as a UTF-8 &str.
 /// For ASCII compact: data at offset 48 is valid UTF-8.
 /// For non-ASCII compact: read from cached utf8 field.
-pub unsafe fn unicode_value(obj: *mut RawPyObject) -> &'static str {
-    let ascii = obj as *mut PyASCIIObject;
-    let state = (*ascii).state;
-    if state_is_ascii(state) {
-        // Compact ASCII: data inline at offset 48
-        let data = (obj as *mut u8).add(ASCII_HEADER);
-        let len = (*ascii).length as usize;
-        let bytes = std::slice::from_raw_parts(data, len);
-        std::str::from_utf8_unchecked(bytes)
-    } else {
-        // Non-ASCII compact: read from cached utf8
-        let compact = obj as *mut PyCompactUnicodeObject;
-        if !(*compact).utf8.is_null() {
-            let len = (*compact).utf8_length as usize;
-            let bytes = std::slice::from_raw_parts((*compact).utf8, len);
+pub fn unicode_value(obj: *mut RawPyObject) -> &'static str {
+    unsafe {
+        let ascii = obj as *mut PyASCIIObject;
+        let state = (*ascii).state;
+        if state_is_ascii(state) {
+            // Compact ASCII: data inline at offset 48
+            let data = (obj as *mut u8).add(ASCII_HEADER);
+            let len = (*ascii).length as usize;
+            let bytes = std::slice::from_raw_parts(data, len);
             std::str::from_utf8_unchecked(bytes)
         } else {
-            ""
+            // Non-ASCII compact: read from cached utf8
+            let compact = obj as *mut PyCompactUnicodeObject;
+            if !(*compact).utf8.is_null() {
+                let len = (*compact).utf8_length as usize;
+                let bytes = std::slice::from_raw_parts((*compact).utf8, len);
+                std::str::from_utf8_unchecked(bytes)
+            } else {
+                ""
+            }
         }
     }
 }
@@ -441,8 +444,8 @@ pub unsafe extern "C" fn PyUnicode_InternFromString(s: *const c_char) -> *mut Ra
 }
 
 /// Helper: create a Python string from a Rust &str
-pub unsafe fn create_from_str(s: &str) -> *mut RawPyObject {
-    create_unicode(s)
+pub fn create_from_str(s: &str) -> *mut RawPyObject {
+    unsafe { create_unicode(s) }
 }
 
 /// PyUnicode_New — allocate an empty unicode object with room for `size` characters
@@ -631,6 +634,6 @@ pub unsafe extern "C" fn _PyUnicode_FastCopyCharacters(
 }
 
 pub unsafe fn init_unicode_type() {
-    PyUnicode_Type.tp_dealloc = Some(unicode_dealloc);
-    PyUnicode_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_UNICODE_SUBCLASS;
+    (*PyUnicode_Type.get()).tp_dealloc = Some(unicode_dealloc);
+    (*PyUnicode_Type.get()).tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_UNICODE_SUBCLASS;
 }

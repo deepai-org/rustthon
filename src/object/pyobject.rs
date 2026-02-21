@@ -59,6 +59,9 @@ pub struct PyGCHead {
 // Static assertion: PyGC_Head must be exactly 16 bytes
 const _: () = assert!(std::mem::size_of::<PyGCHead>() == 16);
 
+unsafe impl Send for RawPyObject {}
+unsafe impl Sync for RawPyObject {}
+
 impl RawPyObject {
     /// Create a new RawPyObject with refcount 1 and the given type.
     pub fn new(tp: *mut RawPyTypeObject) -> Self {

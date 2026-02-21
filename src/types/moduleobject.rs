@@ -5,20 +5,21 @@
 
 use crate::object::pyobject::{PyObjectWithData, RawPyObject};
 use crate::object::typeobj::{PyMethodDef, RawPyTypeObject};
+use crate::object::SyncUnsafeCell;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
-static mut MODULE_TYPE: RawPyTypeObject = {
+static MODULE_TYPE: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"module\0".as_ptr() as *const _;
     tp.tp_basicsize = 0;
     tp.tp_getattro = Some(module_getattro);
     tp.tp_setattro = Some(module_setattro);
     tp
-};
+});
 
-pub unsafe fn module_type() -> *mut RawPyTypeObject {
-    &mut MODULE_TYPE
+pub fn module_type() -> *mut RawPyTypeObject {
+    MODULE_TYPE.get()
 }
 
 /// module_getattro — lookup attribute in module __dict__
@@ -37,7 +38,7 @@ unsafe extern "C" fn module_getattro(
     }
     // Attribute not found — set AttributeError
     crate::runtime::error::PyErr_SetString(
-        crate::runtime::error::PyExc_AttributeError,
+        *crate::runtime::error::PyExc_AttributeError.get(),
         b"module has no attribute\0".as_ptr() as *const _,
     );
     ptr::null_mut()
@@ -133,7 +134,7 @@ pub unsafe extern "C" fn PyModule_Create2(
     }
 
     let module = PyObjectWithData::alloc(
-        &mut MODULE_TYPE,
+        MODULE_TYPE.get(),
         ModuleData {
             name,
             dict,
@@ -325,7 +326,7 @@ pub unsafe extern "C" fn PyModule_NewObject(name: *mut RawPyObject) -> *mut RawP
     crate::types::dict::PyDict_SetItemString(dict, b"__name__\0".as_ptr() as *const _, name);
 
     let module = PyObjectWithData::alloc(
-        &mut MODULE_TYPE,
+        MODULE_TYPE.get(),
         ModuleData {
             name: name_str,
             dict,

@@ -6,6 +6,7 @@
 
 use crate::object::pyobject::RawPyObject;
 use crate::object::typeobj::RawPyTypeObject;
+use crate::object::SyncUnsafeCell;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
@@ -23,12 +24,12 @@ pub struct PyCodeObject {
     pub co_firstlineno: c_int,
 }
 
-static mut CODE_TYPE: RawPyTypeObject = {
+static CODE_TYPE: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"code\0".as_ptr() as *const _;
     tp.tp_basicsize = std::mem::size_of::<PyCodeObject>() as isize;
     tp
-};
+});
 
 /// PyCode_NewEmpty — create a minimal code object (used by Cython for tracebacks).
 #[no_mangle]
@@ -42,7 +43,7 @@ pub unsafe extern "C" fn PyCode_NewEmpty(
         return ptr::null_mut();
     }
     (*code).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
-    (*code).ob_type = &mut CODE_TYPE;
+    (*code).ob_type = CODE_TYPE.get();
     (*code).co_filename = if !filename.is_null() {
         crate::types::unicode::PyUnicode_FromString(filename)
     } else {
@@ -104,12 +105,12 @@ pub struct PyFrameObject {
     pub f_lineno: c_int,
 }
 
-static mut FRAME_TYPE: RawPyTypeObject = {
+static FRAME_TYPE: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"frame\0".as_ptr() as *const _;
     tp.tp_basicsize = std::mem::size_of::<PyFrameObject>() as isize;
     tp
-};
+});
 
 /// PyFrame_New — create a frame object.
 /// Cython uses this to build traceback chains.
@@ -125,7 +126,7 @@ pub unsafe extern "C" fn PyFrame_New(
         return ptr::null_mut();
     }
     (*frame).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
-    (*frame).ob_type = &mut FRAME_TYPE;
+    (*frame).ob_type = FRAME_TYPE.get();
     (*frame).f_back = ptr::null_mut();
     (*frame).f_code = code as *mut PyCodeObject;
     if !code.is_null() {

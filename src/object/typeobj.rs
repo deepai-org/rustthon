@@ -5,6 +5,7 @@
 //! We implement the critical ones that extensions actually use.
 
 use crate::object::pyobject::RawPyObject;
+use crate::object::SyncUnsafeCell;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
@@ -413,21 +414,21 @@ impl RawPyTypeObject {
 
 /// The metaclass: type of all types.
 #[no_mangle]
-pub static mut PyType_Type: RawPyTypeObject = {
+pub static PyType_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"type\0".as_ptr() as *const _;
     tp.tp_basicsize = std::mem::size_of::<RawPyTypeObject>() as isize;
     tp
-};
+});
 
 /// The base class: object.
 #[no_mangle]
-pub static mut PyBaseObject_Type: RawPyTypeObject = {
+pub static PyBaseObject_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"object\0".as_ptr() as *const _;
     tp.tp_basicsize = std::mem::size_of::<RawPyObject>() as isize;
     tp
-};
+});
 
 // ─── Default slot function implementations ───
 
@@ -566,12 +567,12 @@ pub unsafe extern "C" fn PyType_Ready(tp: *mut RawPyTypeObject) -> c_int {
 
     // 1. Set base type if not set
     if (*tp).tp_base.is_null() {
-        (*tp).tp_base = std::ptr::addr_of_mut!(PyBaseObject_Type);
+        (*tp).tp_base = PyBaseObject_Type.get();
     }
 
     // 2. Set metaclass if not set
     if (*tp).ob_base.ob_type.is_null() {
-        (*tp).ob_base.ob_type = &mut PyType_Type;
+        (*tp).ob_base.ob_type = PyType_Type.get();
     }
 
     // 3. Ensure base is ready first
@@ -581,7 +582,7 @@ pub unsafe extern "C" fn PyType_Ready(tp: *mut RawPyTypeObject) -> c_int {
         let base_addr = base as usize;
         if base_addr % std::mem::align_of::<RawPyTypeObject>() != 0 {
             // Misaligned tp_base — fall back to PyBaseObject_Type
-            (*tp).tp_base = &mut PyBaseObject_Type;
+            (*tp).tp_base = PyBaseObject_Type.get();
         }
     }
     let base = (*tp).tp_base;
@@ -682,31 +683,33 @@ pub unsafe extern "C" fn PyType_Ready(tp: *mut RawPyTypeObject) -> c_int {
 
 /// Initialize PyBaseObject_Type and PyType_Type with default slots.
 /// Must be called early in init_types(), before any other type init.
-pub unsafe fn init_base_types() {
+pub fn init_base_types() {
+    unsafe {
     // PyBaseObject_Type gets default slot implementations
-    PyBaseObject_Type.tp_alloc = Some(PyType_GenericAlloc);
-    PyBaseObject_Type.tp_new = Some(PyType_GenericNew);
-    PyBaseObject_Type.tp_init = Some(default_init);
-    PyBaseObject_Type.tp_free = Some(crate::runtime::memory::PyObject_Free);
-    PyBaseObject_Type.tp_getattro = Some(PyObject_GenericGetAttr);
-    PyBaseObject_Type.tp_setattro = Some(PyObject_GenericSetAttr);
-    PyBaseObject_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_READY;
-    PyBaseObject_Type.ob_base.ob_type = &mut PyType_Type;
-    PyBaseObject_Type.ob_base.ob_refcnt =
+    (*PyBaseObject_Type.get()).tp_alloc = Some(PyType_GenericAlloc);
+    (*PyBaseObject_Type.get()).tp_new = Some(PyType_GenericNew);
+    (*PyBaseObject_Type.get()).tp_init = Some(default_init);
+    (*PyBaseObject_Type.get()).tp_free = Some(crate::runtime::memory::PyObject_Free);
+    (*PyBaseObject_Type.get()).tp_getattro = Some(PyObject_GenericGetAttr);
+    (*PyBaseObject_Type.get()).tp_setattro = Some(PyObject_GenericSetAttr);
+    (*PyBaseObject_Type.get()).tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_READY;
+    (*PyBaseObject_Type.get()).ob_base.ob_type = PyType_Type.get();
+    (*PyBaseObject_Type.get()).ob_base.ob_refcnt =
         std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
 
     // PyType_Type — metaclass of all types
-    PyType_Type.tp_base = &mut PyBaseObject_Type;
-    PyType_Type.tp_alloc = Some(PyType_GenericAlloc);
-    PyType_Type.tp_new = Some(PyType_GenericNew);
-    PyType_Type.tp_init = Some(default_init);
-    PyType_Type.tp_free = Some(crate::runtime::memory::PyObject_Free);
-    PyType_Type.tp_getattro = Some(PyObject_GenericGetAttr);
-    PyType_Type.tp_setattro = Some(PyObject_GenericSetAttr);
-    PyType_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_READY | PY_TPFLAGS_TYPE_SUBCLASS;
-    PyType_Type.ob_base.ob_type = &mut PyType_Type; // type's type is type
-    PyType_Type.ob_base.ob_refcnt =
+    (*PyType_Type.get()).tp_base = PyBaseObject_Type.get();
+    (*PyType_Type.get()).tp_alloc = Some(PyType_GenericAlloc);
+    (*PyType_Type.get()).tp_new = Some(PyType_GenericNew);
+    (*PyType_Type.get()).tp_init = Some(default_init);
+    (*PyType_Type.get()).tp_free = Some(crate::runtime::memory::PyObject_Free);
+    (*PyType_Type.get()).tp_getattro = Some(PyObject_GenericGetAttr);
+    (*PyType_Type.get()).tp_setattro = Some(PyObject_GenericSetAttr);
+    (*PyType_Type.get()).tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_READY | PY_TPFLAGS_TYPE_SUBCLASS;
+    (*PyType_Type.get()).ob_base.ob_type = PyType_Type.get(); // type's type is type
+    (*PyType_Type.get()).ob_base.ob_refcnt =
         std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
+    }
 }
 
 /// PyType_IsSubtype — check if `a` is a subtype of `b`.
@@ -859,7 +862,7 @@ pub unsafe extern "C" fn PyType_FromModuleAndSpec(
     (*tp).tp_basicsize = (*spec).basicsize as PySsizeT;
     (*tp).tp_itemsize = (*spec).itemsize as PySsizeT;
     (*tp).tp_flags = (*spec).flags as u64;
-    (*tp).ob_base.ob_type = &mut PyType_Type;
+    (*tp).ob_base.ob_type = PyType_Type.get();
     (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
 
     // Process slots
@@ -987,7 +990,7 @@ pub unsafe extern "C" fn PyType_FromSpecWithBases(
     (*tp).tp_basicsize = (*spec).basicsize as PySsizeT;
     (*tp).tp_itemsize = (*spec).itemsize as PySsizeT;
     (*tp).tp_flags = (*spec).flags as u64;
-    (*tp).ob_base.ob_type = &mut PyType_Type;
+    (*tp).ob_base.ob_type = PyType_Type.get();
     (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
 
     // Set base type if extracted from bases

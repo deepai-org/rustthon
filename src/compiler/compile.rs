@@ -4,7 +4,7 @@
 //! into our bytecode format.
 
 use crate::compiler::bytecode::{CodeObject, OpCode};
-use crate::object::pyobject::RawPyObject;
+use crate::object::safe_api::{py_none, py_true, py_false, create_int, create_float, create_str, create_bytes};
 use rustpython_parser::ast::{self, Constant, Expr, Stmt};
 use rustpython_parser::Parse;
 
@@ -37,10 +37,7 @@ impl Compiler {
     }
 
     fn add_none_const(&mut self) -> u32 {
-        unsafe {
-            let none = crate::types::none::PY_NONE.get();
-            self.code.add_const(none)
-        }
+        self.code.add_const(py_none())
     }
 
     fn compile_body(&mut self, stmts: &[Stmt]) -> Result<(), String> {
@@ -137,51 +134,35 @@ impl Compiler {
                     Constant::Int(i) => {
                         // BigInt from malachite-bigint
                         let val: i64 = i.try_into().unwrap_or(0);
-                        unsafe {
-                            let obj = crate::types::longobject::PyLong_FromLong(val as _);
-                            let idx = self.code.add_const(obj);
-                            self.code.emit(OpCode::LoadConst, idx);
-                        }
+                        let obj = create_int(val);
+                        let idx = self.code.add_const(obj);
+                        self.code.emit(OpCode::LoadConst, idx);
                     }
                     Constant::Float(f) => {
-                        unsafe {
-                            let obj = crate::types::floatobject::PyFloat_FromDouble(*f);
-                            let idx = self.code.add_const(obj);
-                            self.code.emit(OpCode::LoadConst, idx);
-                        }
+                        let obj = create_float(*f);
+                        let idx = self.code.add_const(obj);
+                        self.code.emit(OpCode::LoadConst, idx);
                     }
-                    Constant::Complex { real, imag } => {
+                    Constant::Complex { real, imag: _ } => {
                         // TODO: Complex number support — emit the real part for now
-                        unsafe {
-                            let obj = crate::types::floatobject::PyFloat_FromDouble(*real);
-                            let idx = self.code.add_const(obj);
-                            self.code.emit(OpCode::LoadConst, idx);
-                        }
+                        let obj = create_float(*real);
+                        let idx = self.code.add_const(obj);
+                        self.code.emit(OpCode::LoadConst, idx);
                     }
                     Constant::Str(s) => {
-                        unsafe {
-                            let obj = crate::types::unicode::create_from_str(s);
-                            let idx = self.code.add_const(obj);
-                            self.code.emit(OpCode::LoadConst, idx);
-                        }
+                        let obj = create_str(s);
+                        let idx = self.code.add_const(obj);
+                        self.code.emit(OpCode::LoadConst, idx);
                     }
                     Constant::Bytes(b) => {
-                        unsafe {
-                            let obj = crate::types::bytes::create_bytes_from_slice(b);
-                            let idx = self.code.add_const(obj);
-                            self.code.emit(OpCode::LoadConst, idx);
-                        }
+                        let obj = create_bytes(b);
+                        let idx = self.code.add_const(obj);
+                        self.code.emit(OpCode::LoadConst, idx);
                     }
                     Constant::Bool(b) => {
-                        unsafe {
-                            let obj = if *b {
-                                crate::types::boolobject::PY_TRUE.get()
-                            } else {
-                                crate::types::boolobject::PY_FALSE.get()
-                            };
-                            let idx = self.code.add_const(obj);
-                            self.code.emit(OpCode::LoadConst, idx);
-                        }
+                        let obj = if *b { py_true() } else { py_false() };
+                        let idx = self.code.add_const(obj);
+                        self.code.emit(OpCode::LoadConst, idx);
                     }
                     Constant::None => {
                         let idx = self.add_none_const();
@@ -371,11 +352,9 @@ impl Compiler {
                 // f-string — compile each part and concatenate
                 // Simplified: just concatenate string parts
                 if fstring.values.is_empty() {
-                    unsafe {
-                        let obj = crate::types::unicode::create_from_str("");
-                        let idx = self.code.add_const(obj);
-                        self.code.emit(OpCode::LoadConst, idx);
-                    }
+                    let obj = create_str("");
+                    let idx = self.code.add_const(obj);
+                    self.code.emit(OpCode::LoadConst, idx);
                 } else {
                     self.compile_expr(&fstring.values[0])?;
                     for value in &fstring.values[1..] {
@@ -406,36 +385,24 @@ impl Compiler {
         match constant {
             Constant::Int(i) => {
                 let val: i64 = i.try_into().unwrap_or(0);
-                unsafe {
-                    let obj = crate::types::longobject::PyLong_FromLong(val as _);
-                    let idx = self.code.add_const(obj);
-                    self.code.emit(OpCode::LoadConst, idx);
-                }
+                let obj = create_int(val);
+                let idx = self.code.add_const(obj);
+                self.code.emit(OpCode::LoadConst, idx);
             }
             Constant::Float(f) => {
-                unsafe {
-                    let obj = crate::types::floatobject::PyFloat_FromDouble(*f);
-                    let idx = self.code.add_const(obj);
-                    self.code.emit(OpCode::LoadConst, idx);
-                }
+                let obj = create_float(*f);
+                let idx = self.code.add_const(obj);
+                self.code.emit(OpCode::LoadConst, idx);
             }
             Constant::Str(s) => {
-                unsafe {
-                    let obj = crate::types::unicode::create_from_str(s);
-                    let idx = self.code.add_const(obj);
-                    self.code.emit(OpCode::LoadConst, idx);
-                }
+                let obj = create_str(s);
+                let idx = self.code.add_const(obj);
+                self.code.emit(OpCode::LoadConst, idx);
             }
             Constant::Bool(b) => {
-                unsafe {
-                    let obj = if *b {
-                        crate::types::boolobject::PY_TRUE.get()
-                    } else {
-                        crate::types::boolobject::PY_FALSE.get()
-                    };
-                    let idx = self.code.add_const(obj);
-                    self.code.emit(OpCode::LoadConst, idx);
-                }
+                let obj = if *b { py_true() } else { py_false() };
+                let idx = self.code.add_const(obj);
+                self.code.emit(OpCode::LoadConst, idx);
             }
             Constant::None => {
                 let idx = self.add_none_const();

@@ -5,6 +5,7 @@
 //! We replicate this exact mechanism.
 
 use crate::object::pyobject::RawPyObject;
+use crate::object::StaticPtr;
 use std::cell::RefCell;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
@@ -249,7 +250,7 @@ pub unsafe extern "C" fn PyErr_NewException(
     let base_tp = if !base.is_null() {
         base as *mut RawPyTypeObject
     } else {
-        PyExc_Exception as *mut RawPyTypeObject
+        *PyExc_Exception.get() as *mut RawPyTypeObject
     };
 
     // We need a stable name pointer — heap-allocate a copy of the name string
@@ -269,7 +270,7 @@ pub unsafe extern "C" fn PyErr_NewException(
     std::ptr::write(tp, RawPyTypeObject::zeroed());
 
     (*tp).tp_name = name_copy as *const c_char;
-    (*tp).ob_base.ob_type = &mut crate::object::typeobj::PyType_Type;
+    (*tp).ob_base.ob_type = crate::object::typeobj::PyType_Type.get();
     (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
     (*tp).tp_basicsize = std::mem::size_of::<RawPyObject>() as isize;
     (*tp).tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
@@ -305,31 +306,31 @@ pub unsafe extern "C" fn PyErr_NewException(
 use crate::object::typeobj::RawPyTypeObject;
 
 // Pointer variables matching CPython ABI
-#[no_mangle] pub static mut PyExc_BaseException: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_Exception: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_TypeError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_ValueError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_OverflowError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_RuntimeError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_KeyError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_IndexError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_AttributeError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_StopIteration: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_MemoryError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_SystemError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_OSError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_NotImplementedError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_UnicodeDecodeError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_UnicodeEncodeError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_UnicodeError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_LookupError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_ArithmeticError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_IOError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_ImportError: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_DeprecationWarning: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_RuntimeWarning: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_UserWarning: *mut RawPyObject = ptr::null_mut();
-#[no_mangle] pub static mut PyExc_Warning: *mut RawPyObject = ptr::null_mut();
+#[no_mangle] pub static PyExc_BaseException: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_Exception: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_TypeError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_ValueError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_OverflowError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_RuntimeError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_KeyError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_IndexError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_AttributeError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_StopIteration: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_MemoryError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_SystemError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_OSError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_NotImplementedError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_UnicodeDecodeError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_UnicodeEncodeError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_UnicodeError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_LookupError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_ArithmeticError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_IOError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_ImportError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_DeprecationWarning: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_RuntimeWarning: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_UserWarning: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_Warning: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
 
 /// Allocate an exception type object with the given name and base.
 /// Returns a pointer to a heap-allocated, immortal RawPyTypeObject.
@@ -344,7 +345,7 @@ unsafe fn alloc_exc_type(name: &[u8], base: *mut RawPyTypeObject) -> *mut RawPyO
 
     // Set fields
     (*tp).tp_name = name.as_ptr() as *const c_char;
-    (*tp).ob_base.ob_type = &mut crate::object::typeobj::PyType_Type;
+    (*tp).ob_base.ob_type = crate::object::typeobj::PyType_Type.get();
     (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
     (*tp).tp_basicsize = std::mem::size_of::<RawPyObject>() as isize;
     (*tp).tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
@@ -377,79 +378,79 @@ unsafe fn alloc_exc_type(name: &[u8], base: *mut RawPyTypeObject) -> *mut RawPyO
 /// Initialize the exception type hierarchy. Must be called after base types are ready.
 pub unsafe fn init_exceptions() {
     // BaseException
-    PyExc_BaseException = alloc_exc_type(
-        b"BaseException\0", &mut crate::object::typeobj::PyBaseObject_Type);
+    *PyExc_BaseException.get() = alloc_exc_type(
+        b"BaseException\0", crate::object::typeobj::PyBaseObject_Type.get());
 
-    let base_exc = PyExc_BaseException as *mut RawPyTypeObject;
+    let base_exc = *PyExc_BaseException.get() as *mut RawPyTypeObject;
 
     // Exception
-    PyExc_Exception = alloc_exc_type(b"Exception\0", base_exc);
-    let exc = PyExc_Exception as *mut RawPyTypeObject;
+    *PyExc_Exception.get() = alloc_exc_type(b"Exception\0", base_exc);
+    let exc = *PyExc_Exception.get() as *mut RawPyTypeObject;
 
     // Direct subclasses of Exception
-    PyExc_TypeError = alloc_exc_type(b"TypeError\0", exc);
-    PyExc_ValueError = alloc_exc_type(b"ValueError\0", exc);
-    PyExc_RuntimeError = alloc_exc_type(b"RuntimeError\0", exc);
-    PyExc_AttributeError = alloc_exc_type(b"AttributeError\0", exc);
-    PyExc_StopIteration = alloc_exc_type(b"StopIteration\0", exc);
-    PyExc_MemoryError = alloc_exc_type(b"MemoryError\0", exc);
-    PyExc_SystemError = alloc_exc_type(b"SystemError\0", exc);
-    PyExc_OSError = alloc_exc_type(b"OSError\0", exc);
-    PyExc_IOError = PyExc_OSError; // IOError is an alias for OSError
+    *PyExc_TypeError.get() = alloc_exc_type(b"TypeError\0", exc);
+    *PyExc_ValueError.get() = alloc_exc_type(b"ValueError\0", exc);
+    *PyExc_RuntimeError.get() = alloc_exc_type(b"RuntimeError\0", exc);
+    *PyExc_AttributeError.get() = alloc_exc_type(b"AttributeError\0", exc);
+    *PyExc_StopIteration.get() = alloc_exc_type(b"StopIteration\0", exc);
+    *PyExc_MemoryError.get() = alloc_exc_type(b"MemoryError\0", exc);
+    *PyExc_SystemError.get() = alloc_exc_type(b"SystemError\0", exc);
+    *PyExc_OSError.get() = alloc_exc_type(b"OSError\0", exc);
+    *PyExc_IOError.get() = *PyExc_OSError.get(); // IOError is an alias for OSError
 
     // Intermediate base classes
-    PyExc_LookupError = alloc_exc_type(b"LookupError\0", exc);
-    let lookup = PyExc_LookupError as *mut RawPyTypeObject;
-    PyExc_KeyError = alloc_exc_type(b"KeyError\0", lookup);
-    PyExc_IndexError = alloc_exc_type(b"IndexError\0", lookup);
+    *PyExc_LookupError.get() = alloc_exc_type(b"LookupError\0", exc);
+    let lookup = *PyExc_LookupError.get() as *mut RawPyTypeObject;
+    *PyExc_KeyError.get() = alloc_exc_type(b"KeyError\0", lookup);
+    *PyExc_IndexError.get() = alloc_exc_type(b"IndexError\0", lookup);
 
-    PyExc_ArithmeticError = alloc_exc_type(b"ArithmeticError\0", exc);
-    let arith = PyExc_ArithmeticError as *mut RawPyTypeObject;
-    PyExc_OverflowError = alloc_exc_type(b"OverflowError\0", arith);
+    *PyExc_ArithmeticError.get() = alloc_exc_type(b"ArithmeticError\0", exc);
+    let arith = *PyExc_ArithmeticError.get() as *mut RawPyTypeObject;
+    *PyExc_OverflowError.get() = alloc_exc_type(b"OverflowError\0", arith);
 
     // RuntimeError subclass
-    let runtime = PyExc_RuntimeError as *mut RawPyTypeObject;
-    PyExc_NotImplementedError = alloc_exc_type(b"NotImplementedError\0", runtime);
+    let runtime = *PyExc_RuntimeError.get() as *mut RawPyTypeObject;
+    *PyExc_NotImplementedError.get() = alloc_exc_type(b"NotImplementedError\0", runtime);
 
     // ValueError subclasses
-    let val = PyExc_ValueError as *mut RawPyTypeObject;
-    PyExc_UnicodeError = alloc_exc_type(b"UnicodeError\0", val);
-    let unicode_err = PyExc_UnicodeError as *mut RawPyTypeObject;
-    PyExc_UnicodeDecodeError = alloc_exc_type(b"UnicodeDecodeError\0", unicode_err);
-    PyExc_UnicodeEncodeError = alloc_exc_type(b"UnicodeEncodeError\0", unicode_err);
+    let val = *PyExc_ValueError.get() as *mut RawPyTypeObject;
+    *PyExc_UnicodeError.get() = alloc_exc_type(b"UnicodeError\0", val);
+    let unicode_err = *PyExc_UnicodeError.get() as *mut RawPyTypeObject;
+    *PyExc_UnicodeDecodeError.get() = alloc_exc_type(b"UnicodeDecodeError\0", unicode_err);
+    *PyExc_UnicodeEncodeError.get() = alloc_exc_type(b"UnicodeEncodeError\0", unicode_err);
 
     // ImportError
-    PyExc_ImportError = alloc_exc_type(b"ImportError\0", exc);
+    *PyExc_ImportError.get() = alloc_exc_type(b"ImportError\0", exc);
 
     // Warning hierarchy
-    PyExc_Warning = alloc_exc_type(b"Warning\0", exc);
-    let warn = PyExc_Warning as *mut RawPyTypeObject;
-    PyExc_DeprecationWarning = alloc_exc_type(b"DeprecationWarning\0", warn);
-    PyExc_RuntimeWarning = alloc_exc_type(b"RuntimeWarning\0", warn);
-    PyExc_UserWarning = alloc_exc_type(b"UserWarning\0", warn);
+    *PyExc_Warning.get() = alloc_exc_type(b"Warning\0", exc);
+    let warn = *PyExc_Warning.get() as *mut RawPyTypeObject;
+    *PyExc_DeprecationWarning.get() = alloc_exc_type(b"DeprecationWarning\0", warn);
+    *PyExc_RuntimeWarning.get() = alloc_exc_type(b"RuntimeWarning\0", warn);
+    *PyExc_UserWarning.get() = alloc_exc_type(b"UserWarning\0", warn);
 }
 
 // Backward-compatible function accessors for Rustthon-compiled extensions.
 // Our include/Python.h uses macros like #define PyExc_TypeError (_Rustthon_Exc_TypeError())
 
 #[no_mangle]
-pub unsafe extern "C" fn _Rustthon_Exc_TypeError() -> *mut RawPyObject { PyExc_TypeError }
+pub unsafe extern "C" fn _Rustthon_Exc_TypeError() -> *mut RawPyObject { *PyExc_TypeError.get() }
 #[no_mangle]
-pub unsafe extern "C" fn _Rustthon_Exc_ValueError() -> *mut RawPyObject { PyExc_ValueError }
+pub unsafe extern "C" fn _Rustthon_Exc_ValueError() -> *mut RawPyObject { *PyExc_ValueError.get() }
 #[no_mangle]
-pub unsafe extern "C" fn _Rustthon_Exc_OverflowError() -> *mut RawPyObject { PyExc_OverflowError }
+pub unsafe extern "C" fn _Rustthon_Exc_OverflowError() -> *mut RawPyObject { *PyExc_OverflowError.get() }
 #[no_mangle]
-pub unsafe extern "C" fn _Rustthon_Exc_RuntimeError() -> *mut RawPyObject { PyExc_RuntimeError }
+pub unsafe extern "C" fn _Rustthon_Exc_RuntimeError() -> *mut RawPyObject { *PyExc_RuntimeError.get() }
 #[no_mangle]
-pub unsafe extern "C" fn _Rustthon_Exc_KeyError() -> *mut RawPyObject { PyExc_KeyError }
+pub unsafe extern "C" fn _Rustthon_Exc_KeyError() -> *mut RawPyObject { *PyExc_KeyError.get() }
 #[no_mangle]
-pub unsafe extern "C" fn _Rustthon_Exc_IndexError() -> *mut RawPyObject { PyExc_IndexError }
+pub unsafe extern "C" fn _Rustthon_Exc_IndexError() -> *mut RawPyObject { *PyExc_IndexError.get() }
 #[no_mangle]
-pub unsafe extern "C" fn _Rustthon_Exc_AttributeError() -> *mut RawPyObject { PyExc_AttributeError }
+pub unsafe extern "C" fn _Rustthon_Exc_AttributeError() -> *mut RawPyObject { *PyExc_AttributeError.get() }
 #[no_mangle]
-pub unsafe extern "C" fn _Rustthon_Exc_StopIteration() -> *mut RawPyObject { PyExc_StopIteration }
+pub unsafe extern "C" fn _Rustthon_Exc_StopIteration() -> *mut RawPyObject { *PyExc_StopIteration.get() }
 #[no_mangle]
-pub unsafe extern "C" fn _Rustthon_Exc_MemoryError() -> *mut RawPyObject { PyExc_MemoryError }
+pub unsafe extern "C" fn _Rustthon_Exc_MemoryError() -> *mut RawPyObject { *PyExc_MemoryError.get() }
 
 // ─── Internal helpers ───
 
@@ -600,4 +601,4 @@ pub unsafe extern "C" fn PyException_SetCause(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn _Rustthon_Exc_ImportError() -> *mut RawPyObject { PyExc_ImportError }
+pub unsafe extern "C" fn _Rustthon_Exc_ImportError() -> *mut RawPyObject { *PyExc_ImportError.get() }

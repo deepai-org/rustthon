@@ -5,6 +5,13 @@
 
 use crate::compiler::bytecode::{CodeObject, OpCode};
 use crate::object::pyobject::RawPyObject;
+use crate::object::safe_api::{
+    py_incref, py_decref, py_true, py_false,
+    is_int, is_float, is_str, is_list, is_bool, is_none,
+    get_int_value, get_float_value,
+    create_int, create_float, create_str,
+    return_none, bool_from_long,
+};
 use crate::vm::frame::Frame;
 use std::ptr;
 
@@ -75,7 +82,7 @@ impl VM {
         loop {
             if frame.ip >= frame.code.instructions.len() {
                 // End of code
-                return Ok(unsafe { crate::types::none::return_none() });
+                return Ok(crate::types::none::return_none());
             }
 
             let instr = frame.code.instructions[frame.ip].clone();
@@ -86,11 +93,7 @@ impl VM {
 
                 OpCode::LoadConst => {
                     let obj = frame.code.constants[instr.arg as usize];
-                    unsafe {
-                        if !obj.is_null() {
-                            (*obj).incref();
-                        }
-                    }
+                    py_incref(obj);
                     frame.push(obj);
                 }
 
@@ -100,9 +103,7 @@ impl VM {
                     if obj.is_null() {
                         return Err(format!("NameError: name '{}' is not defined", name));
                     }
-                    unsafe {
-                        (*obj).incref();
-                    }
+                    py_incref(obj);
                     frame.push(obj);
                 }
 
@@ -111,11 +112,7 @@ impl VM {
                     let obj = frame.pop();
                     frame.store_name(&name, obj);
                     // store_name increfs, so we can decref our copy
-                    unsafe {
-                        if !obj.is_null() {
-                            (*obj).decref();
-                        }
-                    }
+                    py_decref(obj);
                 }
 
                 OpCode::LoadGlobal => {
@@ -127,41 +124,25 @@ impl VM {
                     } else {
                         return Err(format!("NameError: name '{}' is not defined", name));
                     };
-                    unsafe {
-                        if !obj.is_null() {
-                            (*obj).incref();
-                        }
-                    }
+                    py_incref(obj);
                     frame.push(obj);
                 }
 
                 OpCode::StoreGlobal => {
                     let name = frame.code.names[instr.arg as usize].clone();
                     let obj = frame.pop();
-                    unsafe {
-                        if !obj.is_null() {
-                            (*obj).incref();
-                        }
-                    }
+                    py_incref(obj);
                     frame.globals.insert(name, obj);
                 }
 
                 OpCode::PopTop => {
                     let obj = frame.pop();
-                    unsafe {
-                        if !obj.is_null() {
-                            (*obj).decref();
-                        }
-                    }
+                    py_decref(obj);
                 }
 
                 OpCode::DupTop => {
                     let obj = frame.top();
-                    unsafe {
-                        if !obj.is_null() {
-                            (*obj).incref();
-                        }
-                    }
+                    py_incref(obj);
                     frame.push(obj);
                 }
 
@@ -185,123 +166,101 @@ impl VM {
                 OpCode::BinaryAdd => {
                     let right = frame.pop();
                     let left = frame.pop();
-                    let result = unsafe { binary_add(left, right) };
+                    let result = binary_add(left, right);
                     frame.push(result);
-                    unsafe {
-                        if !left.is_null() { (*left).decref(); }
-                        if !right.is_null() { (*right).decref(); }
-                    }
+                    py_decref(left);
+                    py_decref(right);
                 }
 
                 OpCode::BinarySubtract => {
                     let right = frame.pop();
                     let left = frame.pop();
-                    let result = unsafe { binary_sub(left, right) };
+                    let result = binary_sub(left, right);
                     frame.push(result);
-                    unsafe {
-                        if !left.is_null() { (*left).decref(); }
-                        if !right.is_null() { (*right).decref(); }
-                    }
+                    py_decref(left);
+                    py_decref(right);
                 }
 
                 OpCode::BinaryMultiply => {
                     let right = frame.pop();
                     let left = frame.pop();
-                    let result = unsafe { binary_mul(left, right) };
+                    let result = binary_mul(left, right);
                     frame.push(result);
-                    unsafe {
-                        if !left.is_null() { (*left).decref(); }
-                        if !right.is_null() { (*right).decref(); }
-                    }
+                    py_decref(left);
+                    py_decref(right);
                 }
 
                 OpCode::BinaryTrueDivide => {
                     let right = frame.pop();
                     let left = frame.pop();
-                    let result = unsafe { binary_truediv(left, right) };
+                    let result = binary_truediv(left, right);
                     frame.push(result);
-                    unsafe {
-                        if !left.is_null() { (*left).decref(); }
-                        if !right.is_null() { (*right).decref(); }
-                    }
+                    py_decref(left);
+                    py_decref(right);
                 }
 
                 OpCode::BinaryFloorDivide => {
                     let right = frame.pop();
                     let left = frame.pop();
-                    let result = unsafe { binary_floordiv(left, right) };
+                    let result = binary_floordiv(left, right);
                     frame.push(result);
-                    unsafe {
-                        if !left.is_null() { (*left).decref(); }
-                        if !right.is_null() { (*right).decref(); }
-                    }
+                    py_decref(left);
+                    py_decref(right);
                 }
 
                 OpCode::BinaryModulo => {
                     let right = frame.pop();
                     let left = frame.pop();
-                    let result = unsafe { binary_mod(left, right) };
+                    let result = binary_mod(left, right);
                     frame.push(result);
-                    unsafe {
-                        if !left.is_null() { (*left).decref(); }
-                        if !right.is_null() { (*right).decref(); }
-                    }
+                    py_decref(left);
+                    py_decref(right);
                 }
 
                 OpCode::BinaryPower => {
                     let right = frame.pop();
                     let left = frame.pop();
-                    let result = unsafe { binary_pow(left, right) };
+                    let result = binary_pow(left, right);
                     frame.push(result);
-                    unsafe {
-                        if !left.is_null() { (*left).decref(); }
-                        if !right.is_null() { (*right).decref(); }
-                    }
+                    py_decref(left);
+                    py_decref(right);
                 }
 
                 OpCode::BinaryAnd | OpCode::BinaryOr | OpCode::BinaryXor |
                 OpCode::BinaryLShift | OpCode::BinaryRShift => {
                     let right = frame.pop();
                     let left = frame.pop();
-                    let result = unsafe { binary_bitop(left, right, instr.opcode) };
+                    let result = binary_bitop(left, right, instr.opcode);
                     frame.push(result);
-                    unsafe {
-                        if !left.is_null() { (*left).decref(); }
-                        if !right.is_null() { (*right).decref(); }
-                    }
+                    py_decref(left);
+                    py_decref(right);
                 }
 
                 OpCode::InplaceAdd => {
                     let right = frame.pop();
                     let left = frame.pop();
-                    let result = unsafe { binary_add(left, right) };
+                    let result = binary_add(left, right);
                     frame.push(result);
-                    unsafe {
-                        if !left.is_null() { (*left).decref(); }
-                        if !right.is_null() { (*right).decref(); }
-                    }
+                    py_decref(left);
+                    py_decref(right);
                 }
 
                 OpCode::InplaceSubtract => {
                     let right = frame.pop();
                     let left = frame.pop();
-                    let result = unsafe { binary_sub(left, right) };
+                    let result = binary_sub(left, right);
                     frame.push(result);
-                    unsafe {
-                        if !left.is_null() { (*left).decref(); }
-                        if !right.is_null() { (*right).decref(); }
-                    }
+                    py_decref(left);
+                    py_decref(right);
                 }
 
                 OpCode::InplaceMultiply => {
                     let right = frame.pop();
                     let left = frame.pop();
-                    let result = unsafe { binary_mul(left, right) };
+                    let result = binary_mul(left, right);
                     frame.push(result);
-                    unsafe {
-                        if !left.is_null() { (*left).decref(); }
-                        if !right.is_null() { (*right).decref(); }
-                    }
+                    py_decref(left);
+                    py_decref(right);
                 }
 
                 OpCode::BinarySubscr => {
@@ -316,49 +275,37 @@ impl VM {
                     } else {
                         result
                     });
-                    unsafe {
-                        if !obj.is_null() { (*obj).decref(); }
-                        if !key.is_null() { (*key).decref(); }
-                    }
+                    py_decref(obj);
+                    py_decref(key);
                 }
 
                 // ─── Comparison ───
                 OpCode::CompareOp => {
                     let right = frame.pop();
                     let left = frame.pop();
-                    let result = unsafe { compare_op(left, right, instr.arg) };
+                    let result = compare_op(left, right, instr.arg);
                     frame.push(result);
-                    unsafe {
-                        if !left.is_null() { (*left).decref(); }
-                        if !right.is_null() { (*right).decref(); }
-                    }
+                    py_decref(left);
+                    py_decref(right);
                 }
 
                 // ─── Unary ───
                 OpCode::UnaryNot => {
                     let obj = frame.pop();
-                    let result = unsafe {
-                        let is_true = crate::ffi::object_api::PyObject_IsTrue(obj);
-                        if is_true != 0 {
-                            crate::types::boolobject::PY_FALSE.get()
-                        } else {
-                            crate::types::boolobject::PY_TRUE.get()
-                        }
+                    let is_true = unsafe {
+                        crate::ffi::object_api::PyObject_IsTrue(obj)
                     };
-                    unsafe {
-                        (*result).incref();
-                        if !obj.is_null() { (*obj).decref(); }
-                    }
+                    let result = if is_true != 0 { py_false() } else { py_true() };
+                    py_incref(result);
+                    py_decref(obj);
                     frame.push(result);
                 }
 
                 OpCode::UnaryNegative => {
                     let obj = frame.pop();
-                    let result = unsafe { unary_negative(obj) };
+                    let result = unary_negative(obj);
                     frame.push(result);
-                    unsafe {
-                        if !obj.is_null() { (*obj).decref(); }
-                    }
+                    py_decref(obj);
                 }
 
                 OpCode::UnaryPositive => {
@@ -376,9 +323,7 @@ impl VM {
                     let is_true = unsafe {
                         crate::ffi::object_api::PyObject_IsTrue(obj)
                     };
-                    unsafe {
-                        if !obj.is_null() { (*obj).decref(); }
-                    }
+                    py_decref(obj);
                     if is_true == 0 {
                         frame.ip = instr.arg as usize;
                     }
@@ -389,9 +334,7 @@ impl VM {
                     let is_true = unsafe {
                         crate::ffi::object_api::PyObject_IsTrue(obj)
                     };
-                    unsafe {
-                        if !obj.is_null() { (*obj).decref(); }
-                    }
+                    py_decref(obj);
                     if is_true != 0 {
                         frame.ip = instr.arg as usize;
                     }
@@ -430,11 +373,9 @@ impl VM {
                     let result = unsafe { call_function(func, &args) };
                     frame.push(result);
 
-                    unsafe {
-                        if !func.is_null() { (*func).decref(); }
-                        for &arg in &args {
-                            if !arg.is_null() { (*arg).decref(); }
-                        }
+                    py_decref(func);
+                    for &arg in &args {
+                        py_decref(arg);
                     }
                 }
 
@@ -516,10 +457,10 @@ impl VM {
                         } else if crate::types::dict::PyDict_Check(obj) != 0 {
                             crate::types::dict::PyDict_SetItem(obj, key, value);
                         }
-                        if !obj.is_null() { (*obj).decref(); }
-                        if !key.is_null() { (*key).decref(); }
-                        if !value.is_null() { (*value).decref(); }
                     }
+                    py_decref(obj);
+                    py_decref(key);
+                    py_decref(value);
                 }
 
                 // ─── Import ───
@@ -566,15 +507,13 @@ impl VM {
                 OpCode::PrintExpr => {
                     // In interactive mode, print the expression result
                     let obj = frame.top();
-                    if !obj.is_null() {
+                    if !obj.is_null() && !is_none(obj) {
                         unsafe {
-                            if !crate::types::none::is_none(obj) {
-                                let repr = crate::ffi::object_api::PyObject_Repr(obj);
-                                if !repr.is_null() {
-                                    let s = crate::types::unicode::unicode_value(repr);
-                                    // Don't print in non-interactive mode
-                                    (*repr).decref();
-                                }
+                            let repr = crate::ffi::object_api::PyObject_Repr(obj);
+                            if !repr.is_null() {
+                                let _s = crate::types::unicode::unicode_value(repr);
+                                // Don't print in non-interactive mode
+                                (*repr).decref();
                             }
                         }
                     }
@@ -586,7 +525,7 @@ impl VM {
                     // Pop the code object placeholder
                     let _code_obj = frame.pop();
                     // Push a placeholder function
-                    let none = unsafe { crate::types::none::return_none() };
+                    let none = return_none();
                     frame.push(none);
                 }
 
@@ -609,8 +548,8 @@ impl VM {
                         } else {
                             attr
                         });
-                        if !obj.is_null() { (*obj).decref(); }
                     }
+                    py_decref(obj);
                 }
 
                 OpCode::StoreAttr => {
@@ -624,9 +563,9 @@ impl VM {
                             name_cstr.as_ptr(),
                             value,
                         );
-                        if !obj.is_null() { (*obj).decref(); }
-                        if !value.is_null() { (*value).decref(); }
                     }
+                    py_decref(obj);
+                    py_decref(value);
                 }
 
                 _ => {
@@ -638,179 +577,141 @@ impl VM {
     }
 }
 
-// ─── Helper functions ───
+// ─── Helper functions (now safe where possible) ───
 
-unsafe fn get_int_value(obj: *mut RawPyObject) -> i64 {
-    if obj.is_null() {
-        return 0;
-    }
-    if is_int(obj) || crate::types::boolobject::is_bool(obj) {
-        crate::types::longobject::long_as_i64(obj)
-    } else {
-        0
-    }
-}
-
-unsafe fn get_float_value(obj: *mut RawPyObject) -> f64 {
-    if obj.is_null() {
-        return 0.0;
-    }
-    if (*obj).ob_type == crate::types::floatobject::float_type() {
-        crate::types::floatobject::float_value(obj)
-    } else if is_int(obj) || crate::types::boolobject::is_bool(obj) {
-        crate::types::longobject::long_as_f64(obj)
-    } else {
-        0.0
-    }
-}
-
-unsafe fn is_int(obj: *mut RawPyObject) -> bool {
-    !obj.is_null() && (*obj).ob_type == crate::types::longobject::long_type()
-}
-
-unsafe fn is_float(obj: *mut RawPyObject) -> bool {
-    !obj.is_null() && (*obj).ob_type == crate::types::floatobject::float_type()
-}
-
-unsafe fn is_string(obj: *mut RawPyObject) -> bool {
-    !obj.is_null() && (*obj).ob_type == crate::types::unicode::unicode_type()
-}
-
-unsafe fn is_list(obj: *mut RawPyObject) -> bool {
-    !obj.is_null() && (*obj).ob_type == crate::types::list::list_type()
-}
-
-unsafe fn binary_add(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
+fn binary_add(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
     if is_int(left) && is_int(right) {
-        let l = crate::types::longobject::long_as_i64(left);
-        let r = crate::types::longobject::long_as_i64(right);
-        crate::types::longobject::PyLong_FromLong((l.wrapping_add(r)) as _)
+        let l = get_int_value(left);
+        let r = get_int_value(right);
+        create_int(l.wrapping_add(r))
     } else if is_float(left) || is_float(right) {
         let l = get_float_value(left);
         let r = get_float_value(right);
-        crate::types::floatobject::PyFloat_FromDouble(l + r)
-    } else if is_string(left) && is_string(right) {
-        crate::types::unicode::PyUnicode_Concat(left, right)
+        create_float(l + r)
+    } else if is_str(left) && is_str(right) {
+        unsafe { crate::types::unicode::PyUnicode_Concat(left, right) }
     } else if is_list(left) && is_list(right) {
         // List concatenation via C API
-        let l_size = crate::types::list::PyList_Size(left);
-        let r_size = crate::types::list::PyList_Size(right);
-        let total = l_size + r_size;
-        let new_list = crate::types::list::PyList_New(total);
-        for i in 0..l_size {
-            let item = crate::types::list::PyList_GetItem(left, i);
-            if !item.is_null() { (*item).incref(); }
-            crate::types::list::PyList_SET_ITEM(new_list, i, item);
+        unsafe {
+            let l_size = crate::types::list::PyList_Size(left);
+            let r_size = crate::types::list::PyList_Size(right);
+            let total = l_size + r_size;
+            let new_list = crate::types::list::PyList_New(total);
+            for i in 0..l_size {
+                let item = crate::types::list::PyList_GetItem(left, i);
+                py_incref(item);
+                crate::types::list::PyList_SET_ITEM(new_list, i, item);
+            }
+            for i in 0..r_size {
+                let item = crate::types::list::PyList_GetItem(right, i);
+                py_incref(item);
+                crate::types::list::PyList_SET_ITEM(new_list, l_size + i, item);
+            }
+            new_list
         }
-        for i in 0..r_size {
-            let item = crate::types::list::PyList_GetItem(right, i);
-            if !item.is_null() { (*item).incref(); }
-            crate::types::list::PyList_SET_ITEM(new_list, l_size + i, item);
-        }
-        new_list
     } else {
-        crate::types::none::return_none()
+        return_none()
     }
 }
 
-unsafe fn binary_sub(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
+fn binary_sub(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
     if is_int(left) && is_int(right) {
-        let l = crate::types::longobject::long_as_i64(left);
-        let r = crate::types::longobject::long_as_i64(right);
-        crate::types::longobject::PyLong_FromLong(l.wrapping_sub(r) as _)
+        let l = get_int_value(left);
+        let r = get_int_value(right);
+        create_int(l.wrapping_sub(r))
     } else if is_float(left) || is_float(right) {
         let l = get_float_value(left);
         let r = get_float_value(right);
-        crate::types::floatobject::PyFloat_FromDouble(l - r)
+        create_float(l - r)
     } else {
-        crate::types::none::return_none()
+        return_none()
     }
 }
 
-unsafe fn binary_mul(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
+fn binary_mul(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
     if is_int(left) && is_int(right) {
-        let l = crate::types::longobject::long_as_i64(left);
-        let r = crate::types::longobject::long_as_i64(right);
-        crate::types::longobject::PyLong_FromLong(l.wrapping_mul(r) as _)
+        let l = get_int_value(left);
+        let r = get_int_value(right);
+        create_int(l.wrapping_mul(r))
     } else if is_float(left) || is_float(right) {
         let l = get_float_value(left);
         let r = get_float_value(right);
-        crate::types::floatobject::PyFloat_FromDouble(l * r)
+        create_float(l * r)
     } else {
-        crate::types::none::return_none()
+        return_none()
     }
 }
 
-unsafe fn binary_truediv(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
+fn binary_truediv(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
     let l = get_float_value(left);
     let r = get_float_value(right);
     if r == 0.0 {
         // TODO: ZeroDivisionError
-        return crate::types::none::return_none();
+        return return_none();
     }
-    crate::types::floatobject::PyFloat_FromDouble(l / r)
+    create_float(l / r)
 }
 
-unsafe fn binary_floordiv(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
+fn binary_floordiv(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
     if is_int(left) && is_int(right) {
-        let l = crate::types::longobject::long_as_i64(left);
-        let r = crate::types::longobject::long_as_i64(right);
+        let l = get_int_value(left);
+        let r = get_int_value(right);
         if r == 0 {
-            return crate::types::none::return_none();
+            return return_none();
         }
         // Python floor division: rounds toward negative infinity
         let d = l.wrapping_div(r);
         let result = if (l ^ r) < 0 && d * r != l { d - 1 } else { d };
-        crate::types::longobject::PyLong_FromLong(result as _)
+        create_int(result)
     } else {
         let l = get_float_value(left);
         let r = get_float_value(right);
         if r == 0.0 {
-            return crate::types::none::return_none();
+            return return_none();
         }
-        crate::types::floatobject::PyFloat_FromDouble((l / r).floor())
+        create_float((l / r).floor())
     }
 }
 
-unsafe fn binary_mod(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
+fn binary_mod(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
     if is_int(left) && is_int(right) {
-        let l = crate::types::longobject::long_as_i64(left);
-        let r = crate::types::longobject::long_as_i64(right);
+        let l = get_int_value(left);
+        let r = get_int_value(right);
         if r == 0 {
-            return crate::types::none::return_none();
+            return return_none();
         }
         // Python modulo: result has same sign as divisor
         let m = l % r;
         let result = if m != 0 && (m ^ r) < 0 { m + r } else { m };
-        crate::types::longobject::PyLong_FromLong(result as _)
+        create_int(result)
     } else {
         let l = get_float_value(left);
         let r = get_float_value(right);
         if r == 0.0 {
-            return crate::types::none::return_none();
+            return return_none();
         }
-        crate::types::floatobject::PyFloat_FromDouble(l % r)
+        create_float(l % r)
     }
 }
 
-unsafe fn binary_pow(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
+fn binary_pow(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
     if is_int(left) && is_int(right) {
-        let l = crate::types::longobject::long_as_i64(left);
-        let r = crate::types::longobject::long_as_i64(right);
+        let l = get_int_value(left);
+        let r = get_int_value(right);
         if r >= 0 && r <= 63 {
             let result = l.wrapping_pow(r as u32);
-            crate::types::longobject::PyLong_FromLong(result as _)
+            create_int(result)
         } else {
-            crate::types::floatobject::PyFloat_FromDouble((l as f64).powf(r as f64))
+            create_float((l as f64).powf(r as f64))
         }
     } else {
         let l = get_float_value(left);
         let r = get_float_value(right);
-        crate::types::floatobject::PyFloat_FromDouble(l.powf(r))
+        create_float(l.powf(r))
     }
 }
 
-unsafe fn binary_bitop(left: *mut RawPyObject, right: *mut RawPyObject, op: OpCode) -> *mut RawPyObject {
+fn binary_bitop(left: *mut RawPyObject, right: *mut RawPyObject, op: OpCode) -> *mut RawPyObject {
     let l = get_int_value(left);
     let r = get_int_value(right);
     let result = match op {
@@ -821,36 +722,36 @@ unsafe fn binary_bitop(left: *mut RawPyObject, right: *mut RawPyObject, op: OpCo
         OpCode::BinaryRShift => l.wrapping_shr(r as u32),
         _ => 0,
     };
-    crate::types::longobject::PyLong_FromLong(result as _)
+    create_int(result)
 }
 
-unsafe fn unary_negative(obj: *mut RawPyObject) -> *mut RawPyObject {
+fn unary_negative(obj: *mut RawPyObject) -> *mut RawPyObject {
     if is_int(obj) {
-        let val = crate::types::longobject::long_as_i64(obj);
-        crate::types::longobject::PyLong_FromLong(val.wrapping_neg() as _)
+        let val = get_int_value(obj);
+        create_int(val.wrapping_neg())
     } else if is_float(obj) {
-        let val = crate::types::floatobject::float_value(obj);
-        crate::types::floatobject::PyFloat_FromDouble(-val)
+        let val = get_float_value(obj);
+        create_float(-val)
     } else {
-        crate::types::none::return_none()
+        return_none()
     }
 }
 
-unsafe fn compare_op(left: *mut RawPyObject, right: *mut RawPyObject, op: u32) -> *mut RawPyObject {
+fn compare_op(left: *mut RawPyObject, right: *mut RawPyObject, op: u32) -> *mut RawPyObject {
     match op {
         6 => {
             // is
-            crate::types::boolobject::PyBool_FromLong(if left == right { 1 } else { 0 })
+            bool_from_long(if left == right { 1 } else { 0 })
         }
         7 => {
             // is not
-            crate::types::boolobject::PyBool_FromLong(if left != right { 1 } else { 0 })
+            bool_from_long(if left != right { 1 } else { 0 })
         }
         _ => {
             // Numeric comparison
             if is_int(left) && is_int(right) {
-                let l = crate::types::longobject::long_as_i64(left);
-                let r = crate::types::longobject::long_as_i64(right);
+                let l = get_int_value(left);
+                let r = get_int_value(right);
                 let result = match op {
                     0 => l < r,  // <
                     1 => l <= r, // <=
@@ -860,7 +761,7 @@ unsafe fn compare_op(left: *mut RawPyObject, right: *mut RawPyObject, op: u32) -
                     5 => l >= r, // >=
                     _ => false,
                 };
-                crate::types::boolobject::PyBool_FromLong(if result { 1 } else { 0 })
+                bool_from_long(if result { 1 } else { 0 })
             } else if is_float(left) || is_float(right) {
                 let l = get_float_value(left);
                 let r = get_float_value(right);
@@ -873,8 +774,8 @@ unsafe fn compare_op(left: *mut RawPyObject, right: *mut RawPyObject, op: u32) -
                     5 => l >= r,
                     _ => false,
                 };
-                crate::types::boolobject::PyBool_FromLong(if result { 1 } else { 0 })
-            } else if is_string(left) && is_string(right) {
+                bool_from_long(if result { 1 } else { 0 })
+            } else if is_str(left) && is_str(right) {
                 let l = crate::types::unicode::unicode_value(left);
                 let r = crate::types::unicode::unicode_value(right);
                 let result = match op {
@@ -886,10 +787,10 @@ unsafe fn compare_op(left: *mut RawPyObject, right: *mut RawPyObject, op: u32) -
                     5 => l >= r,
                     _ => false,
                 };
-                crate::types::boolobject::PyBool_FromLong(if result { 1 } else { 0 })
+                bool_from_long(if result { 1 } else { 0 })
             } else {
                 // Default: identity comparison
-                crate::types::boolobject::PyBool_FromLong(
+                bool_from_long(
                     if op == 2 { if left == right { 1 } else { 0 } }
                     else if op == 3 { if left != right { 1 } else { 0 } }
                     else { 0 }
@@ -903,24 +804,18 @@ unsafe fn subscr_fallback(obj: *mut RawPyObject, key: *mut RawPyObject) -> *mut 
     if crate::types::list::PyList_Check(obj) != 0 {
         let idx = get_int_value(key) as isize;
         let item = crate::types::list::PyList_GetItem(obj, idx);
-        if !item.is_null() {
-            (*item).incref();
-        }
+        py_incref(item);
         return item;
     }
     if crate::types::tuple::PyTuple_Check(obj) != 0 {
         let idx = get_int_value(key) as isize;
         let item = crate::types::tuple::PyTuple_GetItem(obj, idx);
-        if !item.is_null() {
-            (*item).incref();
-        }
+        py_incref(item);
         return item;
     }
     if crate::types::dict::PyDict_Check(obj) != 0 {
         let item = crate::types::dict::PyDict_GetItem(obj, key);
-        if !item.is_null() {
-            (*item).incref();
-        }
+        py_incref(item);
         return item;
     }
     ptr::null_mut()
@@ -928,7 +823,7 @@ unsafe fn subscr_fallback(obj: *mut RawPyObject, key: *mut RawPyObject) -> *mut 
 
 unsafe fn call_function(func: *mut RawPyObject, args: &[*mut RawPyObject]) -> *mut RawPyObject {
     if func.is_null() {
-        return crate::types::none::return_none();
+        return return_none();
     }
 
     // Check if it's a built-in CFunction
@@ -936,9 +831,7 @@ unsafe fn call_function(func: *mut RawPyObject, args: &[*mut RawPyObject]) -> *m
         // Build args tuple
         let args_tuple = crate::types::tuple::PyTuple_New(args.len() as isize);
         for (i, &arg) in args.iter().enumerate() {
-            if !arg.is_null() {
-                (*arg).incref();
-            }
+            py_incref(arg);
             crate::types::tuple::PyTuple_SET_ITEM(args_tuple, i as isize, arg);
         }
         let result = crate::types::funcobject::call_cfunction(func, args_tuple, ptr::null_mut());
@@ -952,9 +845,7 @@ unsafe fn call_function(func: *mut RawPyObject, args: &[*mut RawPyObject]) -> *m
         if let Some(tp_call) = (*tp).tp_call {
             let args_tuple = crate::types::tuple::PyTuple_New(args.len() as isize);
             for (i, &arg) in args.iter().enumerate() {
-                if !arg.is_null() {
-                    (*arg).incref();
-                }
+                py_incref(arg);
                 crate::types::tuple::PyTuple_SET_ITEM(args_tuple, i as isize, arg);
             }
             let result = tp_call(func, args_tuple, ptr::null_mut());
@@ -963,7 +854,7 @@ unsafe fn call_function(func: *mut RawPyObject, args: &[*mut RawPyObject]) -> *m
         }
     }
 
-    crate::types::none::return_none()
+    return_none()
 }
 
 // ─── Built-in function implementations ───
@@ -991,7 +882,7 @@ unsafe extern "C" fn builtin_print(
 ) -> *mut RawPyObject {
     if args.is_null() {
         println!();
-        return crate::types::none::return_none();
+        return return_none();
     }
 
     let nargs = crate::types::tuple::PyTuple_Size(args);
@@ -1004,16 +895,16 @@ unsafe extern "C" fn builtin_print(
             continue;
         }
 
-        if crate::types::none::is_none(item) {
+        if is_none(item) {
             parts.push("None".to_string());
-        } else if crate::types::boolobject::is_bool(item) {
+        } else if is_bool(item) {
             // Check bool BEFORE int (bool subclasses int)
             if crate::types::boolobject::is_true(item) {
                 parts.push("True".to_string());
             } else {
                 parts.push("False".to_string());
             }
-        } else if is_string(item) {
+        } else if is_str(item) {
             parts.push(crate::types::unicode::unicode_value(item).to_string());
         } else if is_int(item) {
             let val = crate::types::longobject::long_value(item);
@@ -1027,7 +918,7 @@ unsafe extern "C" fn builtin_print(
             parts.push(format_tuple(item));
         } else {
             let repr = crate::ffi::object_api::PyObject_Repr(item);
-            if !repr.is_null() && is_string(repr) {
+            if !repr.is_null() && is_str(repr) {
                 parts.push(crate::types::unicode::unicode_value(repr).to_string());
                 (*repr).decref();
             } else {
@@ -1037,7 +928,7 @@ unsafe extern "C" fn builtin_print(
     }
 
     println!("{}", parts.join(" "));
-    crate::types::none::return_none()
+    return_none()
 }
 
 unsafe fn format_list(list: *mut RawPyObject) -> String {
@@ -1065,11 +956,11 @@ unsafe fn format_tuple(tuple: *mut RawPyObject) -> String {
 }
 
 unsafe fn format_object(obj: *mut RawPyObject) -> String {
-    if obj.is_null() || crate::types::none::is_none(obj) {
+    if obj.is_null() || is_none(obj) {
         "None".to_string()
-    } else if is_string(obj) {
+    } else if is_str(obj) {
         format!("'{}'", crate::types::unicode::unicode_value(obj))
-    } else if crate::types::boolobject::is_bool(obj) {
+    } else if is_bool(obj) {
         if crate::types::boolobject::is_true(obj) { "True".to_string() } else { "False".to_string() }
     } else if is_int(obj) {
         format!("{}", crate::types::longobject::long_value(obj))
@@ -1087,18 +978,18 @@ unsafe extern "C" fn builtin_len(
 ) -> *mut RawPyObject {
     let obj = crate::types::tuple::PyTuple_GetItem(args, 0);
     if obj.is_null() {
-        return crate::types::longobject::PyLong_FromLong(0);
+        return create_int(0);
     }
     let len = crate::ffi::object_api::PyObject_Length(obj);
     if len >= 0 {
-        crate::types::longobject::PyLong_FromLong(len as _)
+        create_int(len as i64)
     } else {
         // Try string
-        if is_string(obj) {
+        if is_str(obj) {
             let s = crate::types::unicode::unicode_value(obj);
-            crate::types::longobject::PyLong_FromLong(s.len() as _)
+            create_int(s.len() as i64)
         } else {
-            crate::types::longobject::PyLong_FromLong(0)
+            create_int(0)
         }
     }
 }
@@ -1169,7 +1060,7 @@ unsafe extern "C" fn builtin_int(
 ) -> *mut RawPyObject {
     let obj = crate::types::tuple::PyTuple_GetItem(args, 0);
     if obj.is_null() {
-        return crate::types::longobject::PyLong_FromLong(0);
+        return create_int(0);
     }
     if is_int(obj) {
         (*obj).incref();
@@ -1177,15 +1068,15 @@ unsafe extern "C" fn builtin_int(
     }
     if is_float(obj) {
         let val = crate::types::floatobject::float_value(obj);
-        return crate::types::longobject::PyLong_FromLong(val as _);
+        return create_int(val as i64);
     }
-    if is_string(obj) {
+    if is_str(obj) {
         let s = crate::types::unicode::unicode_value(obj);
         if let Ok(val) = s.trim().parse::<i64>() {
-            return crate::types::longobject::PyLong_FromLong(val as _);
+            return create_int(val);
         }
     }
-    crate::types::longobject::PyLong_FromLong(0)
+    create_int(0)
 }
 
 /// Built-in str function
@@ -1195,7 +1086,7 @@ unsafe extern "C" fn builtin_str(
 ) -> *mut RawPyObject {
     let obj = crate::types::tuple::PyTuple_GetItem(args, 0);
     if obj.is_null() {
-        return crate::types::unicode::create_from_str("None");
+        return create_str("None");
     }
     crate::ffi::object_api::PyObject_Str(obj)
 }
@@ -1208,8 +1099,8 @@ unsafe extern "C" fn builtin_isinstance(
     let obj = crate::types::tuple::PyTuple_GetItem(args, 0);
     let tp = crate::types::tuple::PyTuple_GetItem(args, 1);
     if obj.is_null() || tp.is_null() {
-        return crate::types::boolobject::PY_FALSE.get();
+        return py_false();
     }
     let obj_type = (*obj).ob_type as *mut RawPyObject;
-    crate::types::boolobject::PyBool_FromLong(if obj_type == tp { 1 } else { 0 })
+    bool_from_long(if obj_type == tp { 1 } else { 0 })
 }

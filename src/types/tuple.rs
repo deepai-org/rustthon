@@ -9,6 +9,7 @@
 
 use crate::object::pyobject::{RawPyObject, RawPyVarObject};
 use crate::object::typeobj::{RawPyTypeObject, PY_TPFLAGS_DEFAULT, PY_TPFLAGS_TUPLE_SUBCLASS, PY_TPFLAGS_HAVE_GC};
+use crate::object::SyncUnsafeCell;
 use std::os::raw::c_int;
 use std::ptr;
 
@@ -30,16 +31,16 @@ unsafe fn ob_item(obj: *mut PyTupleObject) -> *mut *mut RawPyObject {
 }
 
 #[no_mangle]
-pub static mut PyTuple_Type: RawPyTypeObject = {
+pub static PyTuple_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"tuple\0".as_ptr() as *const _;
     tp.tp_basicsize = TUPLE_HEADER_SIZE as isize; // 24
     tp.tp_itemsize = ITEM_SIZE as isize; // 8
     tp
-};
+});
 
-pub unsafe fn tuple_type() -> *mut RawPyTypeObject {
-    &mut PyTuple_Type
+pub fn tuple_type() -> *mut RawPyTypeObject {
+    PyTuple_Type.get()
 }
 
 unsafe extern "C" fn tuple_dealloc(obj: *mut RawPyObject) {
@@ -145,6 +146,6 @@ pub unsafe extern "C" fn PyTuple_Check(obj: *mut RawPyObject) -> c_int {
 }
 
 pub unsafe fn init_tuple_type() {
-    PyTuple_Type.tp_dealloc = Some(tuple_dealloc);
-    PyTuple_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_TUPLE_SUBCLASS | PY_TPFLAGS_HAVE_GC;
+    (*PyTuple_Type.get()).tp_dealloc = Some(tuple_dealloc);
+    (*PyTuple_Type.get()).tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_TUPLE_SUBCLASS | PY_TPFLAGS_HAVE_GC;
 }

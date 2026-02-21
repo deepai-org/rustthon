@@ -12,6 +12,7 @@
 
 use crate::object::pyobject::RawPyObject;
 use crate::object::typeobj::{RawPyTypeObject, PY_TPFLAGS_DEFAULT, PY_TPFLAGS_DICT_SUBCLASS, PY_TPFLAGS_HAVE_GC};
+use crate::object::SyncUnsafeCell;
 use std::os::raw::c_int;
 use std::ptr;
 
@@ -61,27 +62,28 @@ const DKIX_DUMMY: isize = -2;
 const DK_LOG2_MIN: u8 = 3; // minimum index table size = 8
 
 /// Global dict version counter, bumped on every mutation.
-static mut DICT_VERSION_COUNTER: u64 = 0;
+static DICT_VERSION_COUNTER: SyncUnsafeCell<u64> = SyncUnsafeCell::new(0);
 
 #[inline]
 unsafe fn next_dict_version() -> u64 {
-    DICT_VERSION_COUNTER = DICT_VERSION_COUNTER.wrapping_add(1);
-    DICT_VERSION_COUNTER
+    let p = DICT_VERSION_COUNTER.get();
+    *p = (*p).wrapping_add(1);
+    *p
 }
 
 // ─── Type object ───
 
 #[no_mangle]
-pub static mut PyDict_Type: RawPyTypeObject = {
+pub static PyDict_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"dict\0".as_ptr() as *const _;
     tp.tp_basicsize = 48; // sizeof(PyDictObject)
     tp.tp_itemsize = 0;
     tp
-};
+});
 
-pub unsafe fn dict_type() -> *mut RawPyTypeObject {
-    &mut PyDict_Type
+pub fn dict_type() -> *mut RawPyTypeObject {
+    PyDict_Type.get()
 }
 
 // ─── Hashing and equality ───
@@ -653,6 +655,6 @@ pub unsafe extern "C" fn PyDict_Check(obj: *mut RawPyObject) -> c_int {
 }
 
 pub unsafe fn init_dict_type() {
-    PyDict_Type.tp_dealloc = Some(dict_dealloc);
-    PyDict_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_DICT_SUBCLASS | PY_TPFLAGS_HAVE_GC;
+    (*PyDict_Type.get()).tp_dealloc = Some(dict_dealloc);
+    (*PyDict_Type.get()).tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_DICT_SUBCLASS | PY_TPFLAGS_HAVE_GC;
 }

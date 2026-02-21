@@ -2,6 +2,7 @@
 
 use crate::compiler::bytecode::CodeObject;
 use crate::object::pyobject::RawPyObject;
+use crate::object::safe_api::{py_incref, py_decref};
 use std::collections::HashMap;
 use std::ptr;
 
@@ -63,16 +64,10 @@ impl Frame {
 
     /// Store a name in locals.
     pub fn store_name(&mut self, name: &str, obj: *mut RawPyObject) {
-        unsafe {
-            if !obj.is_null() {
-                (*obj).incref();
-            }
-            // Decref old value if present
-            if let Some(&old) = self.locals.get(name) {
-                if !old.is_null() {
-                    (*old).decref();
-                }
-            }
+        py_incref(obj);
+        // Decref old value if present
+        if let Some(&old) = self.locals.get(name) {
+            py_decref(old);
         }
         self.locals.insert(name.to_string(), obj);
     }

@@ -21,8 +21,8 @@ pub fn init_types() {
         crate::object::typeobj::init_base_types();
 
         // 2. Initialize _Py_NoneStruct early (before any extension can access it)
-        none::_Py_NoneStruct.ob_type = none::none_type();
-        none::_Py_NoneStruct.ob_refcnt =
+        (*none::_Py_NoneStruct.get()).ob_type = none::none_type();
+        (*none::_Py_NoneStruct.get()).ob_refcnt =
             std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
 
         // 3. Init individual type objects
@@ -42,9 +42,9 @@ pub fn init_types() {
 
         macro_rules! wire_type {
             ($ty:expr) => {
-                $ty.ob_base.ob_type = &mut PyType_Type;
-                if $ty.tp_base.is_null() {
-                    $ty.tp_base = &mut PyBaseObject_Type;
+                (*$ty.get()).ob_base.ob_type = PyType_Type.get();
+                if (*$ty.get()).tp_base.is_null() {
+                    (*$ty.get()).tp_base = PyBaseObject_Type.get();
                 }
             };
         }

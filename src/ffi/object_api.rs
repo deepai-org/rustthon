@@ -660,7 +660,7 @@ pub unsafe extern "C" fn PyNumber_Index(obj: *mut RawPyObject) -> *mut RawPyObje
     }
     // If it's already an int, return it
     let tp = (*obj).ob_type;
-    if tp == &mut crate::types::longobject::PyLong_Type as *mut _ {
+    if tp == crate::types::longobject::PyLong_Type.get() {
         (*obj).incref();
         return obj;
     }

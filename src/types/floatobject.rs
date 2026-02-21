@@ -8,6 +8,7 @@
 
 use crate::object::pyobject::RawPyObject;
 use crate::object::typeobj::RawPyTypeObject;
+use crate::object::SyncUnsafeCell;
 use std::os::raw::c_int;
 use std::sync::atomic::AtomicIsize;
 
@@ -22,22 +23,24 @@ pub struct PyFloatObject {
 const _: () = assert!(std::mem::size_of::<PyFloatObject>() == 24);
 
 #[no_mangle]
-pub static mut PyFloat_Type: RawPyTypeObject = {
+pub static PyFloat_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"float\0".as_ptr() as *const _;
     tp.tp_basicsize = 24; // size_of::<PyFloatObject>()
     tp
-};
+});
 
-pub unsafe fn float_type() -> *mut RawPyTypeObject {
-    &mut PyFloat_Type
+pub fn float_type() -> *mut RawPyTypeObject {
+    PyFloat_Type.get()
 }
 
 /// Extract the f64 value from a float object.
 #[inline]
-pub unsafe fn float_value(obj: *mut RawPyObject) -> f64 {
-    let typed = obj as *mut PyFloatObject;
-    (*typed).ob_fval
+pub fn float_value(obj: *mut RawPyObject) -> f64 {
+    unsafe {
+        let typed = obj as *mut PyFloatObject;
+        (*typed).ob_fval
+    }
 }
 
 /// Dealloc for float objects — frees via libc::free.
@@ -76,5 +79,5 @@ pub unsafe extern "C" fn PyFloat_Check(obj: *mut RawPyObject) -> c_int {
 }
 
 pub unsafe fn init_float_type() {
-    PyFloat_Type.tp_dealloc = Some(float_dealloc);
+    (*PyFloat_Type.get()).tp_dealloc = Some(float_dealloc);
 }

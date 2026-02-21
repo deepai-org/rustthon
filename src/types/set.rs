@@ -13,6 +13,7 @@
 
 use crate::object::pyobject::RawPyObject;
 use crate::object::typeobj::{RawPyTypeObject, PY_TPFLAGS_DEFAULT, PY_TPFLAGS_HAVE_GC};
+use crate::object::SyncUnsafeCell;
 use std::os::raw::c_int;
 use std::ptr;
 
@@ -48,16 +49,16 @@ const _: () = assert!(std::mem::size_of::<PySetObject>() == 200);
 // ─── Type object ───
 
 #[no_mangle]
-pub static mut PySet_Type: RawPyTypeObject = {
+pub static PySet_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"set\0".as_ptr() as *const _;
     tp.tp_basicsize = 200; // sizeof(PySetObject)
     tp.tp_itemsize = 0;
     tp
-};
+});
 
-pub unsafe fn set_type() -> *mut RawPyTypeObject {
-    &mut PySet_Type
+pub fn set_type() -> *mut RawPyTypeObject {
+    PySet_Type.get()
 }
 
 // ─── Hashing and equality (reuse dict's) ───
@@ -105,9 +106,9 @@ unsafe fn set_keys_equal(a: *mut RawPyObject, b: *mut RawPyObject) -> bool {
 
 /// Sentinel for dummy (deleted) entries.
 /// Uses a fixed address that can never be a valid Python object.
-static mut DUMMY_STRUCT: u8 = 0;
+static DUMMY_STRUCT: SyncUnsafeCell<u8> = SyncUnsafeCell::new(0);
 unsafe fn dummy_key() -> *mut RawPyObject {
-    &mut DUMMY_STRUCT as *mut u8 as *mut RawPyObject
+    DUMMY_STRUCT.get() as *mut u8 as *mut RawPyObject
 }
 
 #[inline]
@@ -360,6 +361,6 @@ pub unsafe extern "C" fn PySet_Check(obj: *mut RawPyObject) -> c_int {
 }
 
 pub unsafe fn init_set_type() {
-    PySet_Type.tp_dealloc = Some(set_dealloc);
-    PySet_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_HAVE_GC;
+    (*PySet_Type.get()).tp_dealloc = Some(set_dealloc);
+    (*PySet_Type.get()).tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_HAVE_GC;
 }

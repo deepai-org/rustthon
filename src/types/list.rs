@@ -7,6 +7,7 @@
 
 use crate::object::pyobject::{RawPyObject, RawPyVarObject};
 use crate::object::typeobj::{RawPyTypeObject, PY_TPFLAGS_DEFAULT, PY_TPFLAGS_LIST_SUBCLASS, PY_TPFLAGS_HAVE_GC};
+use crate::object::SyncUnsafeCell;
 use std::os::raw::c_int;
 use std::ptr;
 use std::sync::atomic::AtomicIsize;
@@ -22,16 +23,16 @@ pub struct PyListObject {
 const _: () = assert!(std::mem::size_of::<PyListObject>() == 40);
 
 #[no_mangle]
-pub static mut PyList_Type: RawPyTypeObject = {
+pub static PyList_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"list\0".as_ptr() as *const _;
     tp.tp_basicsize = 40; // size_of::<PyListObject>()
     tp.tp_itemsize = 0; // items in separate heap array, not inline
     tp
-};
+});
 
-pub unsafe fn list_type() -> *mut RawPyTypeObject {
-    &mut PyList_Type
+pub fn list_type() -> *mut RawPyTypeObject {
+    PyList_Type.get()
 }
 
 // ─── Internal helpers ───
@@ -273,6 +274,6 @@ pub unsafe extern "C" fn PyList_Check(obj: *mut RawPyObject) -> c_int {
 }
 
 pub unsafe fn init_list_type() {
-    PyList_Type.tp_dealloc = Some(list_dealloc);
-    PyList_Type.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_LIST_SUBCLASS | PY_TPFLAGS_HAVE_GC;
+    (*PyList_Type.get()).tp_dealloc = Some(list_dealloc);
+    (*PyList_Type.get()).tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_LIST_SUBCLASS | PY_TPFLAGS_HAVE_GC;
 }

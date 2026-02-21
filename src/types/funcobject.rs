@@ -5,6 +5,7 @@
 
 use crate::object::pyobject::{PyObjectWithData, RawPyObject};
 use crate::object::typeobj::{PyCFunction, PyMethodDef, RawPyTypeObject, METH_NOARGS, METH_O, METH_VARARGS, METH_KEYWORDS};
+use crate::object::SyncUnsafeCell;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
 
@@ -17,7 +18,7 @@ unsafe extern "C" fn cfunction_tp_call(
     call_cfunction(func, args, kwargs)
 }
 
-static mut CFUNCTION_TYPE: RawPyTypeObject = {
+static CFUNCTION_TYPE: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"builtin_function_or_method\0".as_ptr() as *const _;
     tp.tp_basicsize = 0;
@@ -26,10 +27,10 @@ static mut CFUNCTION_TYPE: RawPyTypeObject = {
     tp.tp_call = Some(cfunction_tp_call);
     tp.tp_getattro = Some(cfunction_getattro);
     tp
-};
+});
 
-pub unsafe fn cfunction_type() -> *mut RawPyTypeObject {
-    &mut CFUNCTION_TYPE
+pub fn cfunction_type() -> *mut RawPyTypeObject {
+    CFUNCTION_TYPE.get()
 }
 
 pub unsafe fn init_cfunction_type() {
@@ -99,7 +100,7 @@ unsafe extern "C" fn cfunction_getattro(
         }
         _ => {
             crate::runtime::error::PyErr_SetString(
-                crate::runtime::error::PyExc_AttributeError,
+                *crate::runtime::error::PyExc_AttributeError.get(),
                 b"builtin_function_or_method has no such attribute\0".as_ptr() as *const _,
             );
             ptr::null_mut()
@@ -133,7 +134,7 @@ pub unsafe fn create_cfunction_full(
         (*module).incref();
     }
     let obj = PyObjectWithData::alloc(
-        &mut CFUNCTION_TYPE,
+        CFUNCTION_TYPE.get(),
         CFunctionData {
             name,
             meth,

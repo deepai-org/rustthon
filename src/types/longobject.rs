@@ -10,6 +10,7 @@
 
 use crate::object::pyobject::{RawPyObject, RawPyVarObject};
 use crate::object::typeobj::RawPyTypeObject;
+use crate::object::SyncUnsafeCell;
 use std::os::raw::{c_int, c_long, c_longlong, c_ulong, c_ulonglong};
 use std::sync::atomic::AtomicIsize;
 
@@ -44,16 +45,16 @@ unsafe fn ob_digit(obj: *mut PyLongObject) -> *mut Digit {
 // ─── Type object ───
 
 #[no_mangle]
-pub static mut PyLong_Type: RawPyTypeObject = {
+pub static PyLong_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"int\0".as_ptr() as *const _;
     tp.tp_basicsize = LONG_HEADER_SIZE as isize; // 24
     tp.tp_itemsize = std::mem::size_of::<Digit>() as isize; // 4
     tp
-};
+});
 
-pub unsafe fn long_type() -> *mut RawPyTypeObject {
-    &mut PyLong_Type
+pub fn long_type() -> *mut RawPyTypeObject {
+    PyLong_Type.get()
 }
 
 unsafe extern "C" fn long_dealloc(obj: *mut RawPyObject) {
@@ -272,18 +273,18 @@ unsafe fn pylong_to_bigint(obj: *mut PyLongObject) -> BigInt {
 // ─── Public accessor functions ───
 
 /// Get the i64 value. Returns 0 if overflow (use long_value for big ints).
-pub unsafe fn long_as_i64(obj: *mut RawPyObject) -> i64 {
-    pylong_to_i64(obj as *mut PyLongObject).unwrap_or(0)
+pub fn long_as_i64(obj: *mut RawPyObject) -> i64 {
+    unsafe { pylong_to_i64(obj as *mut PyLongObject).unwrap_or(0) }
 }
 
 /// Get the f64 value.
-pub unsafe fn long_as_f64(obj: *mut RawPyObject) -> f64 {
-    pylong_to_f64(obj as *mut PyLongObject)
+pub fn long_as_f64(obj: *mut RawPyObject) -> f64 {
+    unsafe { pylong_to_f64(obj as *mut PyLongObject) }
 }
 
 /// Get the BigInt value (allocates). For display and arbitrary precision.
-pub unsafe fn long_value(obj: *mut RawPyObject) -> BigInt {
-    pylong_to_bigint(obj as *mut PyLongObject)
+pub fn long_value(obj: *mut RawPyObject) -> BigInt {
+    unsafe { pylong_to_bigint(obj as *mut PyLongObject) }
 }
 
 // ─── Small int cache ───
@@ -558,7 +559,7 @@ pub unsafe extern "C" fn PyNumber_ToBase(
 }
 
 pub unsafe fn init_long_type() {
-    PyLong_Type.tp_dealloc = Some(long_dealloc);
-    PyLong_Type.tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
+    (*PyLong_Type.get()).tp_dealloc = Some(long_dealloc);
+    (*PyLong_Type.get()).tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
         | crate::object::typeobj::PY_TPFLAGS_LONG_SUBCLASS;
 }
