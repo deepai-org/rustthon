@@ -202,6 +202,63 @@ pub unsafe extern "C" fn PyErr_NoMemory() -> *mut RawPyObject {
     ptr::null_mut()
 }
 
+/// PyErr_NewException — create a new exception class.
+/// Returns a new reference to an exception type object.
+/// For now, returns a minimal sentinel object that can be used as an exception type.
+#[no_mangle]
+pub unsafe extern "C" fn PyErr_NewException(
+    name: *const c_char,
+    base: *mut RawPyObject,
+    _dict: *mut RawPyObject,
+) -> *mut RawPyObject {
+    // Create a minimal type-like object to serve as an exception class.
+    // In a full implementation this would be a real PyTypeObject.
+    // For now, create a unicode string with the exception name that can be
+    // used as the exception type sentinel.
+    if name.is_null() {
+        return ptr::null_mut();
+    }
+    // Use the base if provided, otherwise create a simple sentinel
+    if !base.is_null() {
+        // Create a copy/wrapper of the base as a new exception type
+        // Simplified: just create a new object that stores the name
+    }
+    crate::types::unicode::PyUnicode_FromString(name)
+}
+
+// ─── Exception type singletons ───
+// These are stable pointers that C extensions compare against.
+// We use static allocations (via Lazy) to ensure pointer stability.
+
+use once_cell::sync::Lazy;
+use crate::object::SendPtr;
+
+macro_rules! exc_singleton {
+    ($name:ident, $cname:ident, $label:expr) => {
+        static $name: Lazy<SendPtr<RawPyObject>> = Lazy::new(|| unsafe {
+            let obj = crate::types::unicode::create_from_str($label);
+            // Make immortal
+            (*obj).ob_refcnt = std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
+            SendPtr(obj)
+        });
+
+        #[no_mangle]
+        pub unsafe extern "C" fn $cname() -> *mut RawPyObject {
+            $name.get()
+        }
+    };
+}
+
+exc_singleton!(EXC_TYPE_ERROR, _Rustthon_Exc_TypeError, "TypeError");
+exc_singleton!(EXC_VALUE_ERROR, _Rustthon_Exc_ValueError, "ValueError");
+exc_singleton!(EXC_OVERFLOW_ERROR, _Rustthon_Exc_OverflowError, "OverflowError");
+exc_singleton!(EXC_RUNTIME_ERROR, _Rustthon_Exc_RuntimeError, "RuntimeError");
+exc_singleton!(EXC_KEY_ERROR, _Rustthon_Exc_KeyError, "KeyError");
+exc_singleton!(EXC_INDEX_ERROR, _Rustthon_Exc_IndexError, "IndexError");
+exc_singleton!(EXC_ATTRIBUTE_ERROR, _Rustthon_Exc_AttributeError, "AttributeError");
+exc_singleton!(EXC_STOP_ITERATION, _Rustthon_Exc_StopIteration, "StopIteration");
+exc_singleton!(EXC_MEMORY_ERROR, _Rustthon_Exc_MemoryError, "MemoryError");
+
 // ─── Internal helpers ───
 
 /// Set an error from Rust code (convenience).

@@ -101,6 +101,12 @@ pub unsafe extern "C" fn Py_IsFalse(obj: *mut RawPyObject) -> i32 {
     if obj == PY_FALSE.get() { 1 } else { 0 }
 }
 
+/// PyBool_Check — returns 1 if the object is a bool (True or False).
+#[no_mangle]
+pub unsafe extern "C" fn PyBool_Check(obj: *mut RawPyObject) -> std::os::raw::c_int {
+    if is_bool(obj) { 1 } else { 0 }
+}
+
 pub unsafe fn init_bool_type() {
     BOOL_TYPE.tp_base = crate::types::longobject::long_type();
     BOOL_TYPE.tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT

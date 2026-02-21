@@ -448,6 +448,117 @@ pub unsafe extern "C" fn PyLong_Check(obj: *mut RawPyObject) -> c_int {
 #[no_mangle]
 pub static mut PyLong_Type: *mut RawPyTypeObject = std::ptr::null_mut();
 
+/// PyLong_FromString — parse a C string as an integer in the given base.
+#[no_mangle]
+pub unsafe extern "C" fn PyLong_FromString(
+    str_ptr: *const std::os::raw::c_char,
+    pend: *mut *mut std::os::raw::c_char,
+    base: c_int,
+) -> *mut RawPyObject {
+    if str_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let c_str = std::ffi::CStr::from_ptr(str_ptr);
+    let s = c_str.to_string_lossy();
+    let s = s.trim();
+
+    // Parse using the specified base
+    let result: Result<i64, _> = if base == 0 {
+        // Auto-detect base from prefix
+        if s.starts_with("0x") || s.starts_with("0X") {
+            i64::from_str_radix(&s[2..], 16)
+        } else if s.starts_with("0o") || s.starts_with("0O") {
+            i64::from_str_radix(&s[2..], 8)
+        } else if s.starts_with("0b") || s.starts_with("0B") {
+            i64::from_str_radix(&s[2..], 2)
+        } else {
+            s.parse()
+        }
+    } else {
+        i64::from_str_radix(s, base as u32)
+    };
+
+    // Set pend to end of string if requested
+    if !pend.is_null() {
+        *pend = str_ptr.add(c_str.to_bytes().len()) as *mut _;
+    }
+
+    match result {
+        Ok(v) => create_long(v),
+        Err(_) => {
+            // Try BigInt for very large numbers
+            if let Ok(big) = s.parse::<BigInt>() {
+                let obj = create_long_from_bigint(&big);
+                return obj;
+            }
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Create a PyLongObject from a BigInt.
+unsafe fn create_long_from_bigint(value: &BigInt) -> *mut RawPyObject {
+    use num_traits::Zero;
+    use num_traits::Signed;
+
+    if value.is_zero() {
+        return create_long(0);
+    }
+
+    // Convert to string and parse back via i64 if possible
+    if let Some(v) = value.to_i64() {
+        return create_long(v);
+    }
+
+    // Large value: convert via digit decomposition
+    let negative = value.is_negative();
+    let abs_val = if negative { -value.clone() } else { value.clone() };
+
+    // Extract 30-bit digits
+    let mut digits = Vec::new();
+    let mut remaining = abs_val;
+    let base = BigInt::from(PYLONG_BASE);
+    while remaining > BigInt::from(0) {
+        let digit = (&remaining % &base).to_u64().unwrap_or(0) as Digit;
+        digits.push(digit);
+        remaining = remaining / &base;
+    }
+
+    let ndigits = digits.len().max(1);
+    let obj = alloc_long(ndigits);
+    (*obj).ob_base.ob_size = if negative {
+        -(ndigits as isize)
+    } else {
+        ndigits as isize
+    };
+    let digit_ptr = ob_digit(obj);
+    for (i, &d) in digits.iter().enumerate() {
+        *digit_ptr.add(i) = d;
+    }
+    obj as *mut RawPyObject
+}
+
+/// PyNumber_ToBase — convert an integer to a string in the given base.
+/// Only base 2, 8, 10, 16 are supported (matching CPython).
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_ToBase(
+    obj: *mut RawPyObject,
+    base: c_int,
+) -> *mut RawPyObject {
+    if obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    let big = pylong_to_bigint(obj as *mut PyLongObject);
+    let s = match base {
+        2 => format!("{}", big.to_str_radix(2)),
+        8 => format!("{}", big.to_str_radix(8)),
+        10 => format!("{}", big.to_str_radix(10)),
+        16 => format!("{}", big.to_str_radix(16)),
+        _ => format!("{}", big),
+    };
+    crate::types::unicode::create_from_str(&s)
+}
+
 pub unsafe fn init_long_type() {
     LONG_TYPE.tp_dealloc = Some(long_dealloc);
     LONG_TYPE.tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT

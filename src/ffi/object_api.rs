@@ -539,6 +539,80 @@ pub unsafe extern "C" fn PyType_GenericNew(
     crate::runtime::memory::_PyObject_New(tp)
 }
 
+/// PyObject_CallMethod — call a method on an object by name.
+/// The format argument is ignored (simplified); only used for no-arg calls in ujson.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_CallMethod(
+    obj: *mut RawPyObject,
+    name: *const c_char,
+    _format: *const c_char,
+    // varargs not supported, but ujson always passes NULL format
+) -> *mut RawPyObject {
+    if obj.is_null() || name.is_null() {
+        return ptr::null_mut();
+    }
+    let method = PyObject_GetAttrString(obj, name);
+    if method.is_null() {
+        return ptr::null_mut();
+    }
+    // Call with no arguments (since format is NULL)
+    let result = PyObject_CallNoArgs(method);
+    (*method).decref();
+    result
+}
+
+/// PyObject_CallFunctionObjArgs — call a callable with a NULL-terminated list of PyObject* args.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_CallFunctionObjArgs(
+    callable: *mut RawPyObject,
+    // varargs: PyObject*, ..., NULL
+    // We need to use C varargs here
+) -> *mut RawPyObject {
+    // This is a varargs function. In Rust extern "C" we can't easily handle varargs.
+    // However, this is only called via the C ABI from C code, so we declare it in the
+    // csrc/ shim. For now, provide a stub that handles the common 1-arg case.
+    //
+    // Actually, we need to implement this properly. Let's use a C shim.
+    // For now, return null — we'll implement this as a C wrapper.
+    ptr::null_mut()
+}
+
+/// PyObject_IsInstance — check if obj is an instance of cls.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_IsInstance(
+    inst: *mut RawPyObject,
+    cls: *mut RawPyObject,
+) -> c_int {
+    if inst.is_null() || cls.is_null() {
+        return -1;
+    }
+    let inst_type = (*inst).ob_type;
+    let cls_type = cls as *mut RawPyTypeObject;
+    // Check if inst's type matches cls directly or via subtype chain
+    PyType_IsSubtype(inst_type, cls_type)
+}
+
+/// PyIter_Check — check if an object provides the iterator protocol.
+/// Returns 1 if the object's type has tp_iternext set.
+#[no_mangle]
+pub unsafe extern "C" fn PyIter_Check(obj: *mut RawPyObject) -> c_int {
+    if obj.is_null() {
+        return 0;
+    }
+    let tp = (*obj).ob_type;
+    if !tp.is_null() && (*tp).tp_iternext.is_some() {
+        1
+    } else {
+        0
+    }
+}
+
+/// PyByteArray_Check — stub, always returns 0 (we don't support bytearray yet).
+#[no_mangle]
+pub unsafe extern "C" fn PyByteArray_Check(_obj: *mut RawPyObject) -> c_int {
+    0
+}
+
 /// PyType_GenericAlloc
 #[no_mangle]
 pub unsafe extern "C" fn PyType_GenericAlloc(

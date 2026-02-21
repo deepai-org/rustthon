@@ -121,7 +121,12 @@ pub unsafe extern "C" fn PyModule_Create2(
         }
     }
 
-    module as *mut RawPyObject
+    let result = module as *mut RawPyObject;
+
+    // Register the module for PyState_FindModule
+    register_module(def, result);
+
+    result
 }
 
 /// PyModule_GetDict - get module's __dict__
@@ -203,6 +208,66 @@ pub unsafe extern "C" fn PyModule_Check(obj: *mut RawPyObject) -> c_int {
         return 0;
     }
     if (*obj).ob_type == module_type() { 1 } else { 0 }
+}
+
+/// PyModule_GetState — get the per-module state (m_size bytes after the module object).
+/// For modules with m_size > 0, this returns a pointer to the state block.
+/// Our simplified implementation stores state inline after ModuleData.
+#[no_mangle]
+pub unsafe extern "C" fn PyModule_GetState(module: *mut RawPyObject) -> *mut c_void {
+    if module.is_null() {
+        return ptr::null_mut();
+    }
+    let data = PyObjectWithData::<ModuleData>::data_from_raw(module);
+    if data.def.is_null() || (*data.def).m_size <= 0 {
+        return ptr::null_mut();
+    }
+    // Return the state block that was allocated after module creation.
+    // We store it in a separate allocation pointed to from a static map.
+    get_module_state(module)
+}
+
+/// PyState_FindModule — find a module by its PyModuleDef.
+/// Simplified: we track modules in a global registry.
+#[no_mangle]
+pub unsafe extern "C" fn PyState_FindModule(def: *mut PyModuleDef) -> *mut RawPyObject {
+    let registry = MODULE_REGISTRY.lock();
+    let key = def as usize;
+    registry.0.get(&key).copied().unwrap_or(ptr::null_mut())
+}
+
+// ─── Module registry and state management ───
+
+use std::collections::HashMap;
+use parking_lot::Mutex;
+use once_cell::sync::Lazy;
+
+struct ModuleRegistryInner(HashMap<usize, *mut RawPyObject>);
+unsafe impl Send for ModuleRegistryInner {}
+
+static MODULE_REGISTRY: Lazy<Mutex<ModuleRegistryInner>> =
+    Lazy::new(|| Mutex::new(ModuleRegistryInner(HashMap::new())));
+
+struct ModuleStateInner(HashMap<usize, *mut c_void>);
+unsafe impl Send for ModuleStateInner {}
+
+static MODULE_STATES: Lazy<Mutex<ModuleStateInner>> =
+    Lazy::new(|| Mutex::new(ModuleStateInner(HashMap::new())));
+
+/// Register a module with its def for PyState_FindModule.
+unsafe fn register_module(def: *mut PyModuleDef, module: *mut RawPyObject) {
+    let key = def as usize;
+    MODULE_REGISTRY.lock().0.insert(key, module);
+
+    // Allocate per-module state if m_size > 0
+    if !def.is_null() && (*def).m_size > 0 {
+        let state = libc::calloc(1, (*def).m_size as usize);
+        MODULE_STATES.lock().0.insert(module as usize, state);
+    }
+}
+
+unsafe fn get_module_state(module: *mut RawPyObject) -> *mut c_void {
+    MODULE_STATES.lock().0.get(&(module as usize)).copied().unwrap_or(ptr::null_mut())
 }
 
 /// PyModuleDef_Init

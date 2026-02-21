@@ -67,3 +67,10 @@ pub unsafe extern "C" fn Py_REFCNT(op: *mut RawPyObject) -> isize {
         (*op).refcnt()
     }
 }
+
+/// _Py_Dealloc — called by Py_DECREF macro in Python.h when refcount hits zero.
+/// Reads ob_type->tp_dealloc and calls it, or falls back to libc::free.
+#[no_mangle]
+pub unsafe extern "C" fn _Py_Dealloc(op: *mut RawPyObject) {
+    super::pyobject::dealloc_object(op);
+}

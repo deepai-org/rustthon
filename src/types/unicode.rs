@@ -443,6 +443,112 @@ pub unsafe fn create_from_str(s: &str) -> *mut RawPyObject {
     create_unicode(s)
 }
 
+/// PyUnicode_New — allocate an empty unicode object with room for `size` characters
+/// of at most `maxchar` codepoint. The caller writes directly into the data buffer
+/// via PyUnicode_1BYTE_DATA / PyUnicode_2BYTE_DATA / PyUnicode_4BYTE_DATA macros.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_New(size: isize, maxchar: u32) -> *mut RawPyObject {
+    if size < 0 {
+        return ptr::null_mut();
+    }
+    let len = size as usize;
+
+    if maxchar < 128 {
+        // ASCII compact: header=48, data=len+1
+        let total = ASCII_HEADER + len + 1;
+        let raw = libc::calloc(1, total) as *mut PyASCIIObject;
+        if raw.is_null() { std::process::abort(); }
+        (*raw).ob_refcnt = AtomicIsize::new(1);
+        (*raw).ob_type = unicode_type();
+        (*raw).length = size;
+        (*raw).hash = -1;
+        (*raw).state = make_state(PYUNICODE_1BYTE_KIND, true, true);
+        (*raw).wstr = ptr::null_mut();
+        raw as *mut RawPyObject
+    } else {
+        // Non-ASCII compact: header=72
+        let (kind, kind_size) = if maxchar < 256 {
+            (PYUNICODE_1BYTE_KIND, 1usize)
+        } else if maxchar < 65536 {
+            (PYUNICODE_2BYTE_KIND, 2usize)
+        } else {
+            (PYUNICODE_4BYTE_KIND, 4usize)
+        };
+        let total = COMPACT_HEADER + len * kind_size + kind_size; // +kind_size for null terminator
+        let raw = libc::calloc(1, total) as *mut PyCompactUnicodeObject;
+        if raw.is_null() { std::process::abort(); }
+        (*raw)._base.ob_refcnt = AtomicIsize::new(1);
+        (*raw)._base.ob_type = unicode_type();
+        (*raw)._base.length = size;
+        (*raw)._base.hash = -1;
+        (*raw)._base.state = make_state(kind, true, false);
+        (*raw)._base.wstr = ptr::null_mut();
+        (*raw).utf8 = ptr::null_mut();
+        (*raw).utf8_length = 0;
+        (*raw).wstr_length = 0;
+        raw as *mut RawPyObject
+    }
+}
+
+/// PyUnicode_FromKindAndData — create a unicode string from a buffer of
+/// code points of the given kind (1, 2, or 4 bytes per character).
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_FromKindAndData(
+    kind: c_int,
+    buffer: *const std::os::raw::c_void,
+    size: isize,
+) -> *mut RawPyObject {
+    if buffer.is_null() || size < 0 {
+        return ptr::null_mut();
+    }
+    let len = size as usize;
+    if len == 0 {
+        return create_ascii("");
+    }
+
+    match kind as u32 {
+        PYUNICODE_1BYTE_KIND => {
+            let data = std::slice::from_raw_parts(buffer as *const u8, len);
+            // Check if all ASCII
+            let all_ascii = data.iter().all(|&b| b < 128);
+            if all_ascii {
+                let s = std::str::from_utf8_unchecked(data);
+                create_ascii(s)
+            } else {
+                // Latin-1: convert each byte to char
+                let s: String = data.iter().map(|&b| b as char).collect();
+                create_non_ascii(&s)
+            }
+        }
+        PYUNICODE_2BYTE_KIND => {
+            let data = std::slice::from_raw_parts(buffer as *const u16, len);
+            let s: String = data.iter().filter_map(|&cp| char::from_u32(cp as u32)).collect();
+            create_unicode(&s)
+        }
+        PYUNICODE_4BYTE_KIND => {
+            let data = std::slice::from_raw_parts(buffer as *const u32, len);
+            let s: String = data.iter().filter_map(|&cp| char::from_u32(cp)).collect();
+            create_unicode(&s)
+        }
+        _ => ptr::null_mut(),
+    }
+}
+
+/// PyUnicode_DecodeUTF8 — decode a UTF-8 byte string to a Python unicode object.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_DecodeUTF8(
+    s: *const c_char,
+    size: isize,
+    _errors: *const c_char,
+) -> *mut RawPyObject {
+    if s.is_null() || size < 0 {
+        return ptr::null_mut();
+    }
+    let slice = std::slice::from_raw_parts(s as *const u8, size as usize);
+    let string = String::from_utf8_lossy(slice);
+    create_unicode(&string)
+}
+
 #[no_mangle]
 pub static mut PyUnicode_Type: *mut RawPyTypeObject = ptr::null_mut();
 

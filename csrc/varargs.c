@@ -551,3 +551,88 @@ PyObject *_Py_BuildValue_SizeT(const char *format, ...) {
 PyObject *Py_VaBuildValue(const char *format, va_list va) {
     return do_build_value(format, va);
 }
+
+/* ═══════════════════════════════════════════════════════
+ *  PyObject_CallFunctionObjArgs
+ *  Call a callable with NULL-terminated PyObject* arguments.
+ * ═══════════════════════════════════════════════════════ */
+
+extern PyObject *PyTuple_New(Py_ssize_t size);
+extern int PyTuple_SetItem(PyObject *tuple, Py_ssize_t i, PyObject *v);
+extern PyObject *PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwargs);
+extern void Py_IncRef(PyObject *o);
+extern void Py_DecRef(PyObject *o);
+
+PyObject *PyObject_CallFunctionObjArgs(PyObject *callable, ...) {
+    if (!callable) return (PyObject *)0;
+
+    /* First pass: count arguments */
+    va_list va;
+    va_start(va, callable);
+    int count = 0;
+    while (va_arg(va, PyObject *) != (PyObject *)0) {
+        count++;
+    }
+    va_end(va);
+
+    /* Build a tuple */
+    PyObject *args = PyTuple_New(count);
+    if (!args) return (PyObject *)0;
+
+    va_start(va, callable);
+    for (int i = 0; i < count; i++) {
+        PyObject *arg = va_arg(va, PyObject *);
+        Py_IncRef(arg);
+        PyTuple_SetItem(args, i, arg);
+    }
+    va_end(va);
+
+    PyObject *result = PyObject_Call(callable, args, (PyObject *)0);
+    Py_DecRef(args);
+    return result;
+}
+
+/* ═══════════════════════════════════════════════════════
+ *  PyObject_CallMethod (varargs version)
+ *  Call a named method on an object.
+ *  format + varargs are used to build the argument tuple.
+ *  If format is NULL, call with no arguments.
+ * ═══════════════════════════════════════════════════════ */
+
+extern PyObject *PyObject_GetAttrString(PyObject *obj, const char *name);
+extern int PyCallable_Check(PyObject *obj);
+
+/* Override the Rust stub with the real varargs version */
+PyObject *PyObject_CallMethod(PyObject *obj, const char *name, const char *format, ...) {
+    if (!obj || !name) return (PyObject *)0;
+
+    PyObject *method = PyObject_GetAttrString(obj, name);
+    if (!method) return (PyObject *)0;
+
+    PyObject *args;
+    if (format && *format) {
+        va_list va;
+        va_start(va, format);
+        args = do_build_value(format, va);
+        va_end(va);
+        if (!args) {
+            Py_DecRef(method);
+            return (PyObject *)0;
+        }
+        /* Ensure args is a tuple */
+        if (!PyTuple_Check(args)) {
+            PyObject *tuple = PyTuple_New(1);
+            Py_IncRef(args);
+            PyTuple_SetItem(tuple, 0, args);
+            Py_DecRef(args);
+            args = tuple;
+        }
+    } else {
+        args = PyTuple_New(0);
+    }
+
+    PyObject *result = PyObject_Call(method, args, (PyObject *)0);
+    Py_DecRef(method);
+    Py_DecRef(args);
+    return result;
+}
