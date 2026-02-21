@@ -363,27 +363,6 @@ pub unsafe extern "C" fn PyDict_SetItem(
         }
         (*d).ma_used += 1;
     }
-    // Debug: trace what's stored
-    if !value.is_null() && !(*value).ob_type.is_null() {
-        let tp = (*value).ob_type;
-        let tp_name = if !(*tp).tp_name.is_null() {
-            std::ffi::CStr::from_ptr((*tp).tp_name).to_str().unwrap_or("???")
-        } else { "?" };
-        if tp_name != "str" && tp_name != "dict" && tp_name != "module" {
-            let key_str = if !key.is_null() && (*key).ob_type == crate::types::unicode::unicode_type() {
-                crate::types::unicode::unicode_value(key).to_string()
-            } else { "?".to_string() };
-            eprintln!("[rustthon] PyDict_SetItem: key='{}' value={:p} type={} ob_type={:p}",
-                key_str, value, tp_name, (*value).ob_type);
-        }
-    } else if !value.is_null() {
-        let key_str = if !key.is_null() && !(*key).ob_type.is_null()
-            && (*key).ob_type == crate::types::unicode::unicode_type() {
-            crate::types::unicode::unicode_value(key).to_string()
-        } else { "?".to_string() };
-        eprintln!("[rustthon] PyDict_SetItem: key='{}' value={:p} ob_type=NULL!", key_str, value);
-    }
-
     (*d).ma_version_tag = next_dict_version();
     0
 }

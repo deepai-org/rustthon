@@ -35,6 +35,7 @@ pub fn init_types() {
         unicode::init_unicode_type();
         dict::init_dict_type();
         set::init_set_type();
+        funcobject::init_cfunction_type();
 
         // 4. Wire metaclass chain: set ob_type=PyType_Type on all built-in types
         use crate::object::typeobj::{PyType_Type, PyBaseObject_Type};

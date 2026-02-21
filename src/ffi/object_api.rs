@@ -429,28 +429,10 @@ pub unsafe extern "C" fn PyObject_Call(
     let tp = (*callable).ob_type;
     if !tp.is_null() {
         if let Some(tp_call) = (*tp).tp_call {
-            let result = tp_call(callable, args, kwargs);
-            if result.is_null() {
-                // Debug: check if an error was set
-                let err = crate::runtime::error::PyErr_Occurred();
-                if !err.is_null() {
-                    let etp = err as *mut crate::object::typeobj::RawPyTypeObject;
-                    if !(*etp).tp_name.is_null() {
-                        let name = std::ffi::CStr::from_ptr((*etp).tp_name);
-                        eprintln!("[rustthon] PyObject_Call: tp_call returned NULL, exception: {:?}", name);
-                    }
-                } else {
-                    eprintln!("[rustthon] PyObject_Call: tp_call returned NULL, no exception set");
-                }
-            }
-            return result;
+            return tp_call(callable, args, kwargs);
         }
     }
     // Not callable
-    eprintln!("[rustthon] PyObject_Call: not callable, tp={:?}, tp_call=None",
-        if !tp.is_null() && !(*tp).tp_name.is_null() {
-            std::ffi::CStr::from_ptr((*tp).tp_name).to_str().unwrap_or("???")
-        } else { "null" });
     ptr::null_mut()
 }
 
@@ -724,9 +706,7 @@ pub unsafe extern "C" fn PyCMethod_New(
     if ml.is_null() {
         return ptr::null_mut();
     }
-    // Create a PyCFunction wrapper and return it
-    let func = crate::types::funcobject::PyCFunction_NewEx(ml, self_obj, module);
-    func
+    crate::types::funcobject::PyCFunction_NewEx(ml, self_obj, module)
 }
 
 // PyType_GenericAlloc is in object/typeobj.rs

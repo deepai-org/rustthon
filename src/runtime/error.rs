@@ -57,16 +57,10 @@ where
 /// This is the most common way C extensions signal errors.
 #[no_mangle]
 pub unsafe extern "C" fn PyErr_SetString(exc_type: *mut RawPyObject, message: *const c_char) {
-    // In a full implementation, we'd create a proper exception object from the message.
-    // For now, store the type directly and create a string value.
     with_error(|state| {
         state.exc_type = exc_type;
-        // Create a Python string from the message
         if !message.is_null() {
-            let msg_str = std::ffi::CStr::from_ptr(message);
-            // For now, store the type as the value too (placeholder)
-            // A full implementation would create a PyUnicode from msg_str
-            state.exc_value = exc_type; // TODO: create proper exception instance
+            state.exc_value = crate::types::unicode::PyUnicode_FromString(message);
         }
         state.exc_traceback = ptr::null_mut();
     });
@@ -247,19 +241,61 @@ pub unsafe extern "C" fn PyErr_NewException(
     base: *mut RawPyObject,
     _dict: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    // Create a minimal type-like object to serve as an exception class.
-    // In a full implementation this would be a real PyTypeObject.
-    // For now, create a unicode string with the exception name that can be
-    // used as the exception type sentinel.
     if name.is_null() {
         return ptr::null_mut();
     }
-    // Use the base if provided, otherwise create a simple sentinel
-    if !base.is_null() {
-        // Create a copy/wrapper of the base as a new exception type
-        // Simplified: just create a new object that stores the name
+
+    // Determine the base exception type
+    let base_tp = if !base.is_null() {
+        base as *mut RawPyTypeObject
+    } else {
+        PyExc_Exception as *mut RawPyTypeObject
+    };
+
+    // We need a stable name pointer — heap-allocate a copy of the name string
+    let name_cstr = std::ffi::CStr::from_ptr(name);
+    let name_bytes = name_cstr.to_bytes_with_nul();
+    let name_copy = libc::malloc(name_bytes.len()) as *mut u8;
+    if name_copy.is_null() {
+        return ptr::null_mut();
     }
-    crate::types::unicode::PyUnicode_FromString(name)
+    std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_copy, name_bytes.len());
+
+    // Allocate a real PyTypeObject with proper base chain
+    let tp = libc::calloc(1, std::mem::size_of::<RawPyTypeObject>()) as *mut RawPyTypeObject;
+    if tp.is_null() {
+        return ptr::null_mut();
+    }
+    std::ptr::write(tp, RawPyTypeObject::zeroed());
+
+    (*tp).tp_name = name_copy as *const c_char;
+    (*tp).ob_base.ob_type = &mut crate::object::typeobj::PyType_Type;
+    (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+    (*tp).tp_basicsize = std::mem::size_of::<RawPyObject>() as isize;
+    (*tp).tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
+        | crate::object::typeobj::PY_TPFLAGS_READY;
+
+    // Set base type for PyType_IsSubtype to work
+    if !base_tp.is_null() {
+        (*tp).tp_base = base_tp;
+        let bases = crate::types::tuple::PyTuple_New(1);
+        let base_obj = base_tp as *mut RawPyObject;
+        (*base_obj).incref();
+        crate::types::tuple::PyTuple_SetItem(bases, 0, base_obj);
+        (*tp).tp_bases = bases;
+    }
+
+    // Inherit slots from base
+    if !base_tp.is_null() {
+        if (*tp).tp_alloc.is_none() { (*tp).tp_alloc = (*base_tp).tp_alloc; }
+        if (*tp).tp_new.is_none() { (*tp).tp_new = (*base_tp).tp_new; }
+        if (*tp).tp_init.is_none() { (*tp).tp_init = (*base_tp).tp_init; }
+        if (*tp).tp_free.is_none() { (*tp).tp_free = (*base_tp).tp_free; }
+        if (*tp).tp_dealloc.is_none() { (*tp).tp_dealloc = (*base_tp).tp_dealloc; }
+        if (*tp).tp_getattro.is_none() { (*tp).tp_getattro = (*base_tp).tp_getattro; }
+    }
+
+    tp as *mut RawPyObject
 }
 
 // ─── Exception type singletons ───
@@ -484,7 +520,22 @@ pub unsafe extern "C" fn PyErr_PrintEx(_set_sys_last_vars: c_int) {
         } else {
             "Exception".to_string()
         };
-        eprintln!("{}", name);
+        if !pvalue.is_null() {
+            let val_str = crate::ffi::object_api::PyObject_Str(pvalue);
+            if !val_str.is_null() {
+                let msg = crate::types::unicode::PyUnicode_AsUTF8(val_str);
+                if !msg.is_null() {
+                    let s = std::ffi::CStr::from_ptr(msg).to_string_lossy();
+                    eprintln!("{}: {}", name, s);
+                } else {
+                    eprintln!("{}", name);
+                }
+            } else {
+                eprintln!("{}", name);
+            }
+        } else {
+            eprintln!("{}", name);
+        }
     }
 }
 
@@ -503,8 +554,12 @@ pub unsafe extern "C" fn PyErr_NewExceptionWithDoc(
     base: *mut RawPyObject,
     dict: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    // Delegate to PyErr_NewException (ignoring doc for now)
-    PyErr_NewException(name, base, dict)
+    let result = PyErr_NewException(name, base, dict);
+    if !result.is_null() && !doc.is_null() {
+        let tp = result as *mut RawPyTypeObject;
+        (*tp).tp_doc = doc;
+    }
+    result
 }
 
 // ─── Exception object APIs (needed by PyO3) ───

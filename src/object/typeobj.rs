@@ -580,12 +580,7 @@ pub unsafe extern "C" fn PyType_Ready(tp: *mut RawPyTypeObject) -> c_int {
         // Check alignment before dereferencing
         let base_addr = base as usize;
         if base_addr % std::mem::align_of::<RawPyTypeObject>() != 0 {
-            eprintln!("[rustthon] PyType_Ready: MISALIGNED tp_base={:p} (alignment {}), tp={:p} tp_name={:?}",
-                base, std::mem::align_of::<RawPyTypeObject>(), tp,
-                if !(*tp).tp_name.is_null() {
-                    std::ffi::CStr::from_ptr((*tp).tp_name).to_str().unwrap_or("???")
-                } else { "(null)" });
-            // Try to continue with &PyBaseObject_Type instead
+            // Misaligned tp_base — fall back to PyBaseObject_Type
             (*tp).tp_base = &mut PyBaseObject_Type;
         }
     }
@@ -900,9 +895,7 @@ pub unsafe extern "C" fn PyType_FromModuleAndSpec(
                 PY_TP_FINALIZE => (*tp).tp_finalize = Some(std::mem::transmute(pfunc)),
                 PY_TP_DESCR_GET => (*tp).tp_descr_get = Some(std::mem::transmute(pfunc)),
                 PY_TP_BASE => { /* handled separately below */ },
-                _ => {
-                    eprintln!("[rustthon] PyType_FromModuleAndSpec: ignoring unknown slot_id={}", slot_id);
-                } // Unknown slot, ignore
+                _ => {} // Unknown slot, ignore
             }
             slot_ptr = slot_ptr.add(1);
         }
@@ -947,10 +940,6 @@ pub unsafe extern "C" fn PyType_FromModuleAndSpec(
     // Call PyType_Ready to finalize
     let ret = PyType_Ready(tp);
     if ret < 0 {
-        eprintln!("[rustthon] PyType_FromModuleAndSpec: PyType_Ready failed for {:?}",
-            if !(*spec).name.is_null() {
-                std::ffi::CStr::from_ptr((*spec).name).to_str().unwrap_or("???")
-            } else { "(null)" });
         libc::free(tp as *mut c_void);
         return ptr::null_mut();
     }
@@ -1057,19 +1046,9 @@ pub unsafe extern "C" fn PyType_FromSpecWithBases(
     // Call PyType_Ready to finalize
     let ret = PyType_Ready(tp);
     if ret < 0 {
-        eprintln!("[rustthon] PyType_FromSpecWithBases: PyType_Ready failed for {:?}",
-            if !(*spec).name.is_null() {
-                std::ffi::CStr::from_ptr((*spec).name).to_str().unwrap_or("???")
-            } else { "(null)" });
         libc::free(tp as *mut c_void);
         return ptr::null_mut();
     }
-
-    eprintln!("[rustthon] PyType_FromSpecWithBases: created type {:?} at {:p}, basicsize={}, base={:p}",
-        if !(*spec).name.is_null() {
-            std::ffi::CStr::from_ptr((*spec).name).to_str().unwrap_or("???")
-        } else { "(null)" },
-        tp, (*tp).tp_basicsize, (*tp).tp_base);
 
     tp as *mut RawPyObject
 }
