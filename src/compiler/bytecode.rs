@@ -3,7 +3,7 @@
 //! Our bytecode is inspired by CPython's but simplified.
 //! Each instruction is an opcode + optional argument.
 
-use crate::object::pyobject::RawPyObject;
+use crate::object::pyobject::PyObjectRef;
 
 /// Bytecode opcodes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,12 +127,11 @@ pub struct Instruction {
 }
 
 /// A compiled code object (like CPython's PyCodeObject)
-#[derive(Debug)]
 pub struct CodeObject {
     /// The bytecode instructions
     pub instructions: Vec<Instruction>,
-    /// Constants pool (Python objects)
-    pub constants: Vec<*mut RawPyObject>,
+    /// Constants pool (owned Python objects — RAII manages refcounts)
+    pub constants: Vec<PyObjectRef>,
     /// Names used in the code (for LOAD_NAME, STORE_NAME)
     pub names: Vec<String>,
     /// Local variable names (for LOAD_FAST, STORE_FAST)
@@ -159,7 +158,7 @@ impl CodeObject {
     }
 
     /// Add a constant and return its index.
-    pub fn add_const(&mut self, obj: *mut RawPyObject) -> u32 {
+    pub fn add_const(&mut self, obj: PyObjectRef) -> u32 {
         let idx = self.constants.len() as u32;
         self.constants.push(obj);
         idx

@@ -9,10 +9,11 @@
 
 use parking_lot::{Mutex, MutexGuard};
 use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::os::raw::c_int;
-use std::ptr;
 use std::sync::OnceLock;
 
+use crate::object::pyobject::RawPyObject;
 use crate::runtime::thread_state::PyThreadState;
 
 /// The GIL itself - a simple mutex.
@@ -30,6 +31,7 @@ thread_local! {
 }
 
 /// Acquire the GIL. Called by the runtime at startup and by C extensions.
+/// After acquiring, flushes any pending decrefs queued while the GIL was released.
 pub fn acquire_gil() {
     GIL_DEPTH.with(|depth| {
         let d = *depth.borrow();
@@ -39,6 +41,8 @@ pub fn acquire_gil() {
             GIL_GUARD.with(|g| {
                 *g.borrow_mut() = Some(guard);
             });
+            // Flush pending decrefs now that we hold the GIL
+            flush_pending_decrefs();
         }
         *depth.borrow_mut() = d + 1;
     });
@@ -64,6 +68,75 @@ pub fn release_gil() {
 /// Check if the current thread holds the GIL.
 pub fn gil_held() -> bool {
     GIL_DEPTH.with(|depth| *depth.borrow() > 0)
+}
+
+// ─── Python<'py> GIL Token ───
+
+/// Zero-sized proof that the GIL is held by the current thread.
+///
+/// This type is `!Send` and `!Sync` because the `*mut ()` in `PhantomData`
+/// opts out of auto-traits. A GIL token obtained on thread A must NEVER be
+/// usable on thread B — the compiler enforces this at zero runtime cost.
+#[derive(Copy, Clone)]
+pub struct Python<'py>(PhantomData<(&'py (), *mut ())>);
+
+impl Python<'_> {
+    /// Acquire the GIL and run a closure with the token.
+    ///
+    /// The closure receives a `Python<'py>` proving the GIL is held.
+    /// The GIL is released when the closure returns.
+    pub fn with_gil<F, R>(f: F) -> R
+    where
+        F: for<'py> FnOnce(Python<'py>) -> R,
+    {
+        acquire_gil();
+        let result = f(Python(PhantomData));
+        release_gil();
+        result
+    }
+
+    /// Create a token when the GIL is known to be held.
+    ///
+    /// # Safety
+    /// Caller must guarantee the GIL is currently held by this thread.
+    /// In debug builds, this asserts `gil_held()`.
+    pub unsafe fn assume_gil_held() -> Python<'static> {
+        debug_assert!(gil_held(), "BUG: assume_gil_held called without holding the GIL");
+        Python(PhantomData)
+    }
+}
+
+// ─── Pending Decref Queue ───
+//
+// When a PyObjectRef is dropped without the GIL held (e.g., during a
+// Py_BEGIN_ALLOW_THREADS block), we cannot call Py_DECREF immediately.
+// Instead, we queue the pointer for later decref when the GIL is re-acquired.
+
+/// Wrapper to make raw pointers Send for the pending-decref queue.
+/// SAFETY: The GIL contract ensures these pointers are only dereferenced
+/// while the GIL is held (inside flush_pending_decrefs).
+struct SendPtr(*mut RawPyObject);
+unsafe impl Send for SendPtr {}
+
+static PENDING_DECREFS: Mutex<Vec<SendPtr>> = Mutex::new(Vec::new());
+
+/// Queue a pointer for deferred decref. Called from PyObjectRef::drop()
+/// when the GIL is not held.
+pub fn queue_decref(ptr: *mut RawPyObject) {
+    PENDING_DECREFS.lock().push(SendPtr(ptr));
+}
+
+/// Flush all pending decrefs. Called after re-acquiring the GIL.
+fn flush_pending_decrefs() {
+    let mut queue = PENDING_DECREFS.lock();
+    for SendPtr(ptr) in queue.drain(..) {
+        unsafe {
+            let new_refcnt = (*ptr).decref();
+            if new_refcnt == 0 {
+                crate::object::pyobject::dealloc_object(ptr);
+            }
+        }
+    }
 }
 
 // ─── C API exports ───

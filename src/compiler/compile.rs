@@ -4,17 +4,20 @@
 //! into our bytecode format.
 
 use crate::compiler::bytecode::{CodeObject, OpCode};
-use crate::object::safe_api::{py_none, py_true, py_false, create_int, create_float, create_str, create_bytes};
+use crate::object::safe_api;
+use crate::runtime::gil::Python;
+use crate::runtime::pyerr::PyResult;
 use rustpython_parser::ast::{self, Constant, Expr, Stmt};
 use rustpython_parser::Parse;
 
 /// Compile Python source code into a CodeObject.
-pub fn compile_source(source: &str, filename: &str) -> Result<CodeObject, String> {
+/// Takes a Python<'py> GIL token for compile-time proof the GIL is held.
+pub fn compile_source(py: Python<'_>, source: &str, filename: &str) -> Result<CodeObject, String> {
     // Parse the source into an AST
     let ast = ast::Suite::parse(source, filename)
         .map_err(|e| format!("Parse error: {}", e))?;
 
-    let mut compiler = Compiler::new(filename.to_string());
+    let mut compiler = Compiler::new(py, filename.to_string());
     compiler.compile_body(&ast)?;
 
     // Add implicit return None at the end
@@ -25,19 +28,28 @@ pub fn compile_source(source: &str, filename: &str) -> Result<CodeObject, String
     Ok(compiler.code)
 }
 
-struct Compiler {
+struct Compiler<'py> {
+    py: Python<'py>,
     code: CodeObject,
 }
 
-impl Compiler {
-    fn new(filename: String) -> Self {
+impl<'py> Compiler<'py> {
+    fn new(py: Python<'py>, filename: String) -> Self {
         Compiler {
+            py,
             code: CodeObject::new("<module>".to_string(), filename),
         }
     }
 
     fn add_none_const(&mut self) -> u32 {
-        self.code.add_const(py_none())
+        let none = safe_api::none_obj(self.py);
+        self.code.add_const(none)
+    }
+
+    /// Create and add a constant, mapping allocation failure to a compile error string.
+    fn add_const_result(&mut self, result: PyResult) -> Result<u32, String> {
+        let obj = result.map_err(|e| format!("Allocation error: {}", e))?;
+        Ok(self.code.add_const(obj))
     }
 
     fn compile_body(&mut self, stmts: &[Stmt]) -> Result<(), String> {
@@ -63,14 +75,13 @@ impl Compiler {
             }
 
             Stmt::AugAssign(aug) => {
-                // x += 1 => x = x + 1
                 self.compile_expr(&aug.target)?;
                 self.compile_expr(&aug.value)?;
                 let opcode = match aug.op {
                     ast::Operator::Add => OpCode::InplaceAdd,
                     ast::Operator::Sub => OpCode::InplaceSubtract,
                     ast::Operator::Mult => OpCode::InplaceMultiply,
-                    _ => OpCode::BinaryAdd, // fallback
+                    _ => OpCode::BinaryAdd,
                 };
                 self.code.emit(opcode, 0);
                 self.compile_store_target(&aug.target)?;
@@ -106,9 +117,7 @@ impl Compiler {
                 self.compile_import(import)?;
             }
 
-            Stmt::Pass(_) => {
-                // No-op
-            }
+            Stmt::Pass(_) => {}
 
             Stmt::Break(_) => {
                 self.code.emit(OpCode::BreakLoop, 0);
@@ -119,7 +128,6 @@ impl Compiler {
             }
 
             _ => {
-                // Unhandled statement types - emit NOP for now
                 self.code.emit(OpCode::Nop, 0);
             }
         }
@@ -128,39 +136,31 @@ impl Compiler {
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), String> {
         match expr {
-            // All constants (int, float, str, bool, None) come through ExprConstant
             Expr::Constant(constant) => {
                 match &constant.value {
                     Constant::Int(i) => {
-                        // BigInt from malachite-bigint
                         let val: i64 = i.try_into().unwrap_or(0);
-                        let obj = create_int(val);
-                        let idx = self.code.add_const(obj);
+                        let idx = self.add_const_result(safe_api::new_int(self.py, val))?;
                         self.code.emit(OpCode::LoadConst, idx);
                     }
                     Constant::Float(f) => {
-                        let obj = create_float(*f);
-                        let idx = self.code.add_const(obj);
+                        let idx = self.add_const_result(safe_api::new_float(self.py, *f))?;
                         self.code.emit(OpCode::LoadConst, idx);
                     }
                     Constant::Complex { real, imag: _ } => {
-                        // TODO: Complex number support — emit the real part for now
-                        let obj = create_float(*real);
-                        let idx = self.code.add_const(obj);
+                        let idx = self.add_const_result(safe_api::new_float(self.py, *real))?;
                         self.code.emit(OpCode::LoadConst, idx);
                     }
                     Constant::Str(s) => {
-                        let obj = create_str(s);
-                        let idx = self.code.add_const(obj);
+                        let idx = self.add_const_result(safe_api::new_str(self.py, s))?;
                         self.code.emit(OpCode::LoadConst, idx);
                     }
                     Constant::Bytes(b) => {
-                        let obj = create_bytes(b);
-                        let idx = self.code.add_const(obj);
+                        let idx = self.add_const_result(safe_api::new_bytes(self.py, b))?;
                         self.code.emit(OpCode::LoadConst, idx);
                     }
                     Constant::Bool(b) => {
-                        let obj = if *b { py_true() } else { py_false() };
+                        let obj = safe_api::bool_obj(self.py, *b);
                         let idx = self.code.add_const(obj);
                         self.code.emit(OpCode::LoadConst, idx);
                     }
@@ -169,12 +169,10 @@ impl Compiler {
                         self.code.emit(OpCode::LoadConst, idx);
                     }
                     Constant::Ellipsis => {
-                        // TODO: Ellipsis object
                         let idx = self.add_none_const();
                         self.code.emit(OpCode::LoadConst, idx);
                     }
                     Constant::Tuple(items) => {
-                        // Constant tuple — emit each element then build
                         for item in items {
                             self.compile_constant(item)?;
                         }
@@ -204,7 +202,7 @@ impl Compiler {
                     ast::Operator::BitXor => OpCode::BinaryXor,
                     ast::Operator::LShift => OpCode::BinaryLShift,
                     ast::Operator::RShift => OpCode::BinaryRShift,
-                    ast::Operator::MatMult => OpCode::BinaryMultiply, // TODO
+                    ast::Operator::MatMult => OpCode::BinaryMultiply,
                 };
                 self.code.emit(opcode, 0);
             }
@@ -215,14 +213,13 @@ impl Compiler {
                     ast::UnaryOp::Not => OpCode::UnaryNot,
                     ast::UnaryOp::USub => OpCode::UnaryNegative,
                     ast::UnaryOp::UAdd => OpCode::UnaryPositive,
-                    ast::UnaryOp::Invert => OpCode::UnaryNot, // TODO: proper invert
+                    ast::UnaryOp::Invert => OpCode::UnaryNot,
                 };
                 self.code.emit(opcode, 0);
             }
 
             Expr::Compare(cmp) => {
                 self.compile_expr(&cmp.left)?;
-                // Handle first comparator (simplified — full impl handles chained)
                 if let Some(comparator) = cmp.comparators.first() {
                     self.compile_expr(comparator)?;
                 }
@@ -244,7 +241,6 @@ impl Compiler {
             }
 
             Expr::BoolOp(boolop) => {
-                // and/or — short-circuit evaluation
                 let values = &boolop.values;
                 if values.is_empty() {
                     let idx = self.add_none_const();
@@ -334,7 +330,6 @@ impl Compiler {
             }
 
             Expr::IfExp(ifexp) => {
-                // Ternary: value_if_true if test else value_if_false
                 self.compile_expr(&ifexp.test)?;
                 let jump_to_else = self.code.current_offset();
                 self.code.emit(OpCode::PopJumpIfFalse, 0);
@@ -349,11 +344,8 @@ impl Compiler {
             }
 
             Expr::JoinedStr(fstring) => {
-                // f-string — compile each part and concatenate
-                // Simplified: just concatenate string parts
                 if fstring.values.is_empty() {
-                    let obj = create_str("");
-                    let idx = self.code.add_const(obj);
+                    let idx = self.add_const_result(safe_api::new_str(self.py, ""))?;
                     self.code.emit(OpCode::LoadConst, idx);
                 } else {
                     self.compile_expr(&fstring.values[0])?;
@@ -365,14 +357,10 @@ impl Compiler {
             }
 
             Expr::FormattedValue(fv) => {
-                // Part of an f-string — compile the expression
                 self.compile_expr(&fv.value)?;
-                // Convert to string
-                // In a full impl, we'd handle format_spec and conversion
             }
 
             _ => {
-                // Unhandled expression — push None
                 let idx = self.add_none_const();
                 self.code.emit(OpCode::LoadConst, idx);
             }
@@ -380,27 +368,23 @@ impl Compiler {
         Ok(())
     }
 
-    /// Compile a constant value (used for constant tuples etc.)
     fn compile_constant(&mut self, constant: &Constant) -> Result<(), String> {
         match constant {
             Constant::Int(i) => {
                 let val: i64 = i.try_into().unwrap_or(0);
-                let obj = create_int(val);
-                let idx = self.code.add_const(obj);
+                let idx = self.add_const_result(safe_api::new_int(self.py, val))?;
                 self.code.emit(OpCode::LoadConst, idx);
             }
             Constant::Float(f) => {
-                let obj = create_float(*f);
-                let idx = self.code.add_const(obj);
+                let idx = self.add_const_result(safe_api::new_float(self.py, *f))?;
                 self.code.emit(OpCode::LoadConst, idx);
             }
             Constant::Str(s) => {
-                let obj = create_str(s);
-                let idx = self.code.add_const(obj);
+                let idx = self.add_const_result(safe_api::new_str(self.py, s))?;
                 self.code.emit(OpCode::LoadConst, idx);
             }
             Constant::Bool(b) => {
-                let obj = if *b { py_true() } else { py_false() };
+                let obj = safe_api::bool_obj(self.py, *b);
                 let idx = self.code.add_const(obj);
                 self.code.emit(OpCode::LoadConst, idx);
             }
@@ -441,30 +425,19 @@ impl Compiler {
 
     fn compile_if(&mut self, if_stmt: &ast::StmtIf) -> Result<(), String> {
         self.compile_expr(&if_stmt.test)?;
-
-        // Jump to else/end if false
         let jump_to_else = self.code.current_offset();
-        self.code.emit(OpCode::PopJumpIfFalse, 0); // Patch later
-
-        // Compile body
+        self.code.emit(OpCode::PopJumpIfFalse, 0);
         self.compile_body(&if_stmt.body)?;
 
         if if_stmt.orelse.is_empty() {
-            // No else — patch jump to here
             let end = self.code.current_offset();
             self.code.patch_jump(jump_to_else, end);
         } else {
-            // Jump over else
             let jump_to_end = self.code.current_offset();
-            self.code.emit(OpCode::JumpAbsolute, 0); // Patch later
-
-            // Patch jump-to-else to here
+            self.code.emit(OpCode::JumpAbsolute, 0);
             let else_start = self.code.current_offset();
             self.code.patch_jump(jump_to_else, else_start);
-
-            // Compile else body (elif is represented as nested StmtIf in orelse)
             self.compile_body(&if_stmt.orelse)?;
-
             let end = self.code.current_offset();
             self.code.patch_jump(jump_to_end, end);
         }
@@ -473,35 +446,25 @@ impl Compiler {
 
     fn compile_while(&mut self, while_stmt: &ast::StmtWhile) -> Result<(), String> {
         let loop_start = self.code.current_offset();
-
         self.compile_expr(&while_stmt.test)?;
         let jump_to_end = self.code.current_offset();
         self.code.emit(OpCode::PopJumpIfFalse, 0);
-
         self.compile_body(&while_stmt.body)?;
         self.code.emit(OpCode::JumpAbsolute, loop_start);
-
         let end = self.code.current_offset();
         self.code.patch_jump(jump_to_end, end);
         Ok(())
     }
 
     fn compile_for(&mut self, for_stmt: &ast::StmtFor) -> Result<(), String> {
-        // Compile the iterable
         self.compile_expr(&for_stmt.iter)?;
         self.code.emit(OpCode::GetIter, 0);
-
         let loop_start = self.code.current_offset();
         let for_iter = self.code.current_offset();
-        self.code.emit(OpCode::ForIter, 0); // Jump past body when exhausted
-
-        // Store the loop variable
+        self.code.emit(OpCode::ForIter, 0);
         self.compile_store_target(&for_stmt.target)?;
-
-        // Compile body
         self.compile_body(&for_stmt.body)?;
         self.code.emit(OpCode::JumpAbsolute, loop_start);
-
         let end = self.code.current_offset();
         self.code.patch_jump(for_iter, end);
         Ok(())
@@ -509,17 +472,11 @@ impl Compiler {
 
     fn compile_function_def(&mut self, func_def: &ast::StmtFunctionDef) -> Result<(), String> {
         let func_name = func_def.name.to_string();
-
-        // For now, create a simplified function representation
-        // A full implementation would compile a separate CodeObject
         let name_idx = self.code.add_name(&func_name);
-
-        // Push None as a placeholder for the function object
         let idx = self.add_none_const();
         self.code.emit(OpCode::LoadConst, idx);
         self.code.emit(OpCode::MakeFunction, name_idx);
         self.code.emit(OpCode::StoreName, name_idx);
-
         Ok(())
     }
 
@@ -528,8 +485,6 @@ impl Compiler {
             let module_name = alias.name.to_string();
             let name_idx = self.code.add_name(&module_name);
             self.code.emit(OpCode::ImportName, name_idx);
-
-            // Store as the alias or the module name
             let store_name = if let Some(ref asname) = alias.asname {
                 asname.to_string()
             } else {

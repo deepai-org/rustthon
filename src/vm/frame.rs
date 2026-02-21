@@ -1,24 +1,29 @@
 //! Execution frame — holds the state for one code object being executed.
+//!
+//! All values are RAII `PyObjectRef` — refcounting is automatic:
+//! - `push()` takes ownership (moves in)
+//! - `pop()` returns ownership (moves out)
+//! - `store_name()` replaces old value (old is dropped → auto decref)
+//! - `lookup_name()` clones (= incref) so caller gets an owned reference
 
 use crate::compiler::bytecode::CodeObject;
-use crate::object::pyobject::RawPyObject;
-use crate::object::safe_api::{py_incref, py_decref};
+use crate::object::pyobject::PyObjectRef;
+use crate::runtime::pyerr::PyErr;
 use std::collections::HashMap;
-use std::ptr;
 
 pub struct Frame {
     /// The code being executed
     pub code: CodeObject,
     /// Instruction pointer (index into code.instructions)
     pub ip: usize,
-    /// Value stack
-    pub stack: Vec<*mut RawPyObject>,
+    /// Value stack (RAII — Drop decrefs all remaining objects)
+    pub stack: Vec<PyObjectRef>,
     /// Local variables (by name)
-    pub locals: HashMap<String, *mut RawPyObject>,
+    pub locals: HashMap<String, PyObjectRef>,
     /// Global variables (shared dict)
-    pub globals: HashMap<String, *mut RawPyObject>,
+    pub globals: HashMap<String, PyObjectRef>,
     /// Built-in functions
-    pub builtins: HashMap<String, *mut RawPyObject>,
+    pub builtins: HashMap<String, PyObjectRef>,
 }
 
 impl Frame {
@@ -33,42 +38,37 @@ impl Frame {
         }
     }
 
-    /// Push a value onto the stack.
-    pub fn push(&mut self, obj: *mut RawPyObject) {
+    /// Push a value onto the stack (takes ownership).
+    #[inline]
+    pub fn push(&mut self, obj: PyObjectRef) {
         self.stack.push(obj);
     }
 
-    /// Pop a value from the stack.
-    pub fn pop(&mut self) -> *mut RawPyObject {
-        self.stack.pop().unwrap_or(ptr::null_mut())
+    /// Pop a value from the stack (returns ownership).
+    /// Returns Err on stack underflow (should never happen in correct bytecode).
+    #[inline]
+    pub fn pop(&mut self) -> Result<PyObjectRef, PyErr> {
+        self.stack.pop().ok_or_else(|| PyErr::type_error("VM stack underflow"))
     }
 
-    /// Peek at the top of the stack.
-    pub fn top(&self) -> *mut RawPyObject {
-        self.stack.last().copied().unwrap_or(ptr::null_mut())
+    /// Peek at the top of the stack (clones = increfs).
+    #[inline]
+    pub fn top(&self) -> Result<PyObjectRef, PyErr> {
+        self.stack.last().cloned().ok_or_else(|| PyErr::type_error("VM stack underflow"))
     }
 
     /// Look up a name in locals, then globals, then builtins.
-    pub fn lookup_name(&self, name: &str) -> *mut RawPyObject {
-        if let Some(&obj) = self.locals.get(name) {
-            return obj;
-        }
-        if let Some(&obj) = self.globals.get(name) {
-            return obj;
-        }
-        if let Some(&obj) = self.builtins.get(name) {
-            return obj;
-        }
-        ptr::null_mut()
+    /// Returns a cloned (incref'd) reference, or None if not found.
+    pub fn lookup_name(&self, name: &str) -> Option<PyObjectRef> {
+        self.locals.get(name)
+            .or_else(|| self.globals.get(name))
+            .or_else(|| self.builtins.get(name))
+            .cloned() // Clone = incref. Caller gets an owned reference.
     }
 
-    /// Store a name in locals.
-    pub fn store_name(&mut self, name: &str, obj: *mut RawPyObject) {
-        py_incref(obj);
-        // Decref old value if present
-        if let Some(&old) = self.locals.get(name) {
-            py_decref(old);
-        }
+    /// Store a name in locals. The old value (if any) is automatically
+    /// dropped (= decref'd) by HashMap::insert.
+    pub fn store_name(&mut self, name: &str, obj: PyObjectRef) {
         self.locals.insert(name.to_string(), obj);
     }
 }

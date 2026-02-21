@@ -7,10 +7,13 @@
 //! For GC-tracked objects (PyObject_GC_*), there's also a GC header
 //! prepended before the object.
 
-use std::ptr;
+use std::marker::PhantomData;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use crate::object::typeobj::RawPyTypeObject;
+use crate::runtime::gil::Python;
+use crate::runtime::pyerr::{PyErr, PyResult};
 
 /// The raw C-compatible PyObject header.
 /// This MUST match CPython's PyObject layout exactly.
@@ -91,14 +94,32 @@ impl RawPyObject {
     }
 }
 
+// ─── AsPyPointer trait ───
+
+/// Trait for anything that provides a raw PyObject pointer.
+/// Implemented by `PyObjectRef`, `&PyObjectRef`, and `BorrowedPyObject<'py>`.
+/// Enables safe_api functions to accept both owned and borrowed object references.
+pub trait AsPyPointer {
+    fn as_raw(&self) -> *mut RawPyObject;
+
+    fn get_type(&self) -> *mut RawPyTypeObject {
+        unsafe { (*self.as_raw()).ob_type }
+    }
+}
+
+// ─── PyObjectRef — owned, RAII smart pointer ───
+
 /// A safe, reference-counted wrapper around a raw PyObject pointer.
 /// This is what our Rust-side code uses to hold Python objects.
 ///
+/// Uses `NonNull` internally for niche optimization: `Option<PyObjectRef>`
+/// is pointer-sized.
+///
 /// When cloned, it increments the reference count.
-/// When dropped, it decrements and potentially frees.
+/// When dropped, it decrements and potentially frees (GIL-aware).
 #[derive(Debug)]
 pub struct PyObjectRef {
-    ptr: *mut RawPyObject,
+    ptr: NonNull<RawPyObject>,
 }
 
 // PyObjectRef is Send + Sync because we manage thread safety through the GIL
@@ -111,53 +132,100 @@ impl PyObjectRef {
     ///
     /// # Safety
     /// The pointer must point to a valid, initialized RawPyObject
-    /// with refcount >= 1.
+    /// with refcount >= 1, and must not be null.
     pub unsafe fn from_raw(ptr: *mut RawPyObject) -> Self {
         debug_assert!(!ptr.is_null());
-        PyObjectRef { ptr }
+        PyObjectRef {
+            ptr: NonNull::new_unchecked(ptr),
+        }
     }
 
     /// Create a new PyObjectRef by borrowing (increfs).
     ///
     /// # Safety
-    /// The pointer must point to a valid RawPyObject.
+    /// The pointer must point to a valid RawPyObject and must not be null.
     pub unsafe fn borrow_raw(ptr: *mut RawPyObject) -> Self {
         debug_assert!(!ptr.is_null());
         (*ptr).incref();
-        PyObjectRef { ptr }
+        PyObjectRef {
+            ptr: NonNull::new_unchecked(ptr),
+        }
+    }
+
+    /// Use when the C API returns a **NEW** reference that we now own.
+    /// `PyObjectRef` will decref on Drop.
+    ///
+    /// If the pointer is null, fetches and returns the pending CPython exception.
+    ///
+    /// Use for: `PyObject_GetAttrString`, `PyObject_Call`, `PyObject_Repr`,
+    /// `PyList_New`, `PyTuple_New`, `PyDict_New`, `PyLong_FromLong`,
+    /// `PyFloat_FromDouble`, `PyUnicode_FromString`, `PyImport_ImportModule`, etc.
+    pub fn steal_or_err(ptr: *mut RawPyObject) -> PyResult {
+        NonNull::new(ptr)
+            .map(|nn| PyObjectRef { ptr: nn })
+            .ok_or_else(PyErr::fetch)
+    }
+
+    /// Use when the C API returns a **BORROWED** reference that the container still owns.
+    /// We immediately incref so our `PyObjectRef` safely owns an independent reference.
+    ///
+    /// If the pointer is null, fetches and returns the pending CPython exception.
+    ///
+    /// Use for: `PyTuple_GetItem`, `PyList_GetItem`, `PyDict_GetItem`,
+    /// `PyDict_GetItemString`, etc.
+    pub fn borrow_or_err(ptr: *mut RawPyObject) -> PyResult {
+        if ptr.is_null() {
+            Err(PyErr::fetch())
+        } else {
+            Ok(unsafe { Self::borrow_raw(ptr) })
+        }
     }
 
     /// Get the raw pointer without affecting refcount.
     pub fn as_raw(&self) -> *mut RawPyObject {
-        self.ptr
+        self.ptr.as_ptr()
     }
 
     /// Consume this ref and return the raw pointer without decrementing.
     /// Caller takes ownership of the reference.
     pub fn into_raw(self) -> *mut RawPyObject {
-        let ptr = self.ptr;
+        let ptr = self.ptr.as_ptr();
         std::mem::forget(self);
         ptr
     }
 
     /// Get the type object of this Python object.
     pub fn get_type(&self) -> *mut RawPyTypeObject {
-        unsafe { (*self.ptr).ob_type }
+        unsafe { (*self.ptr.as_ptr()).ob_type }
     }
 
+    /// Check if this pointer is null. Always false since we use NonNull.
+    /// Kept for backward compatibility but deprecated — prefer pattern matching.
     pub fn is_null(&self) -> bool {
-        self.ptr.is_null()
+        false // NonNull is never null
     }
 
     pub fn refcnt(&self) -> isize {
-        unsafe { (*self.ptr).refcnt() }
+        unsafe { (*self.ptr.as_ptr()).refcnt() }
+    }
+}
+
+impl AsPyPointer for PyObjectRef {
+    fn as_raw(&self) -> *mut RawPyObject {
+        self.ptr.as_ptr()
+    }
+}
+
+impl AsPyPointer for &PyObjectRef {
+    fn as_raw(&self) -> *mut RawPyObject {
+        self.ptr.as_ptr()
     }
 }
 
 impl Clone for PyObjectRef {
     fn clone(&self) -> Self {
         unsafe {
-            (*self.ptr).incref();
+            self.ptr.as_ref().incref();
         }
         PyObjectRef { ptr: self.ptr }
     }
@@ -165,18 +233,83 @@ impl Clone for PyObjectRef {
 
 impl Drop for PyObjectRef {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
+        if crate::runtime::gil::gil_held() {
+            // Fast path: GIL held, decref immediately
             unsafe {
-                let new_refcnt = (*self.ptr).decref();
+                let new_refcnt = self.ptr.as_ref().decref();
                 if new_refcnt == 0 {
-                    // Object should be deallocated.
-                    // In a full implementation, we'd call tp_dealloc here.
-                    dealloc_object(self.ptr);
+                    dealloc_object(self.ptr.as_ptr());
                 }
             }
+        } else {
+            // Slow path: GIL released, queue for later decref
+            crate::runtime::gil::queue_decref(self.ptr.as_ptr());
         }
     }
 }
+
+// ─── BorrowedPyObject<'py> — zero-cost borrowed reference ───
+
+/// A borrowed reference to a Python object, tied to the GIL lifetime.
+///
+/// Does **NOT** implement `Drop` — no incref or decref. Zero atomic operations.
+/// The GIL lifetime `'py` guarantees the object stays alive (the container that
+/// owns the real reference will not be collected while the GIL is held).
+///
+/// Use this for read-only access (type checks, value extraction) to avoid
+/// paying the atomic cost of incref+decref.
+#[derive(Copy, Clone, Debug)]
+pub struct BorrowedPyObject<'py> {
+    ptr: NonNull<RawPyObject>,
+    _marker: PhantomData<Python<'py>>,
+}
+
+impl<'py> BorrowedPyObject<'py> {
+    /// Create a borrowed reference from a raw pointer.
+    ///
+    /// # Safety
+    /// The pointer must be valid for the duration of the GIL scope `'py`.
+    pub unsafe fn from_raw(ptr: *mut RawPyObject) -> Self {
+        debug_assert!(!ptr.is_null());
+        BorrowedPyObject {
+            ptr: NonNull::new_unchecked(ptr),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Create from a raw pointer, returning Err if null.
+    pub fn from_raw_or_err(ptr: *mut RawPyObject) -> Result<Self, PyErr> {
+        NonNull::new(ptr)
+            .map(|nn| BorrowedPyObject {
+                ptr: nn,
+                _marker: PhantomData,
+            })
+            .ok_or_else(PyErr::fetch)
+    }
+
+    /// Get the raw pointer.
+    pub fn as_raw(&self) -> *mut RawPyObject {
+        self.ptr.as_ptr()
+    }
+
+    /// Get the type object.
+    pub fn get_type(&self) -> *mut RawPyTypeObject {
+        unsafe { (*self.ptr.as_ptr()).ob_type }
+    }
+
+    /// Promote to an owned reference by increfing.
+    pub fn to_owned(&self) -> PyObjectRef {
+        unsafe { PyObjectRef::borrow_raw(self.ptr.as_ptr()) }
+    }
+}
+
+impl<'py> AsPyPointer for BorrowedPyObject<'py> {
+    fn as_raw(&self) -> *mut RawPyObject {
+        self.ptr.as_ptr()
+    }
+}
+
+// ─── Object deallocation ───
 
 /// Deallocate a Python object whose refcount has reached zero.
 pub(crate) unsafe fn dealloc_object(obj: *mut RawPyObject) {

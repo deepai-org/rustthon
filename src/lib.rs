@@ -101,79 +101,81 @@ fn run_repl() {
             break;
         }
 
-        match compiler::compile::compile_source(line, "<stdin>") {
-            Ok(code) => {
-                match vm.execute(code) {
-                    Ok(result) => {
-                        unsafe {
-                            if !result.is_null()
-                                && !types::none::is_none(result)
-                            {
-                                print_object(result);
-                                (*result).decref();
+        runtime::gil::Python::with_gil(|py| {
+            match compiler::compile::compile_source(py, line, "<stdin>") {
+                Ok(code) => {
+                    match vm.execute(py, code) {
+                        Ok(result) => {
+                            if !types::none::is_none(result.as_raw()) {
+                                print_object(result.as_raw());
                             }
+                            // result dropped here → auto decref
+                        }
+                        Err(err) => {
+                            eprintln!("{}", err);
                         }
                     }
-                    Err(e) => {
-                        eprintln!("{}", e);
-                    }
+                }
+                Err(e) => {
+                    eprintln!("  {}", e);
                 }
             }
-            Err(e) => {
-                eprintln!("  {}", e);
-            }
-        }
+        });
     }
 }
 
 fn execute_code(source: &str, filename: &str) -> i32 {
-    match compiler::compile::compile_source(source, filename) {
-        Ok(code) => {
-            let mut vm = vm::interpreter::VM::new();
-            match vm.execute(code) {
-                Ok(_) => 0,
-                Err(e) => {
-                    eprintln!("Traceback (most recent call last):");
-                    eprintln!("  File \"{}\"", filename);
-                    eprintln!("{}", e);
-                    1
+    runtime::gil::Python::with_gil(|py| {
+        match compiler::compile::compile_source(py, source, filename) {
+            Ok(code) => {
+                let mut vm = vm::interpreter::VM::new();
+                match vm.execute(py, code) {
+                    Ok(_result) => 0,
+                    Err(err) => {
+                        eprintln!("Traceback (most recent call last):");
+                        eprintln!("  File \"{}\"", filename);
+                        eprintln!("{}", err);
+                        1
+                    }
                 }
             }
+            Err(e) => {
+                eprintln!("  File \"{}\"", filename);
+                eprintln!("    {}", e);
+                1
+            }
         }
-        Err(e) => {
-            eprintln!("  File \"{}\"", filename);
-            eprintln!("    {}", e);
-            1
-        }
-    }
+    })
 }
 
-unsafe fn print_object(obj: *mut object::pyobject::RawPyObject) {
+fn print_object(obj: *mut object::pyobject::RawPyObject) {
     if obj.is_null() {
         return;
     }
 
-    if types::boolobject::is_bool(obj) {
-        if types::boolobject::is_true(obj) {
-            println!("True");
+    unsafe {
+        if types::boolobject::is_bool(obj) {
+            if types::boolobject::is_true(obj) {
+                println!("True");
+            } else {
+                println!("False");
+            }
+        } else if (*obj).ob_type == types::longobject::long_type() {
+            let val = types::longobject::long_value(obj);
+            println!("{}", val);
+        } else if (*obj).ob_type == types::floatobject::float_type() {
+            let val = types::floatobject::float_value(obj);
+            println!("{}", val);
+        } else if (*obj).ob_type == types::unicode::unicode_type() {
+            let val = types::unicode::unicode_value(obj);
+            println!("'{}'", val);
         } else {
-            println!("False");
-        }
-    } else if (*obj).ob_type == types::longobject::long_type() {
-        let val = types::longobject::long_value(obj);
-        println!("{}", val);
-    } else if (*obj).ob_type == types::floatobject::float_type() {
-        let val = types::floatobject::float_value(obj);
-        println!("{}", val);
-    } else if (*obj).ob_type == types::unicode::unicode_type() {
-        let val = types::unicode::unicode_value(obj);
-        println!("'{}'", val);
-    } else {
-        let repr = ffi::object_api::PyObject_Repr(obj);
-        if !repr.is_null() {
-            let s = types::unicode::unicode_value(repr);
-            println!("{}", s);
-            (*repr).decref();
+            let repr = ffi::object_api::PyObject_Repr(obj);
+            if !repr.is_null() {
+                let s = types::unicode::unicode_value(repr);
+                println!("{}", s);
+                (*repr).decref();
+            }
         }
     }
 }
