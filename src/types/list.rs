@@ -1,19 +1,31 @@
-//! Python list type.
+//! Python list type — CPython 3.11 exact ABI layout.
 //!
-//! Lists are mutable sequences. C extensions manipulate them
-//! via PyList_New, PyList_SetItem, PyList_GetItem, etc.
-//! These must be fast — packages like msgpack and hiredis
-//! build lists from C at high speed.
+//! CPython layout (40 bytes on 64-bit):
+//!   PyVarObject ob_base      (24 bytes: refcnt + type + ob_size=length)
+//!   PyObject **ob_item       (8 bytes: heap-allocated pointer array)
+//!   Py_ssize_t allocated     (8 bytes: capacity of ob_item)
 
-use crate::object::pyobject::{PyObjectWithData, RawPyObject};
-use crate::object::typeobj::RawPyTypeObject;
+use crate::object::pyobject::{RawPyObject, RawPyVarObject};
+use crate::object::typeobj::{RawPyTypeObject, PY_TPFLAGS_DEFAULT, PY_TPFLAGS_LIST_SUBCLASS, PY_TPFLAGS_HAVE_GC};
 use std::os::raw::c_int;
 use std::ptr;
+use std::sync::atomic::AtomicIsize;
+
+/// Exact CPython PyListObject layout.
+#[repr(C)]
+pub struct PyListObject {
+    pub ob_base: RawPyVarObject,        // 24 bytes, ob_size = current length
+    pub ob_item: *mut *mut RawPyObject, // 8 bytes, heap-allocated array
+    pub allocated: isize,               // 8 bytes, capacity
+}
+
+const _: () = assert!(std::mem::size_of::<PyListObject>() == 40);
 
 static mut LIST_TYPE: RawPyTypeObject = {
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"list\0".as_ptr() as *const _;
-    tp.tp_basicsize = 0;
+    tp.tp_basicsize = 40; // size_of::<PyListObject>()
+    tp.tp_itemsize = 0; // items in separate heap array, not inline
     tp
 };
 
@@ -21,221 +33,249 @@ pub unsafe fn list_type() -> *mut RawPyTypeObject {
     &mut LIST_TYPE
 }
 
-pub struct ListData {
-    /// Items stored as raw pointers (we own references)
-    pub items: Vec<*mut RawPyObject>,
+// ─── Internal helpers ───
+
+/// Allocate the item array via libc::calloc.
+unsafe fn alloc_items(capacity: usize) -> *mut *mut RawPyObject {
+    if capacity == 0 {
+        return ptr::null_mut();
+    }
+    let ptr = libc::calloc(capacity, std::mem::size_of::<*mut RawPyObject>())
+        as *mut *mut RawPyObject;
+    if ptr.is_null() {
+        eprintln!("Fatal: out of memory allocating list items");
+        std::process::abort();
+    }
+    ptr
 }
 
-type PyListObject = PyObjectWithData<ListData>;
+/// Ensure the list has capacity for at least `needed` items.
+unsafe fn list_ensure_capacity(list: *mut PyListObject, needed: isize) {
+    if needed <= (*list).allocated {
+        return;
+    }
+    // CPython growth pattern
+    let new_alloc = needed + (needed >> 3) + if needed < 9 { 3 } else { 6 };
+    let new_size = (new_alloc as usize) * std::mem::size_of::<*mut RawPyObject>();
+    let new_items = if (*list).ob_item.is_null() {
+        libc::calloc(new_alloc as usize, std::mem::size_of::<*mut RawPyObject>())
+            as *mut *mut RawPyObject
+    } else {
+        libc::realloc(
+            (*list).ob_item as *mut libc::c_void,
+            new_size,
+        ) as *mut *mut RawPyObject
+    };
+    if new_items.is_null() {
+        eprintln!("Fatal: out of memory growing list");
+        std::process::abort();
+    }
+    // Zero new slots
+    let old_alloc = (*list).allocated as usize;
+    for i in old_alloc..(new_alloc as usize) {
+        *new_items.add(i) = ptr::null_mut();
+    }
+    (*list).ob_item = new_items;
+    (*list).allocated = new_alloc;
+}
 
-unsafe fn create_list(size: usize) -> *mut RawPyObject {
-    let mut items = Vec::with_capacity(size);
-    // Fill with null (items must be set via SetItem before use)
-    items.resize(size, ptr::null_mut());
-    let obj = PyObjectWithData::alloc(
-        &mut LIST_TYPE,
-        ListData { items },
-    );
-    obj as *mut RawPyObject
+/// Dealloc for list objects.
+unsafe extern "C" fn list_dealloc(obj: *mut RawPyObject) {
+    let list = obj as *mut PyListObject;
+    let size = (*list).ob_base.ob_size;
+    // Decref all items
+    if !(*list).ob_item.is_null() {
+        for i in 0..size as usize {
+            let item = *(*list).ob_item.add(i);
+            if !item.is_null() {
+                (*item).decref();
+            }
+        }
+        // Free the item array
+        libc::free((*list).ob_item as *mut libc::c_void);
+    }
+    // Free the object itself (GC-tracked: free from GC head)
+    crate::object::gc::PyObject_GC_Del(obj as *mut libc::c_void);
 }
 
 // ─── C API ───
 
-/// PyList_New - create a new list of given size (items are NULL)
 #[no_mangle]
 pub unsafe extern "C" fn PyList_New(size: isize) -> *mut RawPyObject {
     if size < 0 {
         return ptr::null_mut();
     }
-    create_list(size as usize)
+    // GC-tracked allocation
+    let obj = crate::object::gc::_PyObject_GC_New(&mut LIST_TYPE) as *mut PyListObject;
+    (*obj).ob_base.ob_size = size;
+    if size > 0 {
+        (*obj).ob_item = alloc_items(size as usize);
+        (*obj).allocated = size;
+    } else {
+        (*obj).ob_item = ptr::null_mut();
+        (*obj).allocated = 0;
+    }
+    obj as *mut RawPyObject
 }
 
-/// PyList_Size
 #[no_mangle]
 pub unsafe extern "C" fn PyList_Size(list: *mut RawPyObject) -> isize {
-    if list.is_null() {
-        return -1;
-    }
-    let data = PyObjectWithData::<ListData>::data_from_raw(list);
-    data.items.len() as isize
+    if list.is_null() { return -1; }
+    let obj = list as *mut PyListObject;
+    (*obj).ob_base.ob_size
 }
 
-/// PyList_GET_SIZE
 #[no_mangle]
 pub unsafe extern "C" fn PyList_GET_SIZE(list: *mut RawPyObject) -> isize {
     PyList_Size(list)
 }
 
-/// PyList_GetItem - get item at index (borrowed reference!)
-/// This is a borrowed reference — caller must NOT decref.
 #[no_mangle]
 pub unsafe extern "C" fn PyList_GetItem(list: *mut RawPyObject, index: isize) -> *mut RawPyObject {
-    if list.is_null() {
-        return ptr::null_mut();
-    }
-    let data = PyObjectWithData::<ListData>::data_from_raw(list);
-    if index < 0 || index as usize >= data.items.len() {
-        // TODO: Set IndexError
-        return ptr::null_mut();
-    }
-    data.items[index as usize]
+    if list.is_null() { return ptr::null_mut(); }
+    let obj = list as *mut PyListObject;
+    let size = (*obj).ob_base.ob_size;
+    if index < 0 || index >= size { return ptr::null_mut(); }
+    *(*obj).ob_item.add(index as usize)
 }
 
-/// PyList_GET_ITEM - unchecked version
 #[no_mangle]
 pub unsafe extern "C" fn PyList_GET_ITEM(list: *mut RawPyObject, index: isize) -> *mut RawPyObject {
-    let data = PyObjectWithData::<ListData>::data_from_raw(list);
-    data.items[index as usize]
+    let obj = list as *mut PyListObject;
+    *(*obj).ob_item.add(index as usize)
 }
 
-/// PyList_SetItem - set item at index (steals reference!)
-/// This "steals" the reference to the new item.
 #[no_mangle]
 pub unsafe extern "C" fn PyList_SetItem(
     list: *mut RawPyObject,
     index: isize,
     item: *mut RawPyObject,
 ) -> c_int {
-    if list.is_null() {
-        return -1;
-    }
-    let data = PyObjectWithData::<ListData>::data_from_raw_mut(list);
-    if index < 0 || index as usize >= data.items.len() {
-        return -1;
-    }
+    if list.is_null() { return -1; }
+    let obj = list as *mut PyListObject;
+    let size = (*obj).ob_base.ob_size;
+    if index < 0 || index >= size { return -1; }
     // Decref old item
-    let old = data.items[index as usize];
-    if !old.is_null() {
-        (*old).decref();
-    }
+    let old = *(*obj).ob_item.add(index as usize);
+    if !old.is_null() { (*old).decref(); }
     // Steal reference to new item (no incref)
-    data.items[index as usize] = item;
+    *(*obj).ob_item.add(index as usize) = item;
     0
 }
 
-/// PyList_SET_ITEM - unchecked version (steals reference)
 #[no_mangle]
 pub unsafe extern "C" fn PyList_SET_ITEM(
     list: *mut RawPyObject,
     index: isize,
     item: *mut RawPyObject,
 ) {
-    let data = PyObjectWithData::<ListData>::data_from_raw_mut(list);
-    data.items[index as usize] = item;
+    let obj = list as *mut PyListObject;
+    *(*obj).ob_item.add(index as usize) = item;
 }
 
-/// PyList_Append - append an item (increfs)
 #[no_mangle]
 pub unsafe extern "C" fn PyList_Append(
     list: *mut RawPyObject,
     item: *mut RawPyObject,
 ) -> c_int {
-    if list.is_null() || item.is_null() {
-        return -1;
-    }
-    let data = PyObjectWithData::<ListData>::data_from_raw_mut(list);
+    if list.is_null() || item.is_null() { return -1; }
+    let obj = list as *mut PyListObject;
+    let size = (*obj).ob_base.ob_size;
+    list_ensure_capacity(obj, size + 1);
     (*item).incref();
-    data.items.push(item);
+    *(*obj).ob_item.add(size as usize) = item;
+    (*obj).ob_base.ob_size = size + 1;
     0
 }
 
-/// PyList_Insert
 #[no_mangle]
 pub unsafe extern "C" fn PyList_Insert(
     list: *mut RawPyObject,
     index: isize,
     item: *mut RawPyObject,
 ) -> c_int {
-    if list.is_null() || item.is_null() {
-        return -1;
+    if list.is_null() || item.is_null() { return -1; }
+    let obj = list as *mut PyListObject;
+    let size = (*obj).ob_base.ob_size;
+    let idx = index.max(0).min(size) as usize;
+    list_ensure_capacity(obj, size + 1);
+    // Shift items right
+    let n = size as usize;
+    for i in (idx..n).rev() {
+        *(*obj).ob_item.add(i + 1) = *(*obj).ob_item.add(i);
     }
-    let data = PyObjectWithData::<ListData>::data_from_raw_mut(list);
-    let idx = if index < 0 {
-        0
-    } else if index as usize > data.items.len() {
-        data.items.len()
-    } else {
-        index as usize
-    };
     (*item).incref();
-    data.items.insert(idx, item);
+    *(*obj).ob_item.add(idx) = item;
+    (*obj).ob_base.ob_size = size + 1;
     0
 }
 
-/// PyList_GetSlice
 #[no_mangle]
 pub unsafe extern "C" fn PyList_GetSlice(
     list: *mut RawPyObject,
     low: isize,
     high: isize,
 ) -> *mut RawPyObject {
-    if list.is_null() {
-        return ptr::null_mut();
-    }
-    let data = PyObjectWithData::<ListData>::data_from_raw(list);
-    let len = data.items.len();
-    let lo = (low.max(0) as usize).min(len);
-    let hi = (high.max(0) as usize).min(len);
-
-    let new_list = create_list(0);
-    let new_data = PyObjectWithData::<ListData>::data_from_raw_mut(new_list);
-    for i in lo..hi {
-        let item = data.items[i];
-        if !item.is_null() {
-            (*item).incref();
-        }
-        new_data.items.push(item);
+    if list.is_null() { return ptr::null_mut(); }
+    let obj = list as *mut PyListObject;
+    let len = (*obj).ob_base.ob_size;
+    let lo = low.max(0).min(len) as usize;
+    let hi = high.max(0).min(len) as usize;
+    let slice_len = if hi > lo { hi - lo } else { 0 };
+    let new_list = PyList_New(slice_len as isize);
+    for i in 0..slice_len {
+        let item = *(*obj).ob_item.add(lo + i);
+        if !item.is_null() { (*item).incref(); }
+        PyList_SET_ITEM(new_list, i as isize, item);
     }
     new_list
 }
 
-/// PyList_Sort
 #[no_mangle]
 pub unsafe extern "C" fn PyList_Sort(_list: *mut RawPyObject) -> c_int {
     // TODO: implement sorting with Python comparison
     0
 }
 
-/// PyList_Reverse
 #[no_mangle]
 pub unsafe extern "C" fn PyList_Reverse(list: *mut RawPyObject) -> c_int {
-    if list.is_null() {
-        return -1;
+    if list.is_null() { return -1; }
+    let obj = list as *mut PyListObject;
+    let size = (*obj).ob_base.ob_size as usize;
+    let items = (*obj).ob_item;
+    for i in 0..size / 2 {
+        let tmp = *items.add(i);
+        *items.add(i) = *items.add(size - 1 - i);
+        *items.add(size - 1 - i) = tmp;
     }
-    let data = PyObjectWithData::<ListData>::data_from_raw_mut(list);
-    data.items.reverse();
     0
 }
 
-/// PyList_AsTuple - convert list to tuple
 #[no_mangle]
 pub unsafe extern "C" fn PyList_AsTuple(list: *mut RawPyObject) -> *mut RawPyObject {
-    if list.is_null() {
-        return ptr::null_mut();
-    }
-    let data = PyObjectWithData::<ListData>::data_from_raw(list);
-    let tuple = crate::types::tuple::PyTuple_New(data.items.len() as isize);
-    for (i, &item) in data.items.iter().enumerate() {
-        if !item.is_null() {
-            (*item).incref();
-        }
+    if list.is_null() { return ptr::null_mut(); }
+    let obj = list as *mut PyListObject;
+    let size = (*obj).ob_base.ob_size;
+    let tuple = crate::types::tuple::PyTuple_New(size);
+    for i in 0..size as usize {
+        let item = *(*obj).ob_item.add(i);
+        if !item.is_null() { (*item).incref(); }
         crate::types::tuple::PyTuple_SetItem(tuple, i as isize, item);
     }
     tuple
 }
 
-/// PyList_Check
 #[no_mangle]
 pub unsafe extern "C" fn PyList_Check(obj: *mut RawPyObject) -> c_int {
-    if obj.is_null() {
-        return 0;
-    }
+    if obj.is_null() { return 0; }
     if (*obj).ob_type == list_type() { 1 } else { 0 }
 }
 
 #[no_mangle]
-pub static mut PyList_Type: *mut RawPyTypeObject = std::ptr::null_mut();
+pub static mut PyList_Type: *mut RawPyTypeObject = ptr::null_mut();
 
 pub unsafe fn init_list_type() {
+    LIST_TYPE.tp_dealloc = Some(list_dealloc);
+    LIST_TYPE.tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_LIST_SUBCLASS | PY_TPFLAGS_HAVE_GC;
     PyList_Type = list_type();
 }

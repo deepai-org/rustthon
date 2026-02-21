@@ -126,7 +126,13 @@ unsafe fn print_object(obj: *mut rustthon::object::pyobject::RawPyObject) {
         return;
     }
 
-    if (*obj).ob_type == types::longobject::long_type() {
+    if types::boolobject::is_bool(obj) {
+        if types::boolobject::is_true(obj) {
+            println!("True");
+        } else {
+            println!("False");
+        }
+    } else if (*obj).ob_type == types::longobject::long_type() {
         let val = types::longobject::long_value(obj);
         println!("{}", val);
     } else if (*obj).ob_type == types::floatobject::float_type() {
@@ -135,12 +141,6 @@ unsafe fn print_object(obj: *mut rustthon::object::pyobject::RawPyObject) {
     } else if (*obj).ob_type == types::unicode::unicode_type() {
         let val = types::unicode::unicode_value(obj);
         println!("'{}'", val);
-    } else if types::boolobject::is_bool(obj) {
-        if types::boolobject::is_true(obj) {
-            println!("True");
-        } else {
-            println!("False");
-        }
     } else {
         let repr = rustthon::ffi::object_api::PyObject_Repr(obj);
         if !repr.is_null() {

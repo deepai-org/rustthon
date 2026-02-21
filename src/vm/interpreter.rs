@@ -6,8 +6,6 @@
 use crate::compiler::bytecode::{CodeObject, OpCode};
 use crate::object::pyobject::RawPyObject;
 use crate::vm::frame::Frame;
-use num_bigint::BigInt;
-use num_traits::ToPrimitive;
 use std::ptr;
 
 /// The virtual machine
@@ -646,9 +644,8 @@ unsafe fn get_int_value(obj: *mut RawPyObject) -> i64 {
     if obj.is_null() {
         return 0;
     }
-    if (*obj).ob_type == crate::types::longobject::long_type() {
-        let val = crate::types::longobject::long_value(obj);
-        val.to_i64().unwrap_or(0)
+    if is_int(obj) || crate::types::boolobject::is_bool(obj) {
+        crate::types::longobject::long_as_i64(obj)
     } else {
         0
     }
@@ -660,9 +657,8 @@ unsafe fn get_float_value(obj: *mut RawPyObject) -> f64 {
     }
     if (*obj).ob_type == crate::types::floatobject::float_type() {
         crate::types::floatobject::float_value(obj)
-    } else if (*obj).ob_type == crate::types::longobject::long_type() {
-        let val = crate::types::longobject::long_value(obj);
-        val.to_f64().unwrap_or(0.0)
+    } else if is_int(obj) || crate::types::boolobject::is_bool(obj) {
+        crate::types::longobject::long_as_f64(obj)
     } else {
         0.0
     }
@@ -686,10 +682,9 @@ unsafe fn is_list(obj: *mut RawPyObject) -> bool {
 
 unsafe fn binary_add(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
     if is_int(left) && is_int(right) {
-        let l = crate::types::longobject::long_value(left);
-        let r = crate::types::longobject::long_value(right);
-        let result = l + r;
-        crate::types::longobject::PyLong_FromLong(result.to_i64().unwrap_or(0) as _)
+        let l = crate::types::longobject::long_as_i64(left);
+        let r = crate::types::longobject::long_as_i64(right);
+        crate::types::longobject::PyLong_FromLong((l.wrapping_add(r)) as _)
     } else if is_float(left) || is_float(right) {
         let l = get_float_value(left);
         let r = get_float_value(right);
@@ -697,20 +692,20 @@ unsafe fn binary_add(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut Ra
     } else if is_string(left) && is_string(right) {
         crate::types::unicode::PyUnicode_Concat(left, right)
     } else if is_list(left) && is_list(right) {
-        // List concatenation: [1,2] + [3,4] = [1,2,3,4]
-        use crate::object::pyobject::PyObjectWithData;
-        use crate::types::list::ListData;
-        let l_data = PyObjectWithData::<ListData>::data_from_raw(left);
-        let r_data = PyObjectWithData::<ListData>::data_from_raw(right);
-        let new_list = crate::types::list::PyList_New(0);
-        let new_data = PyObjectWithData::<ListData>::data_from_raw_mut(new_list);
-        for &item in &l_data.items {
+        // List concatenation via C API
+        let l_size = crate::types::list::PyList_Size(left);
+        let r_size = crate::types::list::PyList_Size(right);
+        let total = l_size + r_size;
+        let new_list = crate::types::list::PyList_New(total);
+        for i in 0..l_size {
+            let item = crate::types::list::PyList_GetItem(left, i);
             if !item.is_null() { (*item).incref(); }
-            new_data.items.push(item);
+            crate::types::list::PyList_SET_ITEM(new_list, i, item);
         }
-        for &item in &r_data.items {
+        for i in 0..r_size {
+            let item = crate::types::list::PyList_GetItem(right, i);
             if !item.is_null() { (*item).incref(); }
-            new_data.items.push(item);
+            crate::types::list::PyList_SET_ITEM(new_list, l_size + i, item);
         }
         new_list
     } else {
@@ -720,10 +715,9 @@ unsafe fn binary_add(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut Ra
 
 unsafe fn binary_sub(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
     if is_int(left) && is_int(right) {
-        let l = crate::types::longobject::long_value(left);
-        let r = crate::types::longobject::long_value(right);
-        let result = l - r;
-        crate::types::longobject::PyLong_FromLong(result.to_i64().unwrap_or(0) as _)
+        let l = crate::types::longobject::long_as_i64(left);
+        let r = crate::types::longobject::long_as_i64(right);
+        crate::types::longobject::PyLong_FromLong(l.wrapping_sub(r) as _)
     } else if is_float(left) || is_float(right) {
         let l = get_float_value(left);
         let r = get_float_value(right);
@@ -735,10 +729,9 @@ unsafe fn binary_sub(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut Ra
 
 unsafe fn binary_mul(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
     if is_int(left) && is_int(right) {
-        let l = crate::types::longobject::long_value(left);
-        let r = crate::types::longobject::long_value(right);
-        let result = l * r;
-        crate::types::longobject::PyLong_FromLong(result.to_i64().unwrap_or(0) as _)
+        let l = crate::types::longobject::long_as_i64(left);
+        let r = crate::types::longobject::long_as_i64(right);
+        crate::types::longobject::PyLong_FromLong(l.wrapping_mul(r) as _)
     } else if is_float(left) || is_float(right) {
         let l = get_float_value(left);
         let r = get_float_value(right);
@@ -760,13 +753,15 @@ unsafe fn binary_truediv(left: *mut RawPyObject, right: *mut RawPyObject) -> *mu
 
 unsafe fn binary_floordiv(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
     if is_int(left) && is_int(right) {
-        let l = crate::types::longobject::long_value(left);
-        let r = crate::types::longobject::long_value(right);
-        if r.to_i64() == Some(0) {
+        let l = crate::types::longobject::long_as_i64(left);
+        let r = crate::types::longobject::long_as_i64(right);
+        if r == 0 {
             return crate::types::none::return_none();
         }
-        let result = l / r;
-        crate::types::longobject::PyLong_FromLong(result.to_i64().unwrap_or(0) as _)
+        // Python floor division: rounds toward negative infinity
+        let d = l.wrapping_div(r);
+        let result = if (l ^ r) < 0 && d * r != l { d - 1 } else { d };
+        crate::types::longobject::PyLong_FromLong(result as _)
     } else {
         let l = get_float_value(left);
         let r = get_float_value(right);
@@ -779,13 +774,15 @@ unsafe fn binary_floordiv(left: *mut RawPyObject, right: *mut RawPyObject) -> *m
 
 unsafe fn binary_mod(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
     if is_int(left) && is_int(right) {
-        let l = crate::types::longobject::long_value(left);
-        let r = crate::types::longobject::long_value(right);
-        if r.to_i64() == Some(0) {
+        let l = crate::types::longobject::long_as_i64(left);
+        let r = crate::types::longobject::long_as_i64(right);
+        if r == 0 {
             return crate::types::none::return_none();
         }
-        let result = l % r;
-        crate::types::longobject::PyLong_FromLong(result.to_i64().unwrap_or(0) as _)
+        // Python modulo: result has same sign as divisor
+        let m = l % r;
+        let result = if m != 0 && (m ^ r) < 0 { m + r } else { m };
+        crate::types::longobject::PyLong_FromLong(result as _)
     } else {
         let l = get_float_value(left);
         let r = get_float_value(right);
@@ -798,15 +795,13 @@ unsafe fn binary_mod(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut Ra
 
 unsafe fn binary_pow(left: *mut RawPyObject, right: *mut RawPyObject) -> *mut RawPyObject {
     if is_int(left) && is_int(right) {
-        let l = crate::types::longobject::long_value(left).to_i64().unwrap_or(0);
-        let r = crate::types::longobject::long_value(right).to_i64().unwrap_or(0);
+        let l = crate::types::longobject::long_as_i64(left);
+        let r = crate::types::longobject::long_as_i64(right);
         if r >= 0 && r <= 63 {
             let result = l.wrapping_pow(r as u32);
             crate::types::longobject::PyLong_FromLong(result as _)
         } else {
-            let l = l as f64;
-            let r = r as f64;
-            crate::types::floatobject::PyFloat_FromDouble(l.powf(r))
+            crate::types::floatobject::PyFloat_FromDouble((l as f64).powf(r as f64))
         }
     } else {
         let l = get_float_value(left);
@@ -831,9 +826,8 @@ unsafe fn binary_bitop(left: *mut RawPyObject, right: *mut RawPyObject, op: OpCo
 
 unsafe fn unary_negative(obj: *mut RawPyObject) -> *mut RawPyObject {
     if is_int(obj) {
-        let val = crate::types::longobject::long_value(obj);
-        let result = -val;
-        crate::types::longobject::PyLong_FromLong(result.to_i64().unwrap_or(0) as _)
+        let val = crate::types::longobject::long_as_i64(obj);
+        crate::types::longobject::PyLong_FromLong(val.wrapping_neg() as _)
     } else if is_float(obj) {
         let val = crate::types::floatobject::float_value(obj);
         crate::types::floatobject::PyFloat_FromDouble(-val)
@@ -855,8 +849,8 @@ unsafe fn compare_op(left: *mut RawPyObject, right: *mut RawPyObject, op: u32) -
         _ => {
             // Numeric comparison
             if is_int(left) && is_int(right) {
-                let l = crate::types::longobject::long_value(left);
-                let r = crate::types::longobject::long_value(right);
+                let l = crate::types::longobject::long_as_i64(left);
+                let r = crate::types::longobject::long_as_i64(right);
                 let result = match op {
                     0 => l < r,  // <
                     1 => l <= r, // <=
@@ -1012,6 +1006,13 @@ unsafe extern "C" fn builtin_print(
 
         if crate::types::none::is_none(item) {
             parts.push("None".to_string());
+        } else if crate::types::boolobject::is_bool(item) {
+            // Check bool BEFORE int (bool subclasses int)
+            if crate::types::boolobject::is_true(item) {
+                parts.push("True".to_string());
+            } else {
+                parts.push("False".to_string());
+            }
         } else if is_string(item) {
             parts.push(crate::types::unicode::unicode_value(item).to_string());
         } else if is_int(item) {
@@ -1020,12 +1021,6 @@ unsafe extern "C" fn builtin_print(
         } else if is_float(item) {
             let val = crate::types::floatobject::float_value(item);
             parts.push(format!("{}", val));
-        } else if crate::types::boolobject::is_bool(item) {
-            if crate::types::boolobject::is_true(item) {
-                parts.push("True".to_string());
-            } else {
-                parts.push("False".to_string());
-            }
         } else if crate::types::list::PyList_Check(item) != 0 {
             parts.push(format_list(item));
         } else if crate::types::tuple::PyTuple_Check(item) != 0 {
@@ -1074,12 +1069,12 @@ unsafe fn format_object(obj: *mut RawPyObject) -> String {
         "None".to_string()
     } else if is_string(obj) {
         format!("'{}'", crate::types::unicode::unicode_value(obj))
+    } else if crate::types::boolobject::is_bool(obj) {
+        if crate::types::boolobject::is_true(obj) { "True".to_string() } else { "False".to_string() }
     } else if is_int(obj) {
         format!("{}", crate::types::longobject::long_value(obj))
     } else if is_float(obj) {
         format!("{}", crate::types::floatobject::float_value(obj))
-    } else if crate::types::boolobject::is_bool(obj) {
-        if crate::types::boolobject::is_true(obj) { "True".to_string() } else { "False".to_string() }
     } else {
         format!("<object at {:p}>", obj)
     }

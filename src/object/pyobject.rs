@@ -40,15 +40,24 @@ pub struct RawPyVarObject {
 }
 
 /// GC header prepended before GC-tracked objects.
-/// Matches CPython's PyGC_Head.
+/// Matches CPython 3.8+ PyGC_Head (16 bytes on 64-bit).
+///
+/// In CPython 3.8+, gc_refs was removed as a dedicated word and its bits
+/// are packed into the lower alignment bits of gc_prev. This makes the
+/// header exactly 2 words (16 bytes) instead of the pre-3.8 3-word layout.
+///
+/// C extensions compiled against 3.11 headers do `((PyGC_Head*)obj) - 1`
+/// which subtracts exactly 16 bytes. We MUST match this.
 #[repr(C)]
 pub struct PyGCHead {
-    /// Linked list pointers for GC tracking
-    pub gc_next: *mut PyGCHead,
-    pub gc_prev: *mut PyGCHead,
-    /// GC generation and flags
-    pub gc_refs: isize,
+    /// Pointer to next object in GC list (or 0)
+    pub gc_next: usize,
+    /// Pointer to prev object in GC list.
+    /// Lower bits hold gc_refs state flags (masked by alignment).
+    pub gc_prev: usize,
 }
+// Static assertion: PyGC_Head must be exactly 16 bytes
+const _: () = assert!(std::mem::size_of::<PyGCHead>() == 16);
 
 impl RawPyObject {
     /// Create a new RawPyObject with refcount 1 and the given type.
@@ -175,12 +184,55 @@ pub(crate) unsafe fn dealloc_object(obj: *mut RawPyObject) {
             return;
         }
     }
-    // Fallback: free the memory directly
-    crate::runtime::memory::py_object_free(obj as *mut libc::c_void);
+    // Fallback: free via libc::free (all allocations go through libc::malloc)
+    libc::free(obj as *mut libc::c_void);
+}
+
+// ─── Allocation helpers using libc::malloc (CPython-compatible) ───
+
+/// Allocate a fixed-size Python object via libc::calloc.
+/// Sets refcount=1, type pointer, zeroes everything else.
+///
+/// # Safety
+/// `tp` must point to a valid, initialized RawPyTypeObject.
+pub unsafe fn alloc_object(tp: *mut RawPyTypeObject, size: usize) -> *mut RawPyObject {
+    let ptr = libc::calloc(1, size) as *mut RawPyObject;
+    if ptr.is_null() {
+        eprintln!("Fatal: out of memory allocating Python object");
+        std::process::abort();
+    }
+    ptr::write(&mut (*ptr).ob_refcnt, AtomicIsize::new(1));
+    (*ptr).ob_type = tp;
+    ptr
+}
+
+/// Allocate a variable-size Python object via libc::calloc.
+/// Total size = basicsize + nitems * itemsize.
+/// Sets refcount=1, type pointer, ob_size, zeroes everything else.
+///
+/// # Safety
+/// `tp` must point to a valid, initialized RawPyTypeObject.
+pub unsafe fn alloc_var_object(
+    tp: *mut RawPyTypeObject,
+    nitems: isize,
+    basicsize: usize,
+    itemsize: usize,
+) -> *mut RawPyVarObject {
+    let total = basicsize + (nitems.max(0) as usize) * itemsize;
+    let ptr = libc::calloc(1, total) as *mut RawPyVarObject;
+    if ptr.is_null() {
+        eprintln!("Fatal: out of memory allocating Python var object");
+        std::process::abort();
+    }
+    ptr::write(&mut (*ptr).ob_base.ob_refcnt, AtomicIsize::new(1));
+    (*ptr).ob_base.ob_type = tp;
+    (*ptr).ob_size = nitems;
+    ptr
 }
 
 /// A Python object that holds arbitrary Rust data alongside the PyObject header.
-/// This is the primary way to create Python objects that wrap Rust values.
+/// Used for non-built-in types (funcobject, moduleobject) that don't need
+/// CPython-exact internal layout.
 #[repr(C)]
 pub struct PyObjectWithData<T> {
     pub ob_base: RawPyObject,
@@ -188,13 +240,14 @@ pub struct PyObjectWithData<T> {
 }
 
 impl<T> PyObjectWithData<T> {
-    /// Allocate a new PyObjectWithData on the heap.
+    /// Allocate a new PyObjectWithData on the heap via libc::malloc.
     pub fn alloc(tp: *mut RawPyTypeObject, data: T) -> *mut Self {
-        let layout = std::alloc::Layout::new::<Self>();
         unsafe {
-            let ptr = std::alloc::alloc(layout) as *mut Self;
+            let size = std::mem::size_of::<Self>();
+            let ptr = libc::calloc(1, size) as *mut Self;
             if ptr.is_null() {
-                std::alloc::handle_alloc_error(layout);
+                eprintln!("Fatal: out of memory allocating PyObjectWithData");
+                std::process::abort();
             }
             ptr::write(
                 &mut (*ptr).ob_base,

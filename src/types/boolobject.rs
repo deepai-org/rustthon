@@ -1,4 +1,9 @@
-//! Python bool type (True/False singletons).
+//! Python bool type — CPython 3.11 exact ABI layout.
+//!
+//! In CPython, bool is a subtype of int. True and False are
+//! PyLongObject singletons with ob_type = &PyBool_Type.
+//! True: ob_size=1, ob_digit[0]=1
+//! False: ob_size=0
 
 use crate::object::pyobject::RawPyObject;
 use crate::object::typeobj::RawPyTypeObject;
@@ -8,47 +13,50 @@ use std::sync::atomic::AtomicIsize;
 static mut BOOL_TYPE: RawPyTypeObject = {
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"bool\0".as_ptr() as *const _;
-    tp.tp_basicsize = std::mem::size_of::<PyBoolObject>() as isize;
+    // Same as PyLongObject: header 24 bytes, itemsize 4 (digit)
+    tp.tp_basicsize = 24;
+    tp.tp_itemsize = 4;
     tp
 };
 
-#[repr(C)]
-pub struct PyBoolObject {
-    pub ob_base: RawPyObject,
-    pub value: i64,
+pub unsafe fn bool_type() -> *mut RawPyTypeObject {
+    &mut BOOL_TYPE
 }
 
-#[no_mangle]
-pub static mut _Py_TrueStruct: PyBoolObject = PyBoolObject {
-    ob_base: RawPyObject {
-        ob_refcnt: AtomicIsize::new(1),
-        ob_type: std::ptr::null_mut(),
-    },
-    value: 1,
-};
+// ─── Singleton pointers (heap-allocated PyLongObjects) ───
 
-#[no_mangle]
-pub static mut _Py_FalseStruct: PyBoolObject = PyBoolObject {
-    ob_base: RawPyObject {
-        ob_refcnt: AtomicIsize::new(1),
-        ob_type: std::ptr::null_mut(),
-    },
-    value: 0,
-};
+/// Wrapper to make *mut RawPyObject Send
+struct BoolPtr(*mut RawPyObject);
+unsafe impl Send for BoolPtr {}
+unsafe impl Sync for BoolPtr {}
 
-pub static PY_TRUE: once_cell::sync::Lazy<SendPtr<RawPyObject>> =
-    once_cell::sync::Lazy::new(|| unsafe {
-        _Py_TrueStruct.ob_base.ob_type = &mut BOOL_TYPE;
-        _Py_TrueStruct.ob_base.ob_refcnt = AtomicIsize::new(isize::MAX / 2);
-        SendPtr(&mut _Py_TrueStruct as *mut PyBoolObject as *mut RawPyObject)
-    });
+use once_cell::sync::Lazy;
 
-pub static PY_FALSE: once_cell::sync::Lazy<SendPtr<RawPyObject>> =
-    once_cell::sync::Lazy::new(|| unsafe {
-        _Py_FalseStruct.ob_base.ob_type = &mut BOOL_TYPE;
-        _Py_FalseStruct.ob_base.ob_refcnt = AtomicIsize::new(isize::MAX / 2);
-        SendPtr(&mut _Py_FalseStruct as *mut PyBoolObject as *mut RawPyObject)
-    });
+static TRUE_PTR: Lazy<BoolPtr> = Lazy::new(|| unsafe {
+    let obj = crate::types::longobject::create_long_from_i64_with_type(1, &mut BOOL_TYPE);
+    (*obj).ob_refcnt = AtomicIsize::new(isize::MAX / 2); // immortal
+    BoolPtr(obj)
+});
+
+static FALSE_PTR: Lazy<BoolPtr> = Lazy::new(|| unsafe {
+    let obj = crate::types::longobject::create_long_from_i64_with_type(0, &mut BOOL_TYPE);
+    (*obj).ob_refcnt = AtomicIsize::new(isize::MAX / 2); // immortal
+    BoolPtr(obj)
+});
+
+pub static PY_TRUE: Lazy<SendPtr<RawPyObject>> = Lazy::new(|| {
+    SendPtr(TRUE_PTR.0)
+});
+
+pub static PY_FALSE: Lazy<SendPtr<RawPyObject>> = Lazy::new(|| {
+    SendPtr(FALSE_PTR.0)
+});
+
+// ─── Exported singleton symbols ───
+// C extensions use `&_Py_TrueStruct` and `&_Py_FalseStruct` as pointers.
+// Since our True/False are heap-allocated (flexible array), we export
+// pointer-to-pointer symbols. The `_Py_True()` and `_Py_False()` functions
+// are the primary interface.
 
 // ─── C API ───
 
@@ -80,7 +88,7 @@ pub unsafe fn is_true(obj: *mut RawPyObject) -> bool {
 }
 
 pub unsafe fn is_bool(obj: *mut RawPyObject) -> bool {
-    obj == PY_TRUE.get() || obj == PY_FALSE.get()
+    !obj.is_null() && (*obj).ob_type == bool_type()
 }
 
 #[no_mangle]
@@ -91,4 +99,10 @@ pub unsafe extern "C" fn Py_IsTrue(obj: *mut RawPyObject) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn Py_IsFalse(obj: *mut RawPyObject) -> i32 {
     if obj == PY_FALSE.get() { 1 } else { 0 }
+}
+
+pub unsafe fn init_bool_type() {
+    BOOL_TYPE.tp_base = crate::types::longobject::long_type();
+    BOOL_TYPE.tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
+        | crate::object::typeobj::PY_TPFLAGS_LONG_SUBCLASS;
 }
