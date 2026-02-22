@@ -13,7 +13,7 @@ use crate::object::safe_api::{
     create_int, create_str,
     return_none, bool_from_long, py_incref,
     none_obj, true_obj, false_obj, bool_obj,
-    new_int, new_float, new_str,
+    new_int, new_float, new_str, new_bytes,
     py_is_true, py_get_attr, py_set_attr, py_get_item, py_store_item,
     py_import, py_repr,
     build_list, build_tuple, build_dict, build_set,
@@ -265,8 +265,26 @@ impl VM {
             };
             frame.builtins.insert(name.to_string(), obj);
         }
-        // Register object and super as None placeholders for now
-        frame.builtins.insert("object".to_string(), none_obj(_py));
+        // Register classmethod/staticmethod/property as passthrough decorators
+        for &decorator_name in &["classmethod", "staticmethod", "property"] {
+            let obj = unsafe {
+                PyObjectRef::from_raw(create_builtin_function(decorator_name, builtin_identity))
+            };
+            frame.builtins.insert(decorator_name.to_string(), obj);
+        }
+        // Register type builtins that don't already have constructor functions
+        // (str/int/float/bool/list/tuple/dict/set already have CFunction constructors above)
+        // Add bytes as a constructor + type, complex, bytearray, frozenset, object, type
+        for &extra_builtin in &["bytes", "object", "complex", "bytearray", "frozenset",
+                                "memoryview", "slice"] {
+            if !frame.builtins.contains_key(extra_builtin) {
+                let obj = unsafe {
+                    PyObjectRef::from_raw(create_builtin_function(extra_builtin, builtin_identity))
+                };
+                frame.builtins.insert(extra_builtin.to_string(), obj);
+            }
+        }
+        // Register super and NotImplemented as None placeholders for now
         frame.builtins.insert("super".to_string(), none_obj(_py));
         frame.builtins.insert("NotImplemented".to_string(), none_obj(_py));
 
@@ -528,7 +546,12 @@ impl VM {
                 OpCode::CompareOp => {
                     let right = frame.pop()?;
                     let left = frame.pop()?;
-                    let result = compare_op(py, &left, &right, instr.arg)?;
+                    let result = if instr.arg == 10 {
+                        // Exception match: use saved_exception's exc_type for matching
+                        compare_op_exception_match(py, &left, &right, saved_exception)
+                    } else {
+                        compare_op(py, &left, &right, instr.arg)
+                    }?;
                     frame.push(result);
                 }
 
@@ -796,22 +819,35 @@ impl VM {
                 OpCode::ImportName => {
                     let name = frame.code.names[instr.arg as usize].clone();
                     // Try C API import first (for .so extensions)
-                    match py_import(py, &name) {
-                        Ok(module) => {
-                            frame.push(module);
-                        }
+                    let module = match py_import(py, &name) {
+                        Ok(module) => module,
                         Err(_) => {
                             // Try to import as a Python source file
-                            match self.import_py_source(py, frame, &name) {
-                                Ok(module) => {
-                                    frame.push(module);
-                                }
-                                Err(e) => {
-                                    return Err(e);
+                            self.import_py_source(py, frame, &name)?
+                        }
+                    };
+
+                    // For dotted names like "yaml.loader", also bind the submodule
+                    // as an attribute of the parent package (CPython behavior).
+                    if let Some(dot_pos) = name.rfind('.') {
+                        let parent_name = &name[..dot_pos];
+                        let child_name = &name[dot_pos + 1..];
+                        // Try to find the parent module in cache
+                        if let Some(parent_mod) = PY_MODULE_CACHE.lock().unwrap().get(parent_name).cloned() {
+                            unsafe {
+                                if crate::types::dict::PyDict_Check(parent_mod.as_raw()) != 0 {
+                                    let key = std::ffi::CString::new(child_name).unwrap();
+                                    crate::types::dict::PyDict_SetItemString(
+                                        parent_mod.as_raw(),
+                                        key.as_ptr(),
+                                        module.as_raw(),
+                                    );
                                 }
                             }
                         }
                     }
+
+                    frame.push(module);
                 }
 
                 OpCode::ImportFrom => {
@@ -955,12 +991,45 @@ impl VM {
                         } else if is_class_marker(marker_val) {
                             // Class attribute access
                             let class = unsafe { &*(extract_ptr(marker_val) as *const RustClass) };
-                            if let Some(val) = class.namespace.get(&name) {
-                                frame.push(val.clone());
+                            if name == "__dict__" {
+                                // Return the class namespace as a dict
+                                let mut pairs = Vec::new();
+                                for (k, v) in &class.namespace {
+                                    pairs.push((new_str(py, k)?, v.clone()));
+                                }
+                                let dict = build_dict(py, pairs)?;
+                                frame.push(dict);
+                            } else if name == "__name__" {
+                                frame.push(new_str(py, &class.name)?);
+                            } else if let Some(val) = class.namespace.get(&name) {
+                                // If it's a function, bind the class as first arg (classmethod-like)
+                                if is_int(val.as_raw()) && is_function_marker(get_int_value(val.as_raw())) {
+                                    let bound = build_tuple(py, vec![val.clone(), obj.clone()])?;
+                                    frame.push(bound);
+                                } else {
+                                    frame.push(val.clone());
+                                }
                             } else {
-                                return Err(PyErr::attribute_error(&format!(
-                                    "type object '{}' has no attribute '{}'", class.name, name
-                                )));
+                                // Walk base classes
+                                let mut found = false;
+                                for &base_ptr in &class.bases {
+                                    let base = unsafe { &*base_ptr };
+                                    if let Some(val) = base.namespace.get(&name) {
+                                        if is_int(val.as_raw()) && is_function_marker(get_int_value(val.as_raw())) {
+                                            let bound = build_tuple(py, vec![val.clone(), obj.clone()])?;
+                                            frame.push(bound);
+                                        } else {
+                                            frame.push(val.clone());
+                                        }
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if !found {
+                                    return Err(PyErr::attribute_error(&format!(
+                                        "type object '{}' has no attribute '{}'", class.name, name
+                                    )));
+                                }
                             }
                         } else if is_regex_marker(marker_val) && (is_regex_method(&name) || name == "pattern") {
                             if name == "pattern" {
@@ -1035,12 +1104,16 @@ impl VM {
                     let obj = frame.pop()?;
                     let value = frame.pop()?;
 
-                    // Check if obj is a RustInstance
+                    // Check if obj is a RustInstance or RustClass
                     if is_int(obj.as_raw()) {
                         let marker_val = get_int_value(obj.as_raw());
                         if is_instance_marker(marker_val) {
                             let inst = unsafe { &mut *(extract_ptr(marker_val) as *mut RustInstance) };
                             inst.attrs.insert(name, value);
+                        } else if is_class_marker(marker_val) {
+                            // Set class attribute
+                            let class = unsafe { &mut *(extract_ptr(marker_val) as *mut RustClass) };
+                            class.namespace.insert(name, value);
                         } else {
                             unsafe {
                                 let name_cstr = std::ffi::CString::new(name.as_str()).unwrap();
@@ -1810,13 +1883,45 @@ impl VM {
         // Try builtin stdlib module
         if let Some(module) = self.try_builtin_module(py, name)? {
             PY_MODULE_CACHE.lock().unwrap().insert(name.to_string(), module.clone());
+            // Also register in C API registry so C extensions can find builtin stubs
+            unsafe {
+                crate::module::registry::register_module(name, module.as_raw());
+            }
             return Ok(module);
         }
 
-        // Build search paths: directory of the current file, current directory, "."
-        let search_dirs: Vec<String> = vec![
+        // Build search paths
+        let mut search_dirs: Vec<String> = vec![
             ".".to_string(),
         ];
+
+        // Add directory of the currently-executing file (for submodule imports)
+        let caller_file = caller_frame.locals.get("__file__")
+            .or_else(|| caller_frame.globals.get("__file__"));
+        if let Some(file_obj) = caller_file {
+            if is_str(file_obj.as_raw()) {
+                let file_str = crate::types::unicode::unicode_value(file_obj.as_raw()).to_string();
+                if let Some(parent) = std::path::Path::new(&file_str).parent() {
+                    // Add the parent of the parent (package search dir)
+                    if let Some(grandparent) = parent.parent() {
+                        let gp = grandparent.to_str().unwrap_or(".");
+                        if !gp.is_empty() && !search_dirs.contains(&gp.to_string()) {
+                            search_dirs.push(gp.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add site-packages from venv and system
+        for sp in &[
+            ".venv311/lib/python3.11/site-packages",
+            ".venv/lib/python3.11/site-packages",
+        ] {
+            if std::path::Path::new(sp).exists() && !search_dirs.contains(&sp.to_string()) {
+                search_dirs.push(sp.to_string());
+            }
+        }
 
         // Convert dotted name to path: "foo.bar" -> "foo/bar"
         let path_parts: Vec<&str> = name.split('.').collect();
@@ -1846,6 +1951,11 @@ impl VM {
                 let file_key = new_str(py, "__file__")?;
                 let file_val = new_str(py, &file_path)?;
                 pairs.push((file_key, file_val));
+                // __package__: for "yaml.reader", package is "yaml"
+                let pkg = if let Some(pos) = name.rfind('.') { &name[..pos] } else { "" };
+                let pkg_key = new_str(py, "__package__")?;
+                let pkg_val = new_str(py, pkg)?;
+                pairs.push((pkg_key, pkg_val));
 
                 for (k, v) in &module_frame.locals {
                     let key = new_str(py, k)?;
@@ -1855,6 +1965,10 @@ impl VM {
 
                 // Cache it
                 PY_MODULE_CACHE.lock().unwrap().insert(name.to_string(), module_dict.clone());
+                // Also register in C API module registry so C extensions can find it
+                unsafe {
+                    crate::module::registry::register_module(name, module_dict.as_raw());
+                }
 
                 return Ok(module_dict);
             }
@@ -1883,6 +1997,10 @@ impl VM {
                 let path_key = new_str(py, "__path__")?;
                 let path_val = new_str(py, &format!("{}/{}", dir, file_stem))?;
                 pairs.push((path_key, path_val));
+                // __package__: for a package, __package__ == __name__
+                let pkg_key = new_str(py, "__package__")?;
+                let pkg_val = new_str(py, name)?;
+                pairs.push((pkg_key, pkg_val));
 
                 for (k, v) in &module_frame.locals {
                     let key = new_str(py, k)?;
@@ -1891,6 +2009,10 @@ impl VM {
                 let module_dict = build_dict(py, pairs)?;
 
                 PY_MODULE_CACHE.lock().unwrap().insert(name.to_string(), module_dict.clone());
+                // Also register in C API module registry
+                unsafe {
+                    crate::module::registry::register_module(name, module_dict.as_raw());
+                }
 
                 return Ok(module_dict);
             }
@@ -2011,6 +2133,87 @@ impl VM {
                     };
                     p.push((new_str(py, name)?, obj));
                 }
+                p
+            }
+            "codecs" => {
+                let mut p = Vec::new();
+                p.push((new_str(py, "__name__")?, new_str(py, "codecs")?));
+                // BOM constants used by yaml reader.py
+                p.push((new_str(py, "BOM_UTF16_LE")?, new_bytes(py, b"\xff\xfe")?));
+                p.push((new_str(py, "BOM_UTF16_BE")?, new_bytes(py, b"\xfe\xff")?));
+                p.push((new_str(py, "BOM_UTF8")?, new_bytes(py, b"\xef\xbb\xbf")?));
+                // Placeholder decode functions (only called in method bodies, not at import time)
+                p.push((new_str(py, "utf_8_decode")?, none_obj(py)));
+                p.push((new_str(py, "utf_16_le_decode")?, none_obj(py)));
+                p.push((new_str(py, "utf_16_be_decode")?, none_obj(py)));
+                p
+            }
+            "collections" => {
+                let mut p = Vec::new();
+                p.push((new_str(py, "__name__")?, new_str(py, "collections")?));
+                // OrderedDict — alias to dict (placeholder)
+                p.push((new_str(py, "OrderedDict")?, none_obj(py)));
+                p.push((new_str(py, "defaultdict")?, none_obj(py)));
+                p
+            }
+            "collections.abc" => {
+                let mut p = Vec::new();
+                p.push((new_str(py, "__name__")?, new_str(py, "collections.abc")?));
+                p.push((new_str(py, "Hashable")?, none_obj(py)));
+                p.push((new_str(py, "Mapping")?, none_obj(py)));
+                p.push((new_str(py, "MutableMapping")?, none_obj(py)));
+                p.push((new_str(py, "Set")?, none_obj(py)));
+                p.push((new_str(py, "Sequence")?, none_obj(py)));
+                p
+            }
+            "datetime" => {
+                let mut p = Vec::new();
+                p.push((new_str(py, "__name__")?, new_str(py, "datetime")?));
+                // Placeholder classes — only used in method bodies
+                p.push((new_str(py, "datetime")?, none_obj(py)));
+                p.push((new_str(py, "date")?, none_obj(py)));
+                p.push((new_str(py, "timedelta")?, none_obj(py)));
+                p.push((new_str(py, "timezone")?, none_obj(py)));
+                p
+            }
+            "base64" => {
+                let mut p = Vec::new();
+                p.push((new_str(py, "__name__")?, new_str(py, "base64")?));
+                p.push((new_str(py, "decodebytes")?, none_obj(py)));
+                p.push((new_str(py, "encodebytes")?, none_obj(py)));
+                p
+            }
+            "binascii" => {
+                let mut p = Vec::new();
+                p.push((new_str(py, "__name__")?, new_str(py, "binascii")?));
+                p.push((new_str(py, "hexlify")?, none_obj(py)));
+                p.push((new_str(py, "unhexlify")?, none_obj(py)));
+                p
+            }
+            "types" => {
+                let mut p = Vec::new();
+                p.push((new_str(py, "__name__")?, new_str(py, "types")?));
+                p.push((new_str(py, "FunctionType")?, none_obj(py)));
+                p.push((new_str(py, "BuiltinFunctionType")?, none_obj(py)));
+                p.push((new_str(py, "GeneratorType")?, none_obj(py)));
+                p.push((new_str(py, "ModuleType")?, none_obj(py)));
+                p.push((new_str(py, "MethodType")?, none_obj(py)));
+                p.push((new_str(py, "SimpleNamespace")?, none_obj(py)));
+                p
+            }
+            "copyreg" => {
+                let mut p = Vec::new();
+                p.push((new_str(py, "__name__")?, new_str(py, "copyreg")?));
+                p.push((new_str(py, "dispatch_table")?, build_dict(py, Vec::new())?));
+                p
+            }
+            "io" => {
+                let mut p = Vec::new();
+                p.push((new_str(py, "__name__")?, new_str(py, "io")?));
+                // Placeholder classes — only used in function bodies
+                p.push((new_str(py, "StringIO")?, none_obj(py)));
+                p.push((new_str(py, "BytesIO")?, none_obj(py)));
+                p.push((new_str(py, "open")?, none_obj(py)));
                 p
             }
             _ => return Ok(None),
@@ -2440,6 +2643,41 @@ fn unary_negative(py: Python<'_>, obj: &PyObjectRef) -> PyResult {
     }
 }
 
+/// Exception match comparison (CompareOp 10).
+/// The stack has: left = exception value (pushed by exception handler), right = exception type to match.
+/// Our exc_value is typically a string (from PyErr_SetString), so its ob_type is PyUnicode_Type.
+/// Instead, we use the saved_exception's exc_type for the actual type comparison.
+fn compare_op_exception_match(
+    py: Python<'_>,
+    _left: &PyObjectRef,
+    right: &PyObjectRef,
+    saved_exception: &Option<PyErr>,
+) -> PyResult {
+    let r = right.as_raw();
+
+    if let Some(ref exc) = saved_exception {
+        // Use the saved exception's type for matching
+        let exc_type = exc.exc_type;
+        if !exc_type.is_null() {
+            // Walk the tp_base chain of the actual exception type
+            let mut base = exc_type;
+            while !base.is_null() {
+                if base == r {
+                    return Ok(true_obj(py));
+                }
+                let tp = base as *const crate::object::typeobj::RawPyTypeObject;
+                let next_base = unsafe { (*tp).tp_base };
+                if next_base.is_null() {
+                    break;
+                }
+                base = next_base as *mut RawPyObject;
+            }
+        }
+    }
+
+    Ok(false_obj(py))
+}
+
 fn compare_op(py: Python<'_>, left: &PyObjectRef, right: &PyObjectRef, op: u32) -> PyResult {
     let (l, r) = (left.as_raw(), right.as_raw());
     match op {
@@ -2451,30 +2689,11 @@ fn compare_op(py: Python<'_>, left: &PyObjectRef, right: &PyObjectRef, op: u32) 
         9 => { // not in
             Ok(bool_obj(py, !contains(l, r)))
         }
-        10 => { // exception match (for except clauses)
-            // l = exception value, r = exception type to match against
-            // Check if the exception's type matches the target type
-            let exc_type = unsafe { (*l).ob_type as *mut RawPyObject };
-            if exc_type == r || l == r {
-                Ok(true_obj(py))
-            } else {
-                // Walk the tp_base chain for subclass matching
-                let mut base = exc_type;
-                let mut matched = false;
-                while !base.is_null() {
-                    if base == r {
-                        matched = true;
-                        break;
-                    }
-                    let tp = base as *const crate::object::typeobj::RawPyTypeObject;
-                    let next_base = unsafe { (*tp).tp_base };
-                    if next_base.is_null() {
-                        break;
-                    }
-                    base = next_base as *mut RawPyObject;
-                }
-                Ok(bool_obj(py, matched))
-            }
+        10 => {
+            // Exception match — handled separately via compare_op_exception_match
+            // This branch should not be reached since CompareOp(10) is intercepted
+            // in execute_opcode. Keep as fallback.
+            Ok(false_obj(py))
         }
         _ => {
             if is_none(l) && is_none(r) {
@@ -2735,6 +2954,18 @@ fn call_function_raii(_py: Python<'_>, func: &PyObjectRef, args: &[PyObjectRef])
 }
 
 // ─── Built-in function implementations ───
+
+/// Identity function — used as placeholder for classmethod/staticmethod/property decorators.
+/// Returns the first argument unchanged.
+unsafe extern "C" fn builtin_identity(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let item = crate::types::tuple::PyTuple_GetItem(args, 0);
+    if !item.is_null() {
+        (*item).incref();
+    }
+    item
+}
 
 unsafe fn create_builtin_function(
     name: &str,

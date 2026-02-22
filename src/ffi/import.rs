@@ -83,26 +83,49 @@ pub fn find_extension(name: &str, search_paths: &[String]) -> Option<std::path::
     // - <name>.abi3.so
     // - <name>.so
     // - <name>.dylib
+
+    // For dotted names like "yaml._yaml", split into directory path + leaf name
+    let (dir_prefix, leaf_name) = if let Some(pos) = name.rfind('.') {
+        let pkg = &name[..pos];
+        let leaf = &name[pos + 1..];
+        (pkg.replace('.', "/"), leaf.to_string())
+    } else {
+        (String::new(), name.to_string())
+    };
+
     let suffixes = [
-        format!("{}.cpython-311-darwin.so", name),
-        format!("{}.abi3.so", name),
-        format!("{}.so", name),
-        format!("{}.dylib", name),
+        format!("{}.cpython-311-darwin.so", leaf_name),
+        format!("{}.abi3.so", leaf_name),
+        format!("{}.so", leaf_name),
+        format!("{}.dylib", leaf_name),
     ];
 
     for search_path in search_paths {
+        // Build the directory to search in
+        let search_dir = if dir_prefix.is_empty() {
+            Path::new(search_path).to_path_buf()
+        } else {
+            Path::new(search_path).join(&dir_prefix)
+        };
+
         for suffix in &suffixes {
-            let path = Path::new(search_path).join(suffix);
+            let path = search_dir.join(suffix);
             if path.exists() {
                 return Some(path);
             }
         }
 
         // Also check for package-style: name/__init__.so etc.
-        let pkg_dir = Path::new(search_path).join(name);
+        let pkg_dir = search_dir.join(&leaf_name);
         if pkg_dir.is_dir() {
-            for suffix in &suffixes {
-                let path = pkg_dir.join(suffix.replace(name, "__init__"));
+            let init_suffixes = [
+                "__init__.cpython-311-darwin.so".to_string(),
+                "__init__.abi3.so".to_string(),
+                "__init__.so".to_string(),
+                "__init__.dylib".to_string(),
+            ];
+            for suffix in &init_suffixes {
+                let path = pkg_dir.join(suffix);
                 if path.exists() {
                     return Some(path);
                 }
@@ -133,7 +156,9 @@ pub unsafe extern "C" fn PyImport_ImportModule(name: *const c_char) -> *mut RawP
         // Try to find and load C extension
         let search_paths = crate::module::registry::get_search_paths();
         if let Some(ext_path) = find_extension(&name_str, &search_paths) {
-            match load_extension(&ext_path, &name_str) {
+            // For dotted names like "yaml._yaml", use the leaf name for PyInit_ lookup
+            let leaf_name = name_str.rsplit('.').next().unwrap_or(&name_str);
+            match load_extension(&ext_path, leaf_name) {
                 Ok(module) => {
                     crate::module::registry::register_module(&name_str, module);
                     return module;

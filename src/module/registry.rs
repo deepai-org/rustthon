@@ -26,6 +26,8 @@ impl ModuleRegistry {
             modules: HashMap::new(),
             search_paths: vec![
                 ".".to_string(),
+                ".venv311/lib/python3.11/site-packages".to_string(),
+                ".venv/lib/python3.11/site-packages".to_string(),
                 "/usr/local/lib/python3.11/lib-dynload".to_string(),
                 "/usr/local/lib/python3.11/site-packages".to_string(),
             ],

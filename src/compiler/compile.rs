@@ -10,6 +10,70 @@ use crate::runtime::pyerr::PyResult;
 use rustpython_parser::ast::{self, Constant, Expr, Stmt};
 use rustpython_parser::Parse;
 
+/// Derive the package name from a filename and relative import level.
+///
+/// Uses the filename to infer the current module's package:
+/// - `<prefix>/yaml/__init__.py` → package is `"yaml"` (is_init, level=1)
+/// - `<prefix>/yaml/reader.py` → package is `"yaml"` (not init, level=1)
+/// - `<prefix>/yaml/sub/__init__.py` → package is `"yaml.sub"` (is_init, level=1), `"yaml"` (level=2)
+fn derive_package_name(filename: &str, level: u32) -> String {
+    use std::path::Path;
+    let path = Path::new(filename);
+
+    let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let is_init = file_stem == "__init__";
+
+    // Collect directory components
+    let parent = path.parent().unwrap_or(Path::new(""));
+    let components: Vec<&str> = parent.components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .filter(|&s| s != "." && s != "..")
+        .collect();
+
+    // For __init__.py: the package IS the directory containing it.
+    // For regular .py: the package is the parent directory.
+    // In both cases, `components` gives us the full dir path.
+    //
+    // For level=1: the package is the last component(s) that represent the package.
+    // For level=2: go up one more directory, etc.
+    //
+    // Since we don't know which prefix is the "search path" vs "package",
+    // we take the last N components needed. For yaml/__init__.py in
+    // .venv311/lib/python3.11/site-packages/yaml/, there's only one package
+    // level ("yaml"). We go up (level-1) from there for __init__, or level-1
+    // from the parent for regular files.
+    //
+    // The practical approach: count back from the end.
+    // __init__.py at level 1 → last 1 component
+    // __init__.py at level 2 → last 2 components minus 1 = last 1 component... no.
+    //
+    // Actually: for level=1 from __init__.py, the package is the directory name.
+    //           for level=1 from reader.py, the package is the parent directory name.
+    //           for level=2 from __init__.py, go up 1 more → grandparent.
+    //
+    // So: take directory, go up (level - 1) times, return that directory's name.
+    // For proper dotted packages, we'd need to track depth, but for single-level
+    // packages (yaml), just the dir name suffices.
+
+    if components.is_empty() {
+        return String::new();
+    }
+
+    // How many components to drop from the end for the `level`:
+    // __init__.py: drop (level - 1) from the end
+    // regular .py: drop (level - 1) from the end (parent is already the package dir)
+    let drop = (level - 1) as usize;
+    if drop >= components.len() {
+        return String::new();
+    }
+
+    let remaining = &components[..components.len() - drop];
+    // Return just the last component as the package name.
+    // For nested packages (a.b.c), we'd need deeper analysis, but for the
+    // yaml case (single-level package), this is correct.
+    remaining.last().unwrap_or(&"").to_string()
+}
+
 /// Compile Python source code into a CodeObject.
 /// Takes a Python<'py> GIL token for compile-time proof the GIL is held.
 pub fn compile_source(py: Python<'_>, source: &str, filename: &str) -> Result<CodeObject, String> {
@@ -1319,7 +1383,23 @@ impl<'py> Compiler<'py> {
             .map(|m| m.to_string())
             .unwrap_or_default();
 
-        let name_idx = self.code().add_name(&module_name);
+        // Resolve relative imports using current filename
+        let level = import_from.level.as_ref().map(|l| l.to_u32()).unwrap_or(0);
+        let resolved_name = if level > 0 {
+            let filename = &self.code_stack[0].filename; // module-level filename
+            let package = derive_package_name(filename, level);
+            if module_name.is_empty() {
+                package // `from . import X`
+            } else if package.is_empty() {
+                module_name.clone()
+            } else {
+                format!("{}.{}", package, module_name) // `from .error import *`
+            }
+        } else {
+            module_name.clone()
+        };
+
+        let name_idx = self.code().add_name(&resolved_name);
         self.emit(OpCode::ImportName, name_idx);
 
         let mut is_star = false;
