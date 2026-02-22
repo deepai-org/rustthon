@@ -83,8 +83,11 @@ pub struct RustFunction {
 /// Uses a tag prefix to distinguish from RustFunction pointers.
 pub struct RustClass {
     pub name: String,
-    pub bases: Vec<Box<RustClass>>,
+    /// Base class pointers (raw pointers to heap-allocated RustClass objects).
+    /// These are NOT owned — the bases persist as long as the class markers in the VM.
+    pub bases: Vec<*const RustClass>,
     /// Class namespace: methods, class variables, etc.
+    /// Includes inherited names from bases (flattened at class creation, MRO left-to-right).
     pub namespace: HashMap<String, PyObjectRef>,
     /// Globals from definition scope (for method execution)
     pub globals: HashMap<String, PyObjectRef>,
@@ -115,7 +118,10 @@ const PTR_MASK: i64 = !TAG_MASK;
 fn is_class_marker(val: i64) -> bool { val & TAG_MASK == CLASS_TAG }
 fn is_instance_marker(val: i64) -> bool { val & TAG_MASK == INSTANCE_TAG }
 fn is_bound_method_marker(val: i64) -> bool { val & TAG_MASK == BOUND_METHOD_TAG }
-fn is_function_marker(val: i64) -> bool { val != 0 && val & TAG_MASK == 0 }
+/// A function marker is a positive untagged int that looks like a heap pointer.
+/// Heap pointers on modern systems are > 4096 (page size). We use a conservative
+/// threshold to avoid false positives from small integer class variables.
+fn is_function_marker(val: i64) -> bool { val > 4096 && val & TAG_MASK == 0 }
 fn extract_ptr(val: i64) -> usize { (val & PTR_MASK) as usize }
 
 /// A bound builtin method: self_obj + method name
@@ -138,6 +144,48 @@ struct RustGenerator {
     exhausted: bool,
     /// Whether the generator has been started (first next() call done)
     started: bool,
+}
+
+// ─── Regex support ───
+// Negative int markers with low-bit sub-tags:
+// Generators: -(ptr)      where ptr & 7 == 0 (heap-aligned)
+// Regex:      -(ptr | 1)  low bit 1
+// Match:      -(ptr | 2)  low bit 2
+const REGEX_SUBTAG: i64 = 1;
+const MATCH_SUBTAG: i64 = 2;
+
+fn is_regex_marker(val: i64) -> bool { val < 0 && ((-val) & 7) == REGEX_SUBTAG }
+fn is_match_marker(val: i64) -> bool { val < 0 && ((-val) & 7) == MATCH_SUBTAG }
+fn is_generator_marker(val: i64) -> bool { val < 0 && ((-val) & 7) == 0 }
+
+/// A compiled regex pattern.
+struct RustRegex {
+    pattern: String,
+    compiled: regex::Regex,
+}
+
+/// A regex match result.
+struct RustMatch {
+    full: String,
+    groups: Vec<Option<String>>,
+    start: usize,
+    end: usize,
+}
+
+fn make_regex_marker(ptr: *mut RustRegex) -> i64 {
+    -(((ptr as usize as i64) | REGEX_SUBTAG))
+}
+
+fn make_match_marker(ptr: *mut RustMatch) -> i64 {
+    -(((ptr as usize as i64) | MATCH_SUBTAG))
+}
+
+fn extract_regex(val: i64) -> *mut RustRegex {
+    ((-val) & !7) as usize as *mut RustRegex
+}
+
+fn extract_match(val: i64) -> *mut RustMatch {
+    ((-val) & !7) as usize as *mut RustMatch
 }
 
 /// Result of resuming a generator frame
@@ -792,14 +840,49 @@ impl VM {
 
                 OpCode::ImportStar => {
                     let module = frame.pop()?;
-                    // Copy all names from module dict to locals
+                    // Copy all public names from module dict to locals
                     unsafe {
-                        let dict = crate::ffi::object_api::PyObject_GenericGetDict(module.as_raw(), ptr::null_mut());
+                        let raw = module.as_raw();
+                        // Module is a dict for Python-source modules; otherwise get __dict__
+                        let dict = if crate::types::dict::PyDict_Check(raw) != 0 {
+                            raw
+                        } else {
+                            crate::ffi::object_api::PyObject_GenericGetDict(raw, ptr::null_mut())
+                        };
                         if !dict.is_null() && crate::types::dict::PyDict_Check(dict) != 0 {
-                            // Iterate dict - simple version
-                            let size = crate::types::dict::PyDict_Size(dict);
-                            // We can't easily iterate our dict here, so skip for now
-                            let _ = size;
+                            // Check for __all__
+                            let all_key = std::ffi::CString::new("__all__").unwrap();
+                            let all_list = crate::types::dict::PyDict_GetItemString(dict, all_key.as_ptr());
+                            if !all_list.is_null() && crate::types::list::PyList_Check(all_list) != 0 {
+                                // Import only names listed in __all__
+                                let n = crate::types::list::PyList_Size(all_list);
+                                for i in 0..n {
+                                    let name_obj = crate::types::list::PyList_GetItem(all_list, i);
+                                    if !name_obj.is_null() && is_str(name_obj) {
+                                        let name = crate::types::unicode::unicode_value(name_obj).to_string();
+                                        let name_cstr = std::ffi::CString::new(name.as_str()).unwrap();
+                                        let val = crate::types::dict::PyDict_GetItemString(dict, name_cstr.as_ptr());
+                                        if !val.is_null() {
+                                            let val_ref = PyObjectRef::borrow_or_err(val)?;
+                                            frame.store_name(&name, val_ref);
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Import all names not starting with '_'
+                                let mut pos: isize = 0;
+                                let mut key: *mut RawPyObject = ptr::null_mut();
+                                let mut val: *mut RawPyObject = ptr::null_mut();
+                                while crate::types::dict::PyDict_Next(dict, &mut pos, &mut key, &mut val) != 0 {
+                                    if !key.is_null() && is_str(key) {
+                                        let name = crate::types::unicode::unicode_value(key).to_string();
+                                        if !name.starts_with('_') {
+                                            let val_ref = PyObjectRef::borrow_or_err(val)?;
+                                            frame.store_name(&name, val_ref);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -879,6 +962,29 @@ impl VM {
                                     "type object '{}' has no attribute '{}'", class.name, name
                                 )));
                             }
+                        } else if is_regex_marker(marker_val) && (is_regex_method(&name) || name == "pattern") {
+                            if name == "pattern" {
+                                // .pattern is a property, not a method
+                                let re = unsafe { &*extract_regex(marker_val) };
+                                let pat = new_str(py, &re.pattern)?;
+                                frame.push(pat);
+                            } else {
+                                let bm = Box::new(BoundBuiltinMethod {
+                                    self_obj: obj.clone(),
+                                    method_name: name.clone(),
+                                });
+                                let bm_ptr = Box::into_raw(bm) as usize as i64;
+                                let marker = new_int(py, bm_ptr | BOUND_METHOD_TAG)?;
+                                frame.push(marker);
+                            }
+                        } else if is_match_marker(marker_val) && is_match_method(&name) {
+                            let bm = Box::new(BoundBuiltinMethod {
+                                self_obj: obj.clone(),
+                                method_name: name.clone(),
+                            });
+                            let bm_ptr = Box::into_raw(bm) as usize as i64;
+                            let marker = new_int(py, bm_ptr | BOUND_METHOD_TAG)?;
+                            frame.push(marker);
                         } else {
                             // Regular int — fall through to C API
                             let attr = py_get_attr(py, &obj, &name)?;
@@ -1643,13 +1749,35 @@ impl VM {
                 // Execute the class body
                 let _result = self.run_frame(py, &mut ns_frame)?;
 
-                // Create a RustClass from the namespace
-                let namespace = ns_frame.locals;
+                // Collect base class pointers and merge their namespaces.
+                // Iterate in reverse so that the FIRST base (highest MRO priority) wins.
+                let mut base_ptrs: Vec<*const RustClass> = Vec::new();
+                let mut merged_ns = HashMap::new();
+                // First pass: collect base pointers
+                for base_arg in &args[2..] {
+                    if is_int(base_arg.as_raw()) {
+                        let bval = get_int_value(base_arg.as_raw());
+                        if is_class_marker(bval) {
+                            base_ptrs.push(extract_ptr(bval) as *const RustClass);
+                        }
+                    }
+                }
+                // Second pass: merge in reverse order (last base first, first base last = wins)
+                for &base in base_ptrs.iter().rev() {
+                    let base_ref = unsafe { &*base };
+                    for (k, v) in &base_ref.namespace {
+                        merged_ns.insert(k.clone(), v.clone());
+                    }
+                }
+                // Derived class body overrides base methods
+                for (k, v) in ns_frame.locals {
+                    merged_ns.insert(k, v);
+                }
 
                 let rust_class = RustClass {
                     name: class_name.clone(),
-                    bases: Vec::new(), // TODO: handle base classes
-                    namespace,
+                    bases: base_ptrs,
+                    namespace: merged_ns,
                     globals: merged_globals,
                     builtins: caller_frame.builtins.clone(),
                 };
@@ -1854,6 +1982,37 @@ impl VM {
                 p.push((new_str(py, "environ")?, environ));
                 p
             }
+            "re" => {
+                let mut p = Vec::new();
+                p.push((new_str(py, "__name__")?, new_str(py, "re")?));
+                // Constants
+                p.push((new_str(py, "IGNORECASE")?, new_int(py, 2)?));
+                p.push((new_str(py, "I")?, new_int(py, 2)?));
+                p.push((new_str(py, "MULTILINE")?, new_int(py, 8)?));
+                p.push((new_str(py, "M")?, new_int(py, 8)?));
+                p.push((new_str(py, "DOTALL")?, new_int(py, 16)?));
+                p.push((new_str(py, "S")?, new_int(py, 16)?));
+                p.push((new_str(py, "VERBOSE")?, new_int(py, 64)?));
+                p.push((new_str(py, "X")?, new_int(py, 64)?));
+                // Functions
+                let fns: &[(&str, unsafe extern "C" fn(*mut RawPyObject, *mut RawPyObject) -> *mut RawPyObject)] = &[
+                    ("compile", re_compile),
+                    ("search", re_search),
+                    ("match", re_match_fn),
+                    ("findall", re_findall),
+                    ("sub", re_sub),
+                    ("split", re_split),
+                    ("fullmatch", re_fullmatch),
+                    ("escape", re_escape),
+                ];
+                for &(name, func) in fns {
+                    let obj = unsafe {
+                        PyObjectRef::from_raw(create_builtin_function(name, func))
+                    };
+                    p.push((new_str(py, name)?, obj));
+                }
+                p
+            }
             _ => return Ok(None),
         };
         let module_dict = build_dict(py, pairs)?;
@@ -1872,10 +2031,10 @@ static PY_MODULE_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, PyO
 fn get_iterator(py: Python<'_>, obj: &PyObjectRef) -> PyResult {
     let raw = obj.as_raw();
 
-    // Check for generator (negative int marker)
+    // Check for generator (negative int marker with low bits 0)
     if is_int(raw) {
         let val = get_int_value(raw);
-        if val < 0 {
+        if is_generator_marker(val) {
             // Generator — it IS its own iterator, just pass through
             return Ok(obj.clone());
         }
@@ -1905,10 +2064,10 @@ fn get_iterator(py: Python<'_>, obj: &PyObjectRef) -> PyResult {
 fn iter_next(py: Python<'_>, iter: &PyObjectRef) -> Option<PyObjectRef> {
     let raw = iter.as_raw();
 
-    // Check for generator (negative int marker)
+    // Check for generator (negative int marker with low bits 0)
     if is_int(raw) {
         let val = get_int_value(raw);
-        if val < 0 {
+        if is_generator_marker(val) {
             let gen_ptr = (-val) as usize as *mut RustGenerator;
             let gen = unsafe { &mut *gen_ptr };
             if gen.exhausted {
@@ -2339,12 +2498,46 @@ fn compare_op(py: Python<'_>, left: &PyObjectRef, right: &PyObjectRef, op: u32) 
                 let rv = crate::types::unicode::unicode_value(r);
                 let result = match op { 0=>lv<rv, 1=>lv<=rv, 2=>lv==rv, 3=>lv!=rv, 4=>lv>rv, 5=>lv>=rv, _=>false };
                 Ok(bool_obj(py, result))
+            } else if unsafe { crate::types::tuple::PyTuple_Check(l) != 0 && crate::types::tuple::PyTuple_Check(r) != 0 } {
+                let eq = unsafe { tuples_equal(l, r) };
+                let result = match op { 2 => eq, 3 => !eq, _ => false };
+                Ok(bool_obj(py, result))
+            } else if unsafe { crate::types::list::PyList_Check(l) != 0 && crate::types::list::PyList_Check(r) != 0 } {
+                let eq = unsafe { lists_equal(l, r) };
+                let result = match op { 2 => eq, 3 => !eq, _ => false };
+                Ok(bool_obj(py, result))
             } else {
                 let result = match op { 2 => l == r, 3 => l != r, _ => false };
                 Ok(bool_obj(py, result))
             }
         }
     }
+}
+
+/// Element-wise tuple equality.
+unsafe fn tuples_equal(a: *mut RawPyObject, b: *mut RawPyObject) -> bool {
+    let na = crate::types::tuple::PyTuple_Size(a);
+    let nb = crate::types::tuple::PyTuple_Size(b);
+    if na != nb { return false; }
+    for i in 0..na {
+        let ea = crate::types::tuple::PyTuple_GetItem(a, i);
+        let eb = crate::types::tuple::PyTuple_GetItem(b, i);
+        if !objs_equal(ea, eb) { return false; }
+    }
+    true
+}
+
+/// Element-wise list equality.
+unsafe fn lists_equal(a: *mut RawPyObject, b: *mut RawPyObject) -> bool {
+    let na = crate::types::list::PyList_Size(a);
+    let nb = crate::types::list::PyList_Size(b);
+    if na != nb { return false; }
+    for i in 0..na {
+        let ea = crate::types::list::PyList_GetItem(a, i);
+        let eb = crate::types::list::PyList_GetItem(b, i);
+        if !objs_equal(ea, eb) { return false; }
+    }
+    true
 }
 
 /// Check if item `l` is in container `r`.
@@ -2379,11 +2572,23 @@ fn contains(item: *mut RawPyObject, container: *mut RawPyObject) -> bool {
 fn objs_equal(a: *mut RawPyObject, b: *mut RawPyObject) -> bool {
     if a == b { return true; }
     if a.is_null() || b.is_null() { return false; }
-    if is_int(a) && is_int(b) { return get_int_value(a) == get_int_value(b); }
-    if is_str(a) && is_str(b) {
-        return crate::types::unicode::unicode_value(a) == crate::types::unicode::unicode_value(b);
+    unsafe {
+        if is_none(a) && is_none(b) { return true; }
+        if is_bool(a) && is_bool(b) {
+            return crate::types::boolobject::is_true(a) == crate::types::boolobject::is_true(b);
+        }
+        if is_int(a) && is_int(b) { return get_int_value(a) == get_int_value(b); }
+        if is_str(a) && is_str(b) {
+            return crate::types::unicode::unicode_value(a) == crate::types::unicode::unicode_value(b);
+        }
+        if is_float(a) && is_float(b) { return get_float_value(a) == get_float_value(b); }
+        if crate::types::tuple::PyTuple_Check(a) != 0 && crate::types::tuple::PyTuple_Check(b) != 0 {
+            return tuples_equal(a, b);
+        }
+        if crate::types::list::PyList_Check(a) != 0 && crate::types::list::PyList_Check(b) != 0 {
+            return lists_equal(a, b);
+        }
     }
-    if is_float(a) && is_float(b) { return get_float_value(a) == get_float_value(b); }
     false
 }
 
@@ -2588,6 +2793,8 @@ unsafe fn format_object_for_print(obj: *mut RawPyObject) -> String {
         format_tuple(obj)
     } else if crate::types::dict::PyDict_Check(obj) != 0 {
         format_dict(obj)
+    } else if crate::types::set::PySet_Check(obj) != 0 {
+        format_set(obj)
     } else {
         let repr = crate::ffi::object_api::PyObject_Repr(obj);
         if !repr.is_null() && is_str(repr) {
@@ -2625,9 +2832,36 @@ unsafe fn format_tuple(tuple: *mut RawPyObject) -> String {
 }
 
 unsafe fn format_dict(dict: *mut RawPyObject) -> String {
-    // Simple representation — just show the type for now
-    let size = crate::types::dict::PyDict_Size(dict);
-    format!("{{...{} items...}}", size)
+    let mut items = Vec::new();
+    let mut pos: isize = 0;
+    let mut key: *mut RawPyObject = ptr::null_mut();
+    let mut value: *mut RawPyObject = ptr::null_mut();
+    while crate::types::dict::PyDict_Next(dict, &mut pos, &mut key, &mut value) != 0 {
+        let k = format_object_repr(key);
+        let v = format_object_repr(value);
+        items.push(format!("{}: {}", k, v));
+    }
+    format!("{{{}}}", items.join(", "))
+}
+
+unsafe fn format_set(set: *mut RawPyObject) -> String {
+    let s = set as *mut crate::types::set::PySetObject;
+    let table = (*s).table;
+    let mask = (*s).mask as usize;
+    let mut items = Vec::new();
+    for i in 0..=mask {
+        let entry = &*table.add(i);
+        if !entry.key.is_null() {
+            // Skip dummy entries (hash == 0 with non-null key is possible, but
+            // in our implementation deleted entries have null key)
+            items.push(format_object_repr(entry.key));
+        }
+    }
+    if items.is_empty() {
+        "set()".to_string()
+    } else {
+        format!("{{{}}}", items.join(", "))
+    }
 }
 
 unsafe fn format_object_repr(obj: *mut RawPyObject) -> String {
@@ -2645,6 +2879,10 @@ unsafe fn format_object_repr(obj: *mut RawPyObject) -> String {
         format_list(obj)
     } else if crate::types::tuple::PyTuple_Check(obj) != 0 {
         format_tuple(obj)
+    } else if crate::types::dict::PyDict_Check(obj) != 0 {
+        format_dict(obj)
+    } else if crate::types::set::PySet_Check(obj) != 0 {
+        format_set(obj)
     } else {
         format!("<object at {:p}>", obj)
     }
@@ -2750,7 +2988,9 @@ unsafe extern "C" fn builtin_str(
     if nargs == 0 { return create_str(""); }
     let obj = crate::types::tuple::PyTuple_GetItem(args, 0);
     if obj.is_null() { return create_str("None"); }
-    crate::ffi::object_api::PyObject_Str(obj)
+    // Use our format_object_for_print which handles dicts/sets/lists properly
+    let s = format_object_for_print(obj);
+    create_str(&s)
 }
 
 unsafe extern "C" fn builtin_isinstance(
@@ -2759,15 +2999,33 @@ unsafe extern "C" fn builtin_isinstance(
     let obj = crate::types::tuple::PyTuple_GetItem(args, 0);
     let tp = crate::types::tuple::PyTuple_GetItem(args, 1);
     if obj.is_null() || tp.is_null() { return crate::object::safe_api::py_false(); }
+
+    // If tp is a tuple, check each element
+    if crate::types::tuple::PyTuple_Check(tp) != 0 {
+        let n = crate::types::tuple::PyTuple_Size(tp);
+        for i in 0..n {
+            let single_tp = crate::types::tuple::PyTuple_GetItem(tp, i);
+            if isinstance_check(obj, single_tp) {
+                return bool_from_long(1);
+            }
+        }
+        return bool_from_long(0);
+    }
+
+    bool_from_long(if isinstance_check(obj, tp) { 1 } else { 0 })
+}
+
+/// Core isinstance logic for a single type check.
+unsafe fn isinstance_check(obj: *mut RawPyObject, tp: *mut RawPyObject) -> bool {
+    if obj.is_null() || tp.is_null() { return false; }
     let obj_type = (*obj).ob_type as *mut RawPyObject;
 
     // Direct type comparison
     if obj_type == tp {
-        return bool_from_long(1);
+        return true;
     }
 
-    // If tp is a CFunction (builtin_int, builtin_str, etc.), try to resolve to the actual type
-    // by checking if tp is one of our builtin constructor functions
+    // If tp is a CFunction (builtin_int, builtin_str, etc.), resolve to actual type
     if (*tp).ob_type == crate::types::funcobject::cfunction_type() {
         let data = crate::object::pyobject::PyObjectWithData::<crate::types::funcobject::CFunctionData>::data_from_raw(tp);
         if !data.name.is_null() {
@@ -2785,16 +3043,32 @@ unsafe extern "C" fn builtin_isinstance(
                 _ => false,
             };
             if matched {
-                return bool_from_long(1);
+                return true;
             }
         }
     }
 
-    // Check tp_base chain for subclass matching
+    // RustClass-aware isinstance: check if obj is an instance of a RustClass (or subclass)
+    if is_int(tp) {
+        let tp_val = get_int_value(tp);
+        if is_class_marker(tp_val) {
+            let target_class = extract_ptr(tp_val) as *const RustClass;
+            if is_int(obj) {
+                let obj_val = get_int_value(obj);
+                if is_instance_marker(obj_val) {
+                    let inst = &*(extract_ptr(obj_val) as *const RustInstance);
+                    return isinstance_class_check(inst.class, target_class);
+                }
+            }
+            return false;
+        }
+    }
+
+    // Check tp_base chain for subclass matching (C types)
     let mut base = obj_type;
     while !base.is_null() {
         if base == tp {
-            return bool_from_long(1);
+            return true;
         }
         let tp_ref = base as *const crate::object::typeobj::RawPyTypeObject;
         let next_base = (*tp_ref).tp_base;
@@ -2802,7 +3076,20 @@ unsafe extern "C" fn builtin_isinstance(
         base = next_base as *mut RawPyObject;
     }
 
-    bool_from_long(0)
+    false
+}
+
+/// Check if obj_class is the same as or a subclass of target_class.
+unsafe fn isinstance_class_check(obj_class: *const RustClass, target_class: *const RustClass) -> bool {
+    if obj_class == target_class { return true; }
+    // Walk the bases chain
+    let class = &*obj_class;
+    for &base_ptr in &class.bases {
+        if isinstance_class_check(base_ptr, target_class) {
+            return true;
+        }
+    }
+    false
 }
 
 unsafe extern "C" fn builtin_hasattr(
@@ -3066,6 +3353,11 @@ unsafe extern "C" fn builtin_repr_fn(
         let s = crate::types::unicode::unicode_value(obj);
         return create_str(&format!("'{}'", s));
     }
+    // Handle container types using our VM-side formatters
+    if crate::types::list::PyList_Check(obj) != 0 { return create_str(&format_list(obj)); }
+    if crate::types::tuple::PyTuple_Check(obj) != 0 { return create_str(&format_tuple(obj)); }
+    if crate::types::dict::PyDict_Check(obj) != 0 { return create_str(&format_dict(obj)); }
+    if crate::types::set::PySet_Check(obj) != 0 { return create_str(&format_set(obj)); }
     // Fall back to PyObject_Repr for other types
     let repr = crate::ffi::object_api::PyObject_Repr(obj);
     if repr.is_null() {
@@ -3501,6 +3793,273 @@ unsafe extern "C" fn stdlib_os_path_basename(
     create_str(&base)
 }
 
+// ─── Regex module functions ───
+
+/// Convert Python re flags to regex crate options and build a Regex.
+fn compile_regex_with_flags(pattern: &str, flags: i64) -> Result<regex::Regex, String> {
+    let mut re_pattern = String::new();
+    // Apply flags as inline group at the start
+    if flags != 0 {
+        re_pattern.push_str("(?");
+        if flags & 2 != 0 { re_pattern.push('i'); }  // IGNORECASE
+        if flags & 8 != 0 { re_pattern.push('m'); }  // MULTILINE
+        if flags & 16 != 0 { re_pattern.push('s'); } // DOTALL
+        if flags & 64 != 0 { re_pattern.push('x'); } // VERBOSE
+        re_pattern.push(')');
+    }
+    re_pattern.push_str(pattern);
+    regex::Regex::new(&re_pattern).map_err(|e| e.to_string())
+}
+
+unsafe extern "C" fn re_compile(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let nargs = crate::types::tuple::PyTuple_Size(args);
+    if nargs < 1 { return return_none(); }
+    let pat_obj = crate::types::tuple::PyTuple_GetItem(args, 0);
+    if !is_str(pat_obj) { return return_none(); }
+    let pattern = crate::types::unicode::unicode_value(pat_obj).to_string();
+    let flags = if nargs >= 2 {
+        let f = crate::types::tuple::PyTuple_GetItem(args, 1);
+        if is_int(f) { get_int_value(f) } else { 0 }
+    } else { 0 };
+    match compile_regex_with_flags(&pattern, flags) {
+        Ok(compiled) => {
+            let re_obj = Box::new(RustRegex { pattern, compiled });
+            let marker = make_regex_marker(Box::into_raw(re_obj));
+            create_int(marker)
+        }
+        Err(_) => return_none(),
+    }
+}
+
+/// Helper: perform a regex search and return a match marker (or null)
+unsafe fn do_regex_search(pat: &str, flags: i64, text: &str, anchored: bool) -> *mut RawPyObject {
+    let actual_pat = if anchored && !pat.starts_with('^') {
+        format!("^(?:{})", pat)
+    } else {
+        pat.to_string()
+    };
+    let compiled = match compile_regex_with_flags(&actual_pat, flags) {
+        Ok(c) => c,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    if let Some(m) = compiled.captures(text) {
+        let full_match = m.get(0).unwrap();
+        let groups: Vec<Option<String>> = (1..compiled.captures_len())
+            .map(|i| m.get(i).map(|g| g.as_str().to_string()))
+            .collect();
+        let match_obj = Box::new(RustMatch {
+            full: full_match.as_str().to_string(),
+            groups,
+            start: full_match.start(),
+            end: full_match.end(),
+        });
+        create_int(make_match_marker(Box::into_raw(match_obj)))
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+unsafe extern "C" fn re_search(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let nargs = crate::types::tuple::PyTuple_Size(args);
+    if nargs < 2 { return return_none(); }
+    let pat_obj = crate::types::tuple::PyTuple_GetItem(args, 0);
+    let str_obj = crate::types::tuple::PyTuple_GetItem(args, 1);
+    if !is_str(pat_obj) || !is_str(str_obj) { return return_none(); }
+    let pattern = crate::types::unicode::unicode_value(pat_obj).to_string();
+    let text = crate::types::unicode::unicode_value(str_obj).to_string();
+    let flags = if nargs >= 3 {
+        let f = crate::types::tuple::PyTuple_GetItem(args, 2);
+        if is_int(f) { get_int_value(f) } else { 0 }
+    } else { 0 };
+    let result = do_regex_search(&pattern, flags, &text, false);
+    if result.is_null() { return_none() } else { result }
+}
+
+unsafe extern "C" fn re_match_fn(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let nargs = crate::types::tuple::PyTuple_Size(args);
+    if nargs < 2 { return return_none(); }
+    let pat_obj = crate::types::tuple::PyTuple_GetItem(args, 0);
+    let str_obj = crate::types::tuple::PyTuple_GetItem(args, 1);
+    if !is_str(pat_obj) || !is_str(str_obj) { return return_none(); }
+    let pattern = crate::types::unicode::unicode_value(pat_obj).to_string();
+    let text = crate::types::unicode::unicode_value(str_obj).to_string();
+    let flags = if nargs >= 3 {
+        let f = crate::types::tuple::PyTuple_GetItem(args, 2);
+        if is_int(f) { get_int_value(f) } else { 0 }
+    } else { 0 };
+    let result = do_regex_search(&pattern, flags, &text, true);
+    if result.is_null() { return_none() } else { result }
+}
+
+unsafe extern "C" fn re_fullmatch(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let nargs = crate::types::tuple::PyTuple_Size(args);
+    if nargs < 2 { return return_none(); }
+    let pat_obj = crate::types::tuple::PyTuple_GetItem(args, 0);
+    let str_obj = crate::types::tuple::PyTuple_GetItem(args, 1);
+    if !is_str(pat_obj) || !is_str(str_obj) { return return_none(); }
+    let pattern = crate::types::unicode::unicode_value(pat_obj).to_string();
+    let text = crate::types::unicode::unicode_value(str_obj).to_string();
+    let flags = if nargs >= 3 {
+        let f = crate::types::tuple::PyTuple_GetItem(args, 2);
+        if is_int(f) { get_int_value(f) } else { 0 }
+    } else { 0 };
+    // Fullmatch: anchor pattern to match entire string
+    let anchored_pat = format!("^(?:{})$", pattern);
+    let result = do_regex_search(&anchored_pat, flags, &text, false);
+    if result.is_null() { return_none() } else { result }
+}
+
+unsafe extern "C" fn re_findall(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let nargs = crate::types::tuple::PyTuple_Size(args);
+    if nargs < 2 { return return_none(); }
+    let pat_obj = crate::types::tuple::PyTuple_GetItem(args, 0);
+    let str_obj = crate::types::tuple::PyTuple_GetItem(args, 1);
+    if !is_str(pat_obj) || !is_str(str_obj) { return return_none(); }
+    let pattern = crate::types::unicode::unicode_value(pat_obj).to_string();
+    let text = crate::types::unicode::unicode_value(str_obj).to_string();
+    let flags = if nargs >= 3 {
+        let f = crate::types::tuple::PyTuple_GetItem(args, 2);
+        if is_int(f) { get_int_value(f) } else { 0 }
+    } else { 0 };
+    let compiled = match compile_regex_with_flags(&pattern, flags) {
+        Ok(c) => c,
+        Err(_) => return crate::types::list::PyList_New(0),
+    };
+    let has_groups = compiled.captures_len() > 1;
+    if has_groups {
+        // Return list of groups (or tuples if multiple groups)
+        let results: Vec<*mut RawPyObject> = compiled.captures_iter(&text).map(|caps| {
+            let groups: Vec<String> = (1..compiled.captures_len())
+                .map(|i| caps.get(i).map(|g| g.as_str().to_string()).unwrap_or_default())
+                .collect();
+            if groups.len() == 1 {
+                create_str(&groups[0])
+            } else {
+                // Return tuple of groups
+                let tup = crate::types::tuple::PyTuple_New(groups.len() as isize);
+                for (i, g) in groups.iter().enumerate() {
+                    let s = create_str(g);
+                    crate::types::tuple::PyTuple_SET_ITEM(tup, i as isize, s);
+                }
+                tup
+            }
+        }).collect();
+        let list = crate::types::list::PyList_New(results.len() as isize);
+        for (i, item) in results.iter().enumerate() {
+            crate::types::list::PyList_SET_ITEM(list, i as isize, *item);
+        }
+        list
+    } else {
+        let results: Vec<&str> = compiled.find_iter(&text).map(|m| m.as_str()).collect();
+        let list = crate::types::list::PyList_New(results.len() as isize);
+        for (i, s) in results.iter().enumerate() {
+            crate::types::list::PyList_SET_ITEM(list, i as isize, create_str(s));
+        }
+        list
+    }
+}
+
+unsafe extern "C" fn re_sub(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let nargs = crate::types::tuple::PyTuple_Size(args);
+    if nargs < 3 { return return_none(); }
+    let pat_obj = crate::types::tuple::PyTuple_GetItem(args, 0);
+    let repl_obj = crate::types::tuple::PyTuple_GetItem(args, 1);
+    let str_obj = crate::types::tuple::PyTuple_GetItem(args, 2);
+    if !is_str(pat_obj) || !is_str(repl_obj) || !is_str(str_obj) { return return_none(); }
+    let pattern = crate::types::unicode::unicode_value(pat_obj).to_string();
+    let repl = crate::types::unicode::unicode_value(repl_obj).to_string();
+    let text = crate::types::unicode::unicode_value(str_obj).to_string();
+    let flags = if nargs >= 4 {
+        let f = crate::types::tuple::PyTuple_GetItem(args, 3);
+        if is_int(f) { get_int_value(f) } else { 0 }
+    } else { 0 };
+    let count = if nargs >= 5 {
+        let c = crate::types::tuple::PyTuple_GetItem(args, 4);
+        if is_int(c) { get_int_value(c) as usize } else { 0 }
+    } else { 0 };
+    let compiled = match compile_regex_with_flags(&pattern, flags) {
+        Ok(c) => c,
+        Err(_) => return create_str(&text),
+    };
+    let result = if count > 0 {
+        // Limited replacements
+        let mut result = text.clone();
+        let mut n = 0;
+        for m in compiled.find_iter(&text) {
+            if n >= count { break; }
+            result = result.replacen(m.as_str(), &repl, 1);
+            n += 1;
+        }
+        result
+    } else {
+        compiled.replace_all(&text, repl.as_str()).to_string()
+    };
+    create_str(&result)
+}
+
+unsafe extern "C" fn re_split(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let nargs = crate::types::tuple::PyTuple_Size(args);
+    if nargs < 2 { return return_none(); }
+    let pat_obj = crate::types::tuple::PyTuple_GetItem(args, 0);
+    let str_obj = crate::types::tuple::PyTuple_GetItem(args, 1);
+    if !is_str(pat_obj) || !is_str(str_obj) { return return_none(); }
+    let pattern = crate::types::unicode::unicode_value(pat_obj).to_string();
+    let text = crate::types::unicode::unicode_value(str_obj).to_string();
+    let flags = if nargs >= 3 {
+        let f = crate::types::tuple::PyTuple_GetItem(args, 2);
+        if is_int(f) { get_int_value(f) } else { 0 }
+    } else { 0 };
+    let compiled = match compile_regex_with_flags(&pattern, flags) {
+        Ok(c) => c,
+        Err(_) => {
+            let list = crate::types::list::PyList_New(1);
+            crate::types::list::PyList_SET_ITEM(list, 0, create_str(&text));
+            return list;
+        }
+    };
+    let parts: Vec<&str> = compiled.split(&text).collect();
+    let list = crate::types::list::PyList_New(parts.len() as isize);
+    for (i, s) in parts.iter().enumerate() {
+        crate::types::list::PyList_SET_ITEM(list, i as isize, create_str(s));
+    }
+    list
+}
+
+unsafe extern "C" fn re_escape(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let pat_obj = crate::types::tuple::PyTuple_GetItem(args, 0);
+    if !is_str(pat_obj) { return return_none(); }
+    let pattern = crate::types::unicode::unicode_value(pat_obj).to_string();
+    create_str(&regex::escape(&pattern))
+}
+
+fn is_regex_method(name: &str) -> bool {
+    matches!(name,
+        "search" | "match" | "findall" | "sub" | "split" | "pattern" | "fullmatch"
+    )
+}
+
+fn is_match_method(name: &str) -> bool {
+    matches!(name,
+        "group" | "groups" | "start" | "end" | "span"
+    )
+}
+
 // ─── Method detection helpers ───
 
 fn is_str_method(name: &str) -> bool {
@@ -3904,6 +4463,128 @@ fn call_bound_method(py: Python<'_>, bm: &BoundBuiltinMethod, args: &[PyObjectRe
                     let default = if args.len() > 1 { args[1].clone() } else { none_obj(py) };
                     crate::types::dict::PyDict_SetItem(raw, key, default.as_raw());
                     return Ok(default);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ─── Regex methods ───
+    if is_int(raw) {
+        let marker_val = get_int_value(raw);
+        if is_regex_marker(marker_val) {
+            let re_obj = unsafe { &*extract_regex(marker_val) };
+            match name {
+                "search" => {
+                    if args.is_empty() { return Err(PyErr::type_error("search() requires a string argument")); }
+                    let text = unsafe { crate::types::unicode::unicode_value(args[0].as_raw()).to_string() };
+                    let result = unsafe { do_regex_search(&re_obj.pattern, 0, &text, false) };
+                    if result.is_null() { return Ok(none_obj(py)); }
+                    return unsafe { PyObjectRef::steal_or_err(result) };
+                }
+                "match" => {
+                    if args.is_empty() { return Err(PyErr::type_error("match() requires a string argument")); }
+                    let text = unsafe { crate::types::unicode::unicode_value(args[0].as_raw()).to_string() };
+                    let result = unsafe { do_regex_search(&re_obj.pattern, 0, &text, true) };
+                    if result.is_null() { return Ok(none_obj(py)); }
+                    return unsafe { PyObjectRef::steal_or_err(result) };
+                }
+                "fullmatch" => {
+                    if args.is_empty() { return Err(PyErr::type_error("fullmatch() requires a string argument")); }
+                    let text = unsafe { crate::types::unicode::unicode_value(args[0].as_raw()).to_string() };
+                    let anchored_pat = format!("^(?:{})$", re_obj.pattern);
+                    let result = unsafe { do_regex_search(&anchored_pat, 0, &text, false) };
+                    if result.is_null() { return Ok(none_obj(py)); }
+                    return unsafe { PyObjectRef::steal_or_err(result) };
+                }
+                "findall" => {
+                    if args.is_empty() { return Err(PyErr::type_error("findall() requires a string argument")); }
+                    let text = unsafe { crate::types::unicode::unicode_value(args[0].as_raw()).to_string() };
+                    let has_groups = re_obj.compiled.captures_len() > 1;
+                    if has_groups {
+                        let mut items = Vec::new();
+                        for caps in re_obj.compiled.captures_iter(&text) {
+                            let groups: Vec<String> = (1..re_obj.compiled.captures_len())
+                                .map(|i| caps.get(i).map(|g| g.as_str().to_string()).unwrap_or_default())
+                                .collect();
+                            if groups.len() == 1 {
+                                items.push(new_str(py, &groups[0])?);
+                            } else {
+                                let mut tup_items = Vec::new();
+                                for g in &groups {
+                                    tup_items.push(new_str(py, g)?);
+                                }
+                                items.push(build_tuple(py, tup_items)?);
+                            }
+                        }
+                        return build_list(py, items);
+                    } else {
+                        let mut items = Vec::new();
+                        for m in re_obj.compiled.find_iter(&text) {
+                            items.push(new_str(py, m.as_str())?);
+                        }
+                        return build_list(py, items);
+                    }
+                }
+                "sub" => {
+                    if args.len() < 2 { return Err(PyErr::type_error("sub() requires repl and string arguments")); }
+                    let repl = unsafe { crate::types::unicode::unicode_value(args[0].as_raw()).to_string() };
+                    let text = unsafe { crate::types::unicode::unicode_value(args[1].as_raw()).to_string() };
+                    let result = re_obj.compiled.replace_all(&text, repl.as_str()).to_string();
+                    return new_str(py, &result);
+                }
+                "split" => {
+                    if args.is_empty() { return Err(PyErr::type_error("split() requires a string argument")); }
+                    let text = unsafe { crate::types::unicode::unicode_value(args[0].as_raw()).to_string() };
+                    let parts: Vec<&str> = re_obj.compiled.split(&text).collect();
+                    let mut items = Vec::new();
+                    for s in parts {
+                        items.push(new_str(py, s)?);
+                    }
+                    return build_list(py, items);
+                }
+                _ => {}
+            }
+        }
+
+        if is_match_marker(marker_val) {
+            let m = unsafe { &*extract_match(marker_val) };
+            match name {
+                "group" => {
+                    let idx = if args.is_empty() { 0 } else {
+                        if is_int(args[0].as_raw()) { get_int_value(args[0].as_raw()) as usize } else { 0 }
+                    };
+                    if idx == 0 {
+                        return new_str(py, &m.full);
+                    } else if idx <= m.groups.len() {
+                        return match &m.groups[idx - 1] {
+                            Some(s) => new_str(py, s),
+                            None => Ok(none_obj(py)),
+                        };
+                    } else {
+                        return Err(PyErr::index_error("no such group"));
+                    }
+                }
+                "groups" => {
+                    let mut items = Vec::new();
+                    for g in &m.groups {
+                        match g {
+                            Some(s) => items.push(new_str(py, s)?),
+                            None => items.push(none_obj(py)),
+                        }
+                    }
+                    return build_tuple(py, items);
+                }
+                "start" => {
+                    return new_int(py, m.start as i64);
+                }
+                "end" => {
+                    return new_int(py, m.end as i64);
+                }
+                "span" => {
+                    let start = new_int(py, m.start as i64)?;
+                    let end = new_int(py, m.end as i64)?;
+                    return build_tuple(py, vec![start, end]);
                 }
                 _ => {}
             }

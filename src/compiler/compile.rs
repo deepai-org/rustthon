@@ -1322,10 +1322,12 @@ impl<'py> Compiler<'py> {
         let name_idx = self.code().add_name(&module_name);
         self.emit(OpCode::ImportName, name_idx);
 
+        let mut is_star = false;
         for alias in &import_from.names {
             let attr_name = alias.name.to_string();
             if attr_name == "*" {
                 self.emit(OpCode::ImportStar, 0);
+                is_star = true;
             } else {
                 let attr_idx = self.code().add_name(&attr_name);
                 self.emit(OpCode::ImportFrom, attr_idx);
@@ -1339,7 +1341,10 @@ impl<'py> Compiler<'py> {
             }
         }
         // Pop the module from stack (ImportName left it there)
-        self.emit(OpCode::PopTop, 0);
+        // ImportStar already pops the module, so skip PopTop for * imports
+        if !is_star {
+            self.emit(OpCode::PopTop, 0);
+        }
 
         Ok(())
     }
