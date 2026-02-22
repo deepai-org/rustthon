@@ -7,6 +7,7 @@
 
 use crate::compiler::bytecode::{CodeObject, OpCode};
 use crate::object::pyobject::{PyObjectRef, RawPyObject};
+use crate::object::typeobj::{RawPyTypeObject, PyType_Type, PyBaseObject_Type, is_type_object};
 use crate::object::safe_api::{
     is_int, is_float, is_str, is_list, is_bool, is_none,
     get_int_value, get_float_value,
@@ -23,6 +24,7 @@ use crate::runtime::pyerr::{PyErr, PyResult};
 use crate::vm::frame::{Frame, CellMap};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::os::raw::c_char;
 use std::ptr;
 use std::rc::Rc;
 
@@ -98,7 +100,7 @@ pub struct RustClass {
 /// A user-defined Python instance (VM-internal representation).
 /// Stored as a Box<RustInstance> pointer encoded in an int constant.
 pub struct RustInstance {
-    pub class: *const RustClass,
+    pub class: *mut RawPyTypeObject,
     /// Instance attributes (set via self.x = value)
     pub attrs: HashMap<String, PyObjectRef>,
 }
@@ -188,6 +190,207 @@ fn extract_match(val: i64) -> *mut RustMatch {
     ((-val) & !7) as usize as *mut RustMatch
 }
 
+// ─── Helper functions for type-object-based classes ───
+
+/// Create a real PyTypeObject for a VM-defined class.
+/// The type object is allocated via libc::calloc and passes PyType_Ready.
+unsafe fn create_vm_type(
+    py: Python<'_>,
+    name: &str,
+    bases: &[*mut RawPyTypeObject],
+    namespace: &HashMap<String, PyObjectRef>,
+    globals: &HashMap<String, PyObjectRef>,
+    builtins: &HashMap<String, PyObjectRef>,
+) -> *mut RawPyTypeObject {
+    let tp = libc::calloc(1, std::mem::size_of::<RawPyTypeObject>()) as *mut RawPyTypeObject;
+    if tp.is_null() {
+        eprintln!("Fatal: out of memory in create_vm_type");
+        std::process::abort();
+    }
+    std::ptr::write(tp, RawPyTypeObject::zeroed());
+
+    // Set metaclass and refcount
+    (*tp).ob_base.ob_type = PyType_Type.get();
+    (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+
+    // Heap-allocate name (must be null-terminated, must outlive the type)
+    let name_bytes = name.as_bytes();
+    let name_buf = libc::malloc(name_bytes.len() + 1) as *mut u8;
+    std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_buf, name_bytes.len());
+    *name_buf.add(name_bytes.len()) = 0;
+    (*tp).tp_name = name_buf as *const c_char;
+
+    // Set basic sizes matching _Rustthon_CreateStubType: 16B PyObject + 8B dict ptr = 24B
+    (*tp).tp_basicsize = 24;
+    (*tp).tp_dictoffset = 16;
+    (*tp).tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
+        | crate::object::typeobj::PY_TPFLAGS_BASETYPE;
+
+    // Set base type
+    if !bases.is_empty() {
+        (*tp).tp_base = bases[0];
+        // Build tp_bases tuple
+        let bases_tuple = crate::types::tuple::PyTuple_New(bases.len() as isize);
+        for (i, &base) in bases.iter().enumerate() {
+            (*(base as *mut RawPyObject)).incref();
+            crate::types::tuple::PyTuple_SetItem(bases_tuple, i as isize, base as *mut RawPyObject);
+        }
+        (*tp).tp_bases = bases_tuple;
+    } else {
+        (*tp).tp_base = PyBaseObject_Type.get();
+    }
+
+    // Call PyType_Ready to inherit slots from base
+    crate::object::typeobj::PyType_Ready(tp);
+
+    // Populate tp_dict with namespace entries
+    let dict = (*tp).tp_dict;
+    for (k, v) in namespace {
+        let key_cstr = std::ffi::CString::new(k.as_str()).unwrap();
+        (*v.as_raw()).incref();
+        crate::types::dict::PyDict_SetItemString(dict, key_cstr.as_ptr(), v.as_raw());
+    }
+
+    // Store VM globals and builtins in tp_dict as special keys
+    let vm_globals_dict = hashmap_to_dict(py, globals);
+    crate::types::dict::PyDict_SetItemString(
+        dict,
+        b"__vm_globals__\0".as_ptr() as *const c_char,
+        vm_globals_dict,
+    );
+    (*vm_globals_dict).decref();
+
+    let vm_builtins_dict = hashmap_to_dict(py, builtins);
+    crate::types::dict::PyDict_SetItemString(
+        dict,
+        b"__vm_builtins__\0".as_ptr() as *const c_char,
+        vm_builtins_dict,
+    );
+    (*vm_builtins_dict).decref();
+
+    tp
+}
+
+/// Convert a Rust HashMap<String, PyObjectRef> to a PyDict.
+unsafe fn hashmap_to_dict(
+    _py: Python<'_>,
+    map: &HashMap<String, PyObjectRef>,
+) -> *mut RawPyObject {
+    let dict = crate::types::dict::PyDict_New();
+    for (k, v) in map {
+        let key_cstr = std::ffi::CString::new(k.as_str()).unwrap();
+        (*v.as_raw()).incref();
+        crate::types::dict::PyDict_SetItemString(dict, key_cstr.as_ptr(), v.as_raw());
+    }
+    dict
+}
+
+/// Convert a PyDict to a Rust HashMap<String, PyObjectRef>.
+unsafe fn dict_to_hashmap(dict: *mut RawPyObject) -> HashMap<String, PyObjectRef> {
+    let mut map = HashMap::new();
+    if dict.is_null() { return map; }
+    let mut pos: isize = 0;
+    let mut key: *mut RawPyObject = ptr::null_mut();
+    let mut value: *mut RawPyObject = ptr::null_mut();
+    while crate::types::dict::PyDict_Next(dict, &mut pos, &mut key, &mut value) != 0 {
+        if key.is_null() || value.is_null() { continue; }
+        if !is_str(key) { continue; }
+        let k = crate::types::unicode::unicode_value(key).to_string();
+        (*value).incref();
+        map.insert(k, PyObjectRef::from_raw(value));
+    }
+    map
+}
+
+/// Extract __vm_globals__ from a type's tp_dict.
+unsafe fn extract_vm_globals(tp: *mut RawPyTypeObject) -> HashMap<String, PyObjectRef> {
+    let dict = (*tp).tp_dict;
+    if dict.is_null() { return HashMap::new(); }
+    let globals = crate::types::dict::PyDict_GetItemString(
+        dict, b"__vm_globals__\0".as_ptr() as *const c_char,
+    );
+    if globals.is_null() { return HashMap::new(); }
+    dict_to_hashmap(globals)
+}
+
+/// Extract __vm_builtins__ from a type's tp_dict.
+unsafe fn extract_vm_builtins(tp: *mut RawPyTypeObject) -> HashMap<String, PyObjectRef> {
+    let dict = (*tp).tp_dict;
+    if dict.is_null() { return HashMap::new(); }
+    let builtins = crate::types::dict::PyDict_GetItemString(
+        dict, b"__vm_builtins__\0".as_ptr() as *const c_char,
+    );
+    if builtins.is_null() { return HashMap::new(); }
+    dict_to_hashmap(builtins)
+}
+
+/// Look up a name in a type's tp_dict, walking tp_base chain and tp_bases tuple.
+unsafe fn type_dict_lookup(tp: *mut RawPyTypeObject, name: &str) -> *mut RawPyObject {
+    let name_cstr = std::ffi::CString::new(name).unwrap();
+    type_dict_lookup_cstr(tp, name_cstr.as_ptr())
+}
+
+/// Internal lookup by C string pointer (avoids repeated CString allocation).
+unsafe fn type_dict_lookup_cstr(tp: *mut RawPyTypeObject, name: *const c_char) -> *mut RawPyObject {
+    if tp.is_null() { return ptr::null_mut(); }
+    // Check own tp_dict
+    let dict = (*tp).tp_dict;
+    if !dict.is_null() {
+        let value = crate::types::dict::PyDict_GetItemString(dict, name);
+        if !value.is_null() {
+            return value;
+        }
+    }
+    // Walk tp_bases (tuple of all base types) for multiple inheritance
+    let bases = (*tp).tp_bases;
+    if !bases.is_null() && crate::types::tuple::PyTuple_Check(bases) != 0 {
+        let n = crate::types::tuple::PyTuple_Size(bases);
+        for i in 0..n {
+            let base = crate::types::tuple::PyTuple_GetItem(bases, i) as *mut RawPyTypeObject;
+            if !base.is_null() {
+                let result = type_dict_lookup_cstr(base, name);
+                if !result.is_null() {
+                    return result;
+                }
+            }
+        }
+    } else if !(*tp).tp_base.is_null() {
+        // Fallback: walk single tp_base chain
+        return type_dict_lookup_cstr((*tp).tp_base, name);
+    }
+    ptr::null_mut()
+}
+
+/// Get the tp_name of a type object as a Rust String.
+unsafe fn type_name(tp: *mut RawPyTypeObject) -> String {
+    if tp.is_null() || (*tp).tp_name.is_null() {
+        return "<type>".to_string();
+    }
+    std::ffi::CStr::from_ptr((*tp).tp_name)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Check if `tp` is the same as or a subtype of `target`, walking tp_bases for multiple inheritance.
+unsafe fn is_subtype_of(tp: *mut RawPyTypeObject, target: *mut RawPyTypeObject) -> bool {
+    if tp.is_null() || target.is_null() { return false; }
+    if tp == target { return true; }
+    // Walk tp_bases tuple (all base types)
+    let bases = (*tp).tp_bases;
+    if !bases.is_null() && crate::types::tuple::PyTuple_Check(bases) != 0 {
+        let n = crate::types::tuple::PyTuple_Size(bases);
+        for i in 0..n {
+            let base = crate::types::tuple::PyTuple_GetItem(bases, i) as *mut RawPyTypeObject;
+            if !base.is_null() && is_subtype_of(base, target) {
+                return true;
+            }
+        }
+    } else if !(*tp).tp_base.is_null() {
+        return is_subtype_of((*tp).tp_base, target);
+    }
+    false
+}
+
 /// Result of resuming a generator frame
 enum GeneratorResult {
     Yielded(PyObjectRef),
@@ -272,10 +475,14 @@ impl VM {
             };
             frame.builtins.insert(decorator_name.to_string(), obj);
         }
+        // Register "object" as the real PyBaseObject_Type
+        unsafe {
+            let base_obj_ptr = PyBaseObject_Type.get() as *mut RawPyObject;
+            (*base_obj_ptr).incref();
+            frame.builtins.insert("object".to_string(), PyObjectRef::from_raw(base_obj_ptr));
+        }
         // Register type builtins that don't already have constructor functions
-        // (str/int/float/bool/list/tuple/dict/set already have CFunction constructors above)
-        // Add bytes as a constructor + type, complex, bytearray, frozenset, object, type
-        for &extra_builtin in &["bytes", "object", "complex", "bytearray", "frozenset",
+        for &extra_builtin in &["bytes", "complex", "bytearray", "frozenset",
                                 "memoryview", "slice"] {
             if !frame.builtins.contains_key(extra_builtin) {
                 let obj = unsafe {
@@ -835,10 +1042,12 @@ impl VM {
                         // Try to find the parent module in cache
                         if let Some(parent_mod) = PY_MODULE_CACHE.lock().unwrap().get(parent_name).cloned() {
                             unsafe {
-                                if crate::types::dict::PyDict_Check(parent_mod.as_raw()) != 0 {
+                                // Get the module's dict — works for both PyModule objects and raw dicts
+                                let parent_dict = crate::types::moduleobject::PyModule_GetDict(parent_mod.as_raw());
+                                if !parent_dict.is_null() {
                                     let key = std::ffi::CString::new(child_name).unwrap();
                                     crate::types::dict::PyDict_SetItemString(
-                                        parent_mod.as_raw(),
+                                        parent_dict,
                                         key.as_ptr(),
                                         module.as_raw(),
                                     );
@@ -853,22 +1062,26 @@ impl VM {
                 OpCode::ImportFrom => {
                     let name = frame.code.names[instr.arg as usize].clone();
                     let module = frame.top()?;
-                    // First try py_get_attr (works for C module objects)
+                    // First try py_get_attr (works for C module objects and PyModule)
                     let attr = py_get_attr(py, &module, &name).or_else(|_| {
-                        // Fall back to dict lookup (for Python source modules stored as dicts)
+                        // Fall back to dict lookup (handles both raw dicts and modules)
                         unsafe {
-                            if crate::types::dict::PyDict_Check(module.as_raw()) != 0 {
-                                let name_cstr = std::ffi::CString::new(name.as_str()).unwrap();
-                                let item = crate::types::dict::PyDict_GetItemString(
-                                    module.as_raw(),
-                                    name_cstr.as_ptr(),
-                                );
-                                PyObjectRef::borrow_or_err(item)
+                            let dict = crate::types::moduleobject::PyModule_GetDict(module.as_raw());
+                            let d = if !dict.is_null() {
+                                dict
+                            } else if crate::types::dict::PyDict_Check(module.as_raw()) != 0 {
+                                module.as_raw()
                             } else {
-                                Err(PyErr::import_error(&format!(
+                                return Err(PyErr::import_error(&format!(
                                     "cannot import name '{}' from module", name
-                                )))
-                            }
+                                )));
+                            };
+                            let name_cstr = std::ffi::CString::new(name.as_str()).unwrap();
+                            let item = crate::types::dict::PyDict_GetItemString(
+                                d,
+                                name_cstr.as_ptr(),
+                            );
+                            PyObjectRef::borrow_or_err(item)
                         }
                     })?;
                     frame.push(attr);
@@ -879,11 +1092,17 @@ impl VM {
                     // Copy all public names from module dict to locals
                     unsafe {
                         let raw = module.as_raw();
-                        // Module is a dict for Python-source modules; otherwise get __dict__
-                        let dict = if crate::types::dict::PyDict_Check(raw) != 0 {
-                            raw
-                        } else {
-                            crate::ffi::object_api::PyObject_GenericGetDict(raw, ptr::null_mut())
+                        // Get the module's dict — try PyModule_GetDict first (handles
+                        // both PyModule objects and raw dicts), then fall back
+                        let dict = {
+                            let d = crate::types::moduleobject::PyModule_GetDict(raw);
+                            if !d.is_null() {
+                                d
+                            } else if crate::types::dict::PyDict_Check(raw) != 0 {
+                                raw
+                            } else {
+                                crate::ffi::object_api::PyObject_GenericGetDict(raw, ptr::null_mut())
+                            }
                         };
                         if !dict.is_null() && crate::types::dict::PyDict_Check(dict) != 0 {
                             // Check for __all__
@@ -962,73 +1181,68 @@ impl VM {
                     let name = frame.code.names[instr.arg as usize].clone();
                     let obj = frame.pop()?;
 
-                    // Check if obj is a RustInstance
-                    if is_int(obj.as_raw()) {
-                        let marker_val = get_int_value(obj.as_raw());
-                        if is_instance_marker(marker_val) {
-                            let inst = unsafe { &*(extract_ptr(marker_val) as *const RustInstance) };
-                            // Look in instance attrs first, then class namespace
-                            if let Some(val) = inst.attrs.get(&name) {
-                                frame.push(val.clone());
+                    // Check if obj is a type object (VM class)
+                    if unsafe { is_type_object(obj.as_raw()) } {
+                        let tp = obj.as_raw() as *mut RawPyTypeObject;
+                        unsafe {
+                            if name == "__dict__" {
+                                let dict = (*tp).tp_dict;
+                                if !dict.is_null() {
+                                    (*dict).incref();
+                                    frame.push(PyObjectRef::from_raw(dict));
+                                } else {
+                                    frame.push(none_obj(py));
+                                }
+                            } else if name == "__name__" {
+                                frame.push(new_str(py, &type_name(tp))?);
                             } else {
-                                let class = unsafe { &*inst.class };
-                                if let Some(val) = class.namespace.get(&name) {
-                                    // If it's a method (function), create a bound method:
-                                    // We push (func, self) pair as a special marker
-                                    if is_int(val.as_raw()) && is_function_marker(get_int_value(val.as_raw())) {
-                                        // Create a bound method: store (func_marker, instance_marker) as tuple
-                                        let bound = build_tuple(py, vec![val.clone(), obj.clone()])?;
+                                let val = type_dict_lookup(tp, &name);
+                                if !val.is_null() {
+                                    // If it's a function, bind the class as first arg
+                                    if is_int(val) && is_function_marker(get_int_value(val)) {
+                                        (*val).incref();
+                                        let val_ref = PyObjectRef::from_raw(val);
+                                        let bound = build_tuple(py, vec![val_ref, obj.clone()])?;
                                         frame.push(bound);
                                     } else {
-                                        frame.push(val.clone());
+                                        (*val).incref();
+                                        frame.push(PyObjectRef::from_raw(val));
                                     }
                                 } else {
                                     return Err(PyErr::attribute_error(&format!(
-                                        "'{}' object has no attribute '{}'", class.name, name
+                                        "type object '{}' has no attribute '{}'",
+                                        type_name(tp), name
                                     )));
                                 }
                             }
-                        } else if is_class_marker(marker_val) {
-                            // Class attribute access
-                            let class = unsafe { &*(extract_ptr(marker_val) as *const RustClass) };
-                            if name == "__dict__" {
-                                // Return the class namespace as a dict
-                                let mut pairs = Vec::new();
-                                for (k, v) in &class.namespace {
-                                    pairs.push((new_str(py, k)?, v.clone()));
-                                }
-                                let dict = build_dict(py, pairs)?;
-                                frame.push(dict);
-                            } else if name == "__name__" {
-                                frame.push(new_str(py, &class.name)?);
-                            } else if let Some(val) = class.namespace.get(&name) {
-                                // If it's a function, bind the class as first arg (classmethod-like)
-                                if is_int(val.as_raw()) && is_function_marker(get_int_value(val.as_raw())) {
-                                    let bound = build_tuple(py, vec![val.clone(), obj.clone()])?;
-                                    frame.push(bound);
-                                } else {
-                                    frame.push(val.clone());
-                                }
+                        }
+                    } else if is_int(obj.as_raw()) {
+                        let marker_val = get_int_value(obj.as_raw());
+                        if is_instance_marker(marker_val) {
+                            let inst = unsafe { &*(extract_ptr(marker_val) as *const RustInstance) };
+                            // Look in instance attrs first, then class tp_dict
+                            if let Some(val) = inst.attrs.get(&name) {
+                                frame.push(val.clone());
                             } else {
-                                // Walk base classes
-                                let mut found = false;
-                                for &base_ptr in &class.bases {
-                                    let base = unsafe { &*base_ptr };
-                                    if let Some(val) = base.namespace.get(&name) {
-                                        if is_int(val.as_raw()) && is_function_marker(get_int_value(val.as_raw())) {
-                                            let bound = build_tuple(py, vec![val.clone(), obj.clone()])?;
+                                unsafe {
+                                    let class_val = type_dict_lookup(inst.class, &name);
+                                    if !class_val.is_null() {
+                                        // If it's a method (function), create a bound method
+                                        if is_int(class_val) && is_function_marker(get_int_value(class_val)) {
+                                            (*class_val).incref();
+                                            let val_ref = PyObjectRef::from_raw(class_val);
+                                            let bound = build_tuple(py, vec![val_ref, obj.clone()])?;
                                             frame.push(bound);
                                         } else {
-                                            frame.push(val.clone());
+                                            (*class_val).incref();
+                                            frame.push(PyObjectRef::from_raw(class_val));
                                         }
-                                        found = true;
-                                        break;
+                                    } else {
+                                        return Err(PyErr::attribute_error(&format!(
+                                            "'{}' object has no attribute '{}'",
+                                            type_name(inst.class), name
+                                        )));
                                     }
-                                }
-                                if !found {
-                                    return Err(PyErr::attribute_error(&format!(
-                                        "type object '{}' has no attribute '{}'", class.name, name
-                                    )));
                                 }
                             }
                         } else if is_regex_marker(marker_val) && (is_regex_method(&name) || name == "pattern") {
@@ -1104,16 +1318,22 @@ impl VM {
                     let obj = frame.pop()?;
                     let value = frame.pop()?;
 
-                    // Check if obj is a RustInstance or RustClass
-                    if is_int(obj.as_raw()) {
+                    // Check if obj is a type object (VM class)
+                    if unsafe { is_type_object(obj.as_raw()) } {
+                        unsafe {
+                            let tp = obj.as_raw() as *mut RawPyTypeObject;
+                            let dict = (*tp).tp_dict;
+                            if !dict.is_null() {
+                                let name_cstr = std::ffi::CString::new(name.as_str()).unwrap();
+                                (*value.as_raw()).incref();
+                                crate::types::dict::PyDict_SetItemString(dict, name_cstr.as_ptr(), value.as_raw());
+                            }
+                        }
+                    } else if is_int(obj.as_raw()) {
                         let marker_val = get_int_value(obj.as_raw());
                         if is_instance_marker(marker_val) {
                             let inst = unsafe { &mut *(extract_ptr(marker_val) as *mut RustInstance) };
                             inst.attrs.insert(name, value);
-                        } else if is_class_marker(marker_val) {
-                            // Set class attribute
-                            let class = unsafe { &mut *(extract_ptr(marker_val) as *mut RustClass) };
-                            class.namespace.insert(name, value);
                         } else {
                             unsafe {
                                 let name_cstr = std::ffi::CString::new(name.as_str()).unwrap();
@@ -1488,12 +1708,13 @@ impl VM {
                             let self_marker = get_int_value(self_item);
                             if is_instance_marker(self_marker) {
                                 let inst = &*(extract_ptr(self_marker) as *const RustInstance);
-                                let class = &*inst.class;
+                                let class_name = type_name(inst.class);
                                 // Create a caller frame with class globals
                                 let mut method_frame = Frame::new(CodeObject::new("<method>".to_string(), "<method>".to_string()));
-                                method_frame.globals = class.globals.clone();
+                                method_frame.globals = extract_vm_globals(inst.class);
                                 // Add class name to globals
-                                method_frame.globals.insert(class.name.clone(), new_int(py, (inst.class as usize as i64) | CLASS_TAG)?);
+                                (*(inst.class as *mut RawPyObject)).incref();
+                                method_frame.globals.insert(class_name, PyObjectRef::from_raw(inst.class as *mut RawPyObject));
                                 for (k, v) in &caller_frame.locals {
                                     if !method_frame.globals.contains_key(k) {
                                         method_frame.globals.insert(k.clone(), v.clone());
@@ -1504,7 +1725,28 @@ impl VM {
                                         method_frame.globals.insert(k.clone(), v.clone());
                                     }
                                 }
-                                method_frame.builtins = class.builtins.clone();
+                                method_frame.builtins = extract_vm_builtins(inst.class);
+                                return self.call_rust_function(py, &method_frame, rust_func, &bound_args, &HashMap::new());
+                            }
+                            // self might be a type object (class method call)
+                            if is_type_object(self_item) {
+                                let tp = self_item as *mut RawPyTypeObject;
+                                let class_name = type_name(tp);
+                                let mut method_frame = Frame::new(CodeObject::new("<method>".to_string(), "<method>".to_string()));
+                                method_frame.globals = extract_vm_globals(tp);
+                                (*(tp as *mut RawPyObject)).incref();
+                                method_frame.globals.insert(class_name, PyObjectRef::from_raw(tp as *mut RawPyObject));
+                                for (k, v) in &caller_frame.locals {
+                                    if !method_frame.globals.contains_key(k) {
+                                        method_frame.globals.insert(k.clone(), v.clone());
+                                    }
+                                }
+                                for (k, v) in &caller_frame.globals {
+                                    if !method_frame.globals.contains_key(k) {
+                                        method_frame.globals.insert(k.clone(), v.clone());
+                                    }
+                                }
+                                method_frame.builtins = extract_vm_builtins(tp);
                                 return self.call_rust_function(py, &method_frame, rust_func, &bound_args, &HashMap::new());
                             }
                             return self.call_rust_function(py, caller_frame, rust_func, &bound_args, &HashMap::new());
@@ -1514,15 +1756,19 @@ impl VM {
             }
         }
 
-        // Check if this is a tagged int marker (RustFunction, RustClass, or RustInstance)
+        // Check if func is a type object (VM class constructor)
+        unsafe {
+            if is_type_object(func.as_raw()) {
+                let tp = func.as_raw() as *mut RawPyTypeObject;
+                return self.construct_instance(py, caller_frame, tp, args);
+            }
+        }
+
+        // Check if this is a tagged int marker (RustFunction or RustInstance)
         if is_int(func.as_raw()) {
             let marker_val = get_int_value(func.as_raw());
             if marker_val != 0 {
-                if is_class_marker(marker_val) {
-                    // Class construction: ClassName(args)
-                    let class_ptr = extract_ptr(marker_val) as *const RustClass;
-                    return self.construct_instance(py, caller_frame, class_ptr, args);
-                } else if is_function_marker(marker_val) {
+                if is_function_marker(marker_val) {
                     // Regular function call
                     let rust_func = unsafe { &*(marker_val as usize as *const RustFunction) };
                     return self.call_rust_function(py, caller_frame, rust_func, args, &HashMap::new());
@@ -1558,14 +1804,19 @@ impl VM {
         pos_args: &[PyObjectRef],
         kwargs: &[(String, PyObjectRef)],
     ) -> PyResult {
+        // Check if func is a type object (VM class constructor)
+        unsafe {
+            if is_type_object(func.as_raw()) {
+                let tp = func.as_raw() as *mut RawPyTypeObject;
+                return self.construct_instance(py, caller_frame, tp, pos_args);
+            }
+        }
+
         // Check if this is a tagged int marker
         if is_int(func.as_raw()) {
             let marker_val = get_int_value(func.as_raw());
             if marker_val != 0 {
-                if is_class_marker(marker_val) {
-                    let class_ptr = extract_ptr(marker_val) as *const RustClass;
-                    return self.construct_instance(py, caller_frame, class_ptr, pos_args);
-                } else if is_function_marker(marker_val) {
+                if is_function_marker(marker_val) {
                     let rust_func = unsafe { &*(marker_val as usize as *const RustFunction) };
                     let kw_map: HashMap<String, PyObjectRef> = kwargs.iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
@@ -1730,19 +1981,17 @@ impl VM {
         result
     }
 
-    /// Construct an instance of a RustClass.
+    /// Construct an instance of a type object (VM class).
     fn construct_instance(
         &mut self,
         py: Python<'_>,
         caller_frame: &Frame,
-        class_ptr: *const RustClass,
+        tp: *mut RawPyTypeObject,
         args: &[PyObjectRef],
     ) -> PyResult {
-        let class = unsafe { &*class_ptr };
-
         // Create a new RustInstance
         let instance = RustInstance {
-            class: class_ptr,
+            class: tp,
             attrs: HashMap::new(),
         };
         let instance_box = Box::new(instance);
@@ -1750,21 +1999,23 @@ impl VM {
         let marker_val = (instance_ptr as usize as i64) | INSTANCE_TAG;
         let instance_obj = new_int(py, marker_val)?;
 
-        // Call __init__ if it exists
-        if let Some(init_func) = class.namespace.get("__init__") {
-            if is_int(init_func.as_raw()) {
-                let init_val = get_int_value(init_func.as_raw());
+        // Call __init__ if it exists in tp_dict
+        unsafe {
+            let init_func = type_dict_lookup(tp, "__init__");
+            if !init_func.is_null() && is_int(init_func) {
+                let init_val = get_int_value(init_func);
                 if is_function_marker(init_val) {
                     // Prepend self to args
                     let mut init_args = vec![instance_obj.clone()];
                     init_args.extend_from_slice(args);
 
                     // Build a temporary frame with class globals
-                    let temp_frame = Frame::new(CodeObject::new("<init>".to_string(), "<init>".to_string()));
-                    let mut combined_frame = temp_frame;
-                    combined_frame.globals = class.globals.clone();
-                    // Also add the class itself to globals so methods can reference it
-                    combined_frame.globals.insert(class.name.clone(), new_int(py, (class_ptr as usize as i64) | CLASS_TAG)?);
+                    let class_name = type_name(tp);
+                    let mut combined_frame = Frame::new(CodeObject::new("<init>".to_string(), "<init>".to_string()));
+                    combined_frame.globals = extract_vm_globals(tp);
+                    // Add the class itself to globals so methods can reference it
+                    (*tp).ob_base.incref();
+                    combined_frame.globals.insert(class_name, PyObjectRef::from_raw(tp as *mut RawPyObject));
                     for (k, v) in &caller_frame.locals {
                         combined_frame.globals.insert(k.clone(), v.clone());
                     }
@@ -1773,9 +2024,9 @@ impl VM {
                             combined_frame.globals.insert(k.clone(), v.clone());
                         }
                     }
-                    combined_frame.builtins = class.builtins.clone();
+                    combined_frame.builtins = extract_vm_builtins(tp);
 
-                    let rust_func = unsafe { &*(init_val as usize as *const RustFunction) };
+                    let rust_func = &*(init_val as usize as *const RustFunction);
                     let _result = self.call_rust_function(py, &combined_frame, rust_func, &init_args, &HashMap::new())?;
                 }
             }
@@ -1784,7 +2035,7 @@ impl VM {
         Ok(instance_obj)
     }
 
-    /// __build_class__ implementation
+    /// __build_class__ implementation — creates a real PyTypeObject.
     fn builtin_build_class(
         &mut self,
         py: Python<'_>,
@@ -1822,24 +2073,35 @@ impl VM {
                 // Execute the class body
                 let _result = self.run_frame(py, &mut ns_frame)?;
 
-                // Collect base class pointers and merge their namespaces.
-                // Iterate in reverse so that the FIRST base (highest MRO priority) wins.
-                let mut base_ptrs: Vec<*const RustClass> = Vec::new();
-                let mut merged_ns = HashMap::new();
-                // First pass: collect base pointers
+                // Collect base type objects
+                let mut base_tps: Vec<*mut RawPyTypeObject> = Vec::new();
                 for base_arg in &args[2..] {
-                    if is_int(base_arg.as_raw()) {
-                        let bval = get_int_value(base_arg.as_raw());
-                        if is_class_marker(bval) {
-                            base_ptrs.push(extract_ptr(bval) as *const RustClass);
+                    unsafe {
+                        if is_type_object(base_arg.as_raw()) {
+                            base_tps.push(base_arg.as_raw() as *mut RawPyTypeObject);
                         }
                     }
                 }
-                // Second pass: merge in reverse order (last base first, first base last = wins)
-                for &base in base_ptrs.iter().rev() {
-                    let base_ref = unsafe { &*base };
-                    for (k, v) in &base_ref.namespace {
-                        merged_ns.insert(k.clone(), v.clone());
+
+                // Merge base namespaces from tp_dicts (reverse order so first base wins)
+                let mut merged_ns: HashMap<String, PyObjectRef> = HashMap::new();
+                for &base in base_tps.iter().rev() {
+                    unsafe {
+                        let bdict = (*base).tp_dict;
+                        if !bdict.is_null() {
+                            let mut pos: isize = 0;
+                            let mut key: *mut RawPyObject = ptr::null_mut();
+                            let mut value: *mut RawPyObject = ptr::null_mut();
+                            while crate::types::dict::PyDict_Next(bdict, &mut pos, &mut key, &mut value) != 0 {
+                                if key.is_null() || value.is_null() { continue; }
+                                if !is_str(key) { continue; }
+                                let k = crate::types::unicode::unicode_value(key).to_string();
+                                // Skip __vm_* special keys
+                                if k.starts_with("__vm_") { continue; }
+                                (*value).incref();
+                                merged_ns.insert(k, PyObjectRef::from_raw(value));
+                            }
+                        }
                     }
                 }
                 // Derived class body overrides base methods
@@ -1847,17 +2109,15 @@ impl VM {
                     merged_ns.insert(k, v);
                 }
 
-                let rust_class = RustClass {
-                    name: class_name.clone(),
-                    bases: base_ptrs,
-                    namespace: merged_ns,
-                    globals: merged_globals,
-                    builtins: caller_frame.builtins.clone(),
+                // Create a real PyTypeObject
+                let tp = unsafe {
+                    create_vm_type(py, &class_name, &base_tps, &merged_ns, &merged_globals, &caller_frame.builtins)
                 };
-                let class_box = Box::new(rust_class);
-                let class_ptr = Box::into_raw(class_box);
-                let marker_val = (class_ptr as usize as i64) | CLASS_TAG;
-                return new_int(py, marker_val);
+
+                // Return the type object as a PyObjectRef (no tag bits needed)
+                unsafe {
+                    return PyObjectRef::steal_or_err(tp as *mut RawPyObject);
+                }
             }
         }
 
@@ -1937,40 +2197,50 @@ impl VM {
                 let code = crate::compiler::compile::compile_source(py, &source, &file_path)
                     .map_err(|e| PyErr::import_error(&format!("{}: {}", name, e)))?;
 
+                // Create a proper PyModule object and pre-register BEFORE execution.
+                // This handles circular imports (e.g., yaml._yaml importing yaml).
+                let pkg = if let Some(pos) = name.rfind('.') { &name[..pos] } else { "" };
+                let module_obj = unsafe {
+                    let name_cstr = std::ffi::CString::new(name).unwrap();
+                    let name_py = crate::types::unicode::PyUnicode_FromString(name_cstr.as_ptr());
+                    let m = crate::types::moduleobject::PyModule_NewObject(name_py);
+                    (*name_py).decref();
+                    let dict = crate::types::moduleobject::PyModule_GetDict(m);
+                    // Set __file__ and __package__
+                    let file_cstr = std::ffi::CString::new(file_path.as_str()).unwrap();
+                    let file_py = crate::types::unicode::PyUnicode_FromString(file_cstr.as_ptr());
+                    crate::types::dict::PyDict_SetItemString(dict, b"__file__\0".as_ptr() as *const c_char, file_py);
+                    (*file_py).decref();
+                    let pkg_cstr = std::ffi::CString::new(pkg).unwrap();
+                    let pkg_py = crate::types::unicode::PyUnicode_FromString(pkg_cstr.as_ptr());
+                    crate::types::dict::PyDict_SetItemString(dict, b"__package__\0".as_ptr() as *const c_char, pkg_py);
+                    (*pkg_py).decref();
+                    PyObjectRef::from_raw(m)
+                };
+                PY_MODULE_CACHE.lock().unwrap().insert(name.to_string(), module_obj.clone());
+                unsafe {
+                    crate::module::registry::register_module(name, module_obj.as_raw());
+                }
+
                 // Execute the module code
                 let mut module_frame = Frame::new(code);
-                // Copy builtins from caller
                 module_frame.builtins = caller_frame.builtins.clone();
                 let _result = self.run_frame(py, &mut module_frame)?;
 
-                // Build a module dict from the module's locals
-                let mut pairs = Vec::new();
-                let name_key = new_str(py, "__name__")?;
-                let name_val = new_str(py, name)?;
-                pairs.push((name_key, name_val));
-                let file_key = new_str(py, "__file__")?;
-                let file_val = new_str(py, &file_path)?;
-                pairs.push((file_key, file_val));
-                // __package__: for "yaml.reader", package is "yaml"
-                let pkg = if let Some(pos) = name.rfind('.') { &name[..pos] } else { "" };
-                let pkg_key = new_str(py, "__package__")?;
-                let pkg_val = new_str(py, pkg)?;
-                pairs.push((pkg_key, pkg_val));
-
-                for (k, v) in &module_frame.locals {
-                    let key = new_str(py, k)?;
-                    pairs.push((key, v.clone()));
-                }
-                let module_dict = build_dict(py, pairs)?;
-
-                // Cache it
-                PY_MODULE_CACHE.lock().unwrap().insert(name.to_string(), module_dict.clone());
-                // Also register in C API module registry so C extensions can find it
+                // After execution, add all locals to the module dict
                 unsafe {
-                    crate::module::registry::register_module(name, module_dict.as_raw());
+                    let dict = crate::types::moduleobject::PyModule_GetDict(module_obj.as_raw());
+                    for (k, v) in &module_frame.locals {
+                        let key_c = std::ffi::CString::new(k.as_str()).unwrap();
+                        crate::types::dict::PyDict_SetItemString(
+                            dict,
+                            key_c.as_ptr(),
+                            v.as_raw(),
+                        );
+                    }
                 }
 
-                return Ok(module_dict);
+                return Ok(module_obj);
             }
 
             // Try package: module_name/__init__.py
@@ -1982,39 +2252,53 @@ impl VM {
                 let code = crate::compiler::compile::compile_source(py, &source, &pkg_path)
                     .map_err(|e| PyErr::import_error(&format!("{}: {}", name, e)))?;
 
+                // Create a proper PyModule object and pre-register BEFORE execution.
+                // This handles circular imports (e.g., yaml._yaml importing yaml).
+                let module_obj = unsafe {
+                    let name_cstr = std::ffi::CString::new(name).unwrap();
+                    let name_py = crate::types::unicode::PyUnicode_FromString(name_cstr.as_ptr());
+                    let m = crate::types::moduleobject::PyModule_NewObject(name_py);
+                    (*name_py).decref();
+                    let dict = crate::types::moduleobject::PyModule_GetDict(m);
+                    // Set __file__, __path__, __package__
+                    let file_cstr = std::ffi::CString::new(pkg_path.as_str()).unwrap();
+                    let file_py = crate::types::unicode::PyUnicode_FromString(file_cstr.as_ptr());
+                    crate::types::dict::PyDict_SetItemString(dict, b"__file__\0".as_ptr() as *const c_char, file_py);
+                    (*file_py).decref();
+                    let path_str = format!("{}/{}", dir, file_stem);
+                    let path_cstr = std::ffi::CString::new(path_str.as_str()).unwrap();
+                    let path_py = crate::types::unicode::PyUnicode_FromString(path_cstr.as_ptr());
+                    crate::types::dict::PyDict_SetItemString(dict, b"__path__\0".as_ptr() as *const c_char, path_py);
+                    (*path_py).decref();
+                    let pkg_cstr = std::ffi::CString::new(name).unwrap();
+                    let pkg_py = crate::types::unicode::PyUnicode_FromString(pkg_cstr.as_ptr());
+                    crate::types::dict::PyDict_SetItemString(dict, b"__package__\0".as_ptr() as *const c_char, pkg_py);
+                    (*pkg_py).decref();
+                    PyObjectRef::from_raw(m)
+                };
+                PY_MODULE_CACHE.lock().unwrap().insert(name.to_string(), module_obj.clone());
+                unsafe {
+                    crate::module::registry::register_module(name, module_obj.as_raw());
+                }
+
                 let mut module_frame = Frame::new(code);
                 module_frame.builtins = caller_frame.builtins.clone();
                 let _result = self.run_frame(py, &mut module_frame)?;
 
-                let mut pairs = Vec::new();
-                let name_key = new_str(py, "__name__")?;
-                let name_val = new_str(py, name)?;
-                pairs.push((name_key, name_val));
-                let file_key = new_str(py, "__file__")?;
-                let file_val = new_str(py, &pkg_path)?;
-                pairs.push((file_key, file_val));
-                // __path__ for package
-                let path_key = new_str(py, "__path__")?;
-                let path_val = new_str(py, &format!("{}/{}", dir, file_stem))?;
-                pairs.push((path_key, path_val));
-                // __package__: for a package, __package__ == __name__
-                let pkg_key = new_str(py, "__package__")?;
-                let pkg_val = new_str(py, name)?;
-                pairs.push((pkg_key, pkg_val));
-
-                for (k, v) in &module_frame.locals {
-                    let key = new_str(py, k)?;
-                    pairs.push((key, v.clone()));
-                }
-                let module_dict = build_dict(py, pairs)?;
-
-                PY_MODULE_CACHE.lock().unwrap().insert(name.to_string(), module_dict.clone());
-                // Also register in C API module registry
+                // After execution, add all locals to the module dict
                 unsafe {
-                    crate::module::registry::register_module(name, module_dict.as_raw());
+                    let dict = crate::types::moduleobject::PyModule_GetDict(module_obj.as_raw());
+                    for (k, v) in &module_frame.locals {
+                        let key_c = std::ffi::CString::new(k.as_str()).unwrap();
+                        crate::types::dict::PyDict_SetItemString(
+                            dict,
+                            key_c.as_ptr(),
+                            v.as_raw(),
+                        );
+                    }
                 }
 
-                return Ok(module_dict);
+                return Ok(module_obj);
             }
         }
 
@@ -3279,20 +3563,19 @@ unsafe fn isinstance_check(obj: *mut RawPyObject, tp: *mut RawPyObject) -> bool 
         }
     }
 
-    // RustClass-aware isinstance: check if obj is an instance of a RustClass (or subclass)
-    if is_int(tp) {
-        let tp_val = get_int_value(tp);
-        if is_class_marker(tp_val) {
-            let target_class = extract_ptr(tp_val) as *const RustClass;
-            if is_int(obj) {
-                let obj_val = get_int_value(obj);
-                if is_instance_marker(obj_val) {
-                    let inst = &*(extract_ptr(obj_val) as *const RustInstance);
-                    return isinstance_class_check(inst.class, target_class);
-                }
+    // Type-object-aware isinstance: check if obj is an instance of a VM type
+    if is_type_object(tp) {
+        let target_tp = tp as *mut RawPyTypeObject;
+        // Check if obj is a tagged instance marker
+        if is_int(obj) {
+            let obj_val = get_int_value(obj);
+            if is_instance_marker(obj_val) {
+                let inst = &*(extract_ptr(obj_val) as *const RustInstance);
+                return is_subtype_of(inst.class, target_tp);
             }
-            return false;
         }
+        // Check ob_type chain for non-int objects
+        return is_subtype_of((*obj).ob_type, target_tp);
     }
 
     // Check tp_base chain for subclass matching (C types)
@@ -3301,25 +3584,12 @@ unsafe fn isinstance_check(obj: *mut RawPyObject, tp: *mut RawPyObject) -> bool 
         if base == tp {
             return true;
         }
-        let tp_ref = base as *const crate::object::typeobj::RawPyTypeObject;
+        let tp_ref = base as *const RawPyTypeObject;
         let next_base = (*tp_ref).tp_base;
         if next_base.is_null() { break; }
         base = next_base as *mut RawPyObject;
     }
 
-    false
-}
-
-/// Check if obj_class is the same as or a subclass of target_class.
-unsafe fn isinstance_class_check(obj_class: *const RustClass, target_class: *const RustClass) -> bool {
-    if obj_class == target_class { return true; }
-    // Walk the bases chain
-    let class = &*obj_class;
-    for &base_ptr in &class.bases {
-        if isinstance_class_check(base_ptr, target_class) {
-            return true;
-        }
-    }
     false
 }
 
@@ -3329,21 +3599,21 @@ unsafe extern "C" fn builtin_hasattr(
     let obj = crate::types::tuple::PyTuple_GetItem(args, 0);
     let name = crate::types::tuple::PyTuple_GetItem(args, 1);
     if obj.is_null() || name.is_null() { return crate::object::safe_api::py_false(); }
-    // Handle our tagged int markers for instances/classes
+    // Handle type objects (VM classes)
+    if is_type_object(obj) {
+        let attr_name = crate::types::unicode::unicode_value(name).to_string();
+        let val = type_dict_lookup(obj as *mut RawPyTypeObject, &attr_name);
+        return if !val.is_null() { crate::object::safe_api::py_true() } else { crate::object::safe_api::py_false() };
+    }
+    // Handle our tagged int markers for instances
     if is_int(obj) {
         let marker_val = get_int_value(obj);
         let attr_name = crate::types::unicode::unicode_value(name).to_string();
         if is_instance_marker(marker_val) {
             let inst = &*(extract_ptr(marker_val) as *const RustInstance);
             if inst.attrs.contains_key(&attr_name) { return crate::object::safe_api::py_true(); }
-            let class = &*inst.class;
-            if class.namespace.contains_key(&attr_name) { return crate::object::safe_api::py_true(); }
-            return crate::object::safe_api::py_false();
-        }
-        if is_class_marker(marker_val) {
-            let class = &*(extract_ptr(marker_val) as *const RustClass);
-            if class.namespace.contains_key(&attr_name) { return crate::object::safe_api::py_true(); }
-            return crate::object::safe_api::py_false();
+            let val = type_dict_lookup(inst.class, &attr_name);
+            return if !val.is_null() { crate::object::safe_api::py_true() } else { crate::object::safe_api::py_false() };
         }
     }
     let result = crate::ffi::object_api::PyObject_GetAttr(obj, name);
@@ -3362,7 +3632,22 @@ unsafe extern "C" fn builtin_getattr(
     let nargs = crate::types::tuple::PyTuple_Size(args);
     let obj = crate::types::tuple::PyTuple_GetItem(args, 0);
     let name = crate::types::tuple::PyTuple_GetItem(args, 1);
-    // Handle our tagged int markers for instances/classes
+    // Handle type objects (VM classes)
+    if is_type_object(obj) {
+        let attr_name = crate::types::unicode::unicode_value(name).to_string();
+        let val = type_dict_lookup(obj as *mut RawPyTypeObject, &attr_name);
+        if !val.is_null() {
+            (*val).incref();
+            return val;
+        }
+        if nargs >= 3 {
+            let default = crate::types::tuple::PyTuple_GetItem(args, 2);
+            (*default).incref();
+            return default;
+        }
+        return ptr::null_mut();
+    }
+    // Handle our tagged int markers for instances
     if is_int(obj) {
         let marker_val = get_int_value(obj);
         let attr_name = crate::types::unicode::unicode_value(name).to_string();
@@ -3373,25 +3658,10 @@ unsafe extern "C" fn builtin_getattr(
                 (*raw).incref();
                 return raw;
             }
-            let class = &*inst.class;
-            if let Some(val) = class.namespace.get(&attr_name) {
-                let raw = val.as_raw();
-                (*raw).incref();
-                return raw;
-            }
-            if nargs >= 3 {
-                let default = crate::types::tuple::PyTuple_GetItem(args, 2);
-                (*default).incref();
-                return default;
-            }
-            return ptr::null_mut();
-        }
-        if is_class_marker(marker_val) {
-            let class = &*(extract_ptr(marker_val) as *const RustClass);
-            if let Some(val) = class.namespace.get(&attr_name) {
-                let raw = val.as_raw();
-                (*raw).incref();
-                return raw;
+            let class_val = type_dict_lookup(inst.class, &attr_name);
+            if !class_val.is_null() {
+                (*class_val).incref();
+                return class_val;
             }
             if nargs >= 3 {
                 let default = crate::types::tuple::PyTuple_GetItem(args, 2);

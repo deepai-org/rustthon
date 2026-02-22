@@ -286,15 +286,30 @@ pub unsafe extern "C" fn PyObject_GetAttrString(
             if let Some(getattro) = (*tp).tp_getattro {
                 let name_obj = crate::types::unicode::PyUnicode_FromString(name);
                 let result = getattro(obj, name_obj);
-                // If getattro returned NULL but didn't set an exception, set AttributeError
-                if result.is_null() && crate::runtime::error::PyErr_Occurred().is_null() {
+                (*name_obj).decref();
+                if !result.is_null() {
+                    return result;
+                }
+                // If obj is a dict (Python module registered as dict), try dict item lookup
+                if crate::types::dict::PyDict_Check(obj) != 0 {
+                    // Clear any error from tp_getattro
+                    if !crate::runtime::error::PyErr_Occurred().is_null() {
+                        crate::runtime::error::PyErr_Clear();
+                    }
+                    let item = crate::types::dict::PyDict_GetItemString(obj, name);
+                    if !item.is_null() {
+                        (*item).incref();
+                        return item;
+                    }
+                }
+                // Set AttributeError if not already set
+                if crate::runtime::error::PyErr_Occurred().is_null() {
                     crate::runtime::error::PyErr_SetString(
                         *crate::runtime::error::PyExc_AttributeError.get(),
                         name,
                     );
                 }
-                (*name_obj).decref();
-                return result;
+                return ptr::null_mut();
             }
             // Fall back to tp_getattr (legacy)
             if let Some(getattr) = (*tp).tp_getattr {
@@ -386,20 +401,25 @@ pub unsafe extern "C" fn PyObject_GetAttr(
         if !tp.is_null() {
             if let Some(getattro) = (*tp).tp_getattro {
                 let result = getattro(obj, name);
-                // Debug trace
-                if std::env::var("RUSTTHON_TRACE").is_ok() && result.is_null() {
-                    let name_str = crate::types::unicode::PyUnicode_AsUTF8(name);
-                    let attr = if !name_str.is_null() {
-                        std::ffi::CStr::from_ptr(name_str).to_string_lossy().into_owned()
-                    } else { "(null)".to_string() };
-                    let tp_name = if !(*tp).tp_name.is_null() {
-                        std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy().into_owned()
-                    } else { "(null)".to_string() };
-                    eprintln!("[rustthon] PyObject_GetAttr: '{}' NOT FOUND on type '{}', err_set={}",
-                        attr, tp_name, !crate::runtime::error::PyErr_Occurred().is_null());
+                if !result.is_null() {
+                    return result;
+                }
+                // Dict-item fallback for Python modules registered as dicts
+                if crate::types::dict::PyDict_Check(obj) != 0 {
+                    if !crate::runtime::error::PyErr_Occurred().is_null() {
+                        crate::runtime::error::PyErr_Clear();
+                    }
+                    let name_cstr = crate::types::unicode::PyUnicode_AsUTF8(name);
+                    if !name_cstr.is_null() {
+                        let item = crate::types::dict::PyDict_GetItemString(obj, name_cstr);
+                        if !item.is_null() {
+                            (*item).incref();
+                            return item;
+                        }
+                    }
                 }
                 // Ensure exception is set on failure
-                if result.is_null() && crate::runtime::error::PyErr_Occurred().is_null() {
+                if crate::runtime::error::PyErr_Occurred().is_null() {
                     let name_cstr = crate::types::unicode::PyUnicode_AsUTF8(name);
                     let attr = if !name_cstr.is_null() {
                         std::ffi::CStr::from_ptr(name_cstr).to_string_lossy().into_owned()
@@ -1083,6 +1103,16 @@ pub unsafe extern "C" fn PyObject_CallFinalizerFromDealloc(
         }
         0
     })
+}
+
+/// PyVectorcall_Function — return the vectorcall function pointer for a callable,
+/// or NULL if the object doesn't support vectorcall (caller falls back to tp_call).
+/// Our types don't use vectorcall, so always return NULL.
+#[no_mangle]
+pub unsafe extern "C" fn PyVectorcall_Function(
+    _callable: *mut RawPyObject,
+) -> *const std::ffi::c_void {
+    std::ptr::null()
 }
 
 /// PyObject_VectorcallDict — call a callable with args array + kwargs dict.

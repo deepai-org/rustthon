@@ -188,6 +188,11 @@ pub unsafe extern "C" fn PyModule_GetDict(module: *mut RawPyObject) -> *mut RawP
         if module.is_null() {
             return ptr::null_mut();
         }
+        // If the "module" is actually a dict (e.g. from Python VM imports),
+        // return it directly instead of trying to access ModuleData.
+        if crate::types::dict::PyDict_Check(module) != 0 {
+            return module;
+        }
         let data = PyObjectWithData::<ModuleData>::data_from_raw(module);
         data.dict
     })
@@ -200,8 +205,16 @@ pub unsafe extern "C" fn PyModule_GetName(module: *mut RawPyObject) -> *const c_
         if module.is_null() {
             return ptr::null();
         }
+        // If the "module" is a dict (from Python VM imports), look up "__name__"
+        if crate::types::dict::PyDict_Check(module) != 0 {
+            let key = b"__name__\0".as_ptr() as *const c_char;
+            let name_obj = crate::types::dict::PyDict_GetItemString(module, key);
+            if !name_obj.is_null() && crate::types::unicode::PyUnicode_Check(name_obj) != 0 {
+                return crate::types::unicode::PyUnicode_AsUTF8(name_obj);
+            }
+            return ptr::null();
+        }
         let data = PyObjectWithData::<ModuleData>::data_from_raw(module);
-        // This is a slight hack - we need a stable pointer to the name
         data.name.as_ptr() as *const c_char
     })
 }

@@ -65,10 +65,35 @@ pub unsafe fn load_extension(path: &Path, name: &str) -> Result<*mut RawPyObject
     let module = init();
 
     if module.is_null() {
+        // Check if an exception was set during init
+        let exc_detail = unsafe {
+            let err_type = crate::runtime::error::PyErr_Occurred();
+            if !err_type.is_null() {
+                let mut ptype: *mut RawPyObject = std::ptr::null_mut();
+                let mut pvalue: *mut RawPyObject = std::ptr::null_mut();
+                let mut ptb: *mut RawPyObject = std::ptr::null_mut();
+                crate::runtime::error::PyErr_Fetch(&mut ptype, &mut pvalue, &mut ptb);
+                let type_name = if !ptype.is_null() {
+                    let tp = (*ptype).ob_type;
+                    if !tp.is_null() && !(*tp).tp_name.is_null() {
+                        CStr::from_ptr((*tp).tp_name).to_string_lossy().into_owned()
+                    } else { format!("{:p}", ptype) }
+                } else { "?".to_string() };
+                let value_str = if !pvalue.is_null() && crate::object::safe_api::is_str(pvalue) {
+                    crate::types::unicode::unicode_value(pvalue).to_string()
+                } else if !pvalue.is_null() {
+                    format!("{:p}", pvalue)
+                } else { String::new() };
+                format!(" ({}{}{})", type_name, if value_str.is_empty() { "" } else { ": " }, value_str)
+            } else {
+                String::new()
+            }
+        };
         return Err(format!(
-            "PyInit_{} returned NULL for {}",
+            "PyInit_{} returned NULL for {}{}",
             name,
-            path.display()
+            path.display(),
+            exc_detail
         ));
     }
 

@@ -396,6 +396,23 @@ pub unsafe extern "C" fn PyUnicode_Check(obj: *mut RawPyObject) -> c_int {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn PyUnicode_Compare(
+    left: *mut RawPyObject,
+    right: *mut RawPyObject,
+) -> c_int {
+    crate::ffi::panic_guard::guard_int("PyUnicode_Compare", || unsafe {
+        if left.is_null() || right.is_null() {
+            return -1;
+        }
+        let l = unicode_value(left);
+        let r = unicode_value(right);
+        if l == r { 0 }
+        else if l < r { -1 }
+        else { 1 }
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn PyUnicode_CompareWithASCIIString(
     obj: *mut RawPyObject,
     string: *const c_char,
