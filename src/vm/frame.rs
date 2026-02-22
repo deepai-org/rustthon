@@ -11,6 +11,28 @@ use crate::object::pyobject::PyObjectRef;
 use crate::runtime::pyerr::PyErr;
 use std::collections::HashMap;
 
+/// A block on the block stack (for try/except/finally/loop).
+#[derive(Debug, Clone)]
+pub enum BlockType {
+    /// try/except block: handler_ip is the except handler entry point
+    ExceptHandler { handler_ip: usize },
+    /// try/finally block: handler_ip is the finally handler entry point
+    FinallyHandler { handler_ip: usize },
+    /// Loop block: end_ip is the jump target for break
+    Loop { end_ip: usize },
+    /// Active except handler sentinel (pushed when entering an except handler)
+    /// PopExcept pops this.
+    ActiveExceptHandler,
+}
+
+/// A saved block state, pushed when entering a try/except/finally/loop.
+#[derive(Debug, Clone)]
+pub struct Block {
+    pub block_type: BlockType,
+    /// Stack depth when the block was entered (for unwinding)
+    pub stack_depth: usize,
+}
+
 pub struct Frame {
     /// The code being executed
     pub code: CodeObject,
@@ -24,6 +46,8 @@ pub struct Frame {
     pub globals: HashMap<String, PyObjectRef>,
     /// Built-in functions
     pub builtins: HashMap<String, PyObjectRef>,
+    /// Block stack for try/except/finally/loop unwinding
+    pub block_stack: Vec<Block>,
 }
 
 impl Frame {
@@ -35,6 +59,7 @@ impl Frame {
             locals: HashMap::new(),
             globals: HashMap::new(),
             builtins: HashMap::new(),
+            block_stack: Vec::new(),
         }
     }
 
@@ -70,5 +95,12 @@ impl Frame {
     /// dropped (= decref'd) by HashMap::insert.
     pub fn store_name(&mut self, name: &str, obj: PyObjectRef) {
         self.locals.insert(name.to_string(), obj);
+    }
+
+    /// Unwind the stack to the saved depth (dropping excess values).
+    pub fn unwind_stack_to(&mut self, depth: usize) {
+        while self.stack.len() > depth {
+            let _ = self.stack.pop(); // Drop = decref
+        }
     }
 }

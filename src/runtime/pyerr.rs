@@ -138,6 +138,30 @@ impl PyErr {
         )
     }
 
+    /// Create a RuntimeError with the given message.
+    pub fn runtime_error(msg: &str) -> Self {
+        Self::from_exc_and_msg(
+            unsafe { *crate::runtime::error::PyExc_RuntimeError.get() },
+            msg,
+        )
+    }
+
+    /// Create a ZeroDivisionError with the given message.
+    pub fn zero_division_error(msg: &str) -> Self {
+        Self::from_exc_and_msg(
+            unsafe { *crate::runtime::error::PyExc_ZeroDivisionError.get() },
+            msg,
+        )
+    }
+
+    /// Create a StopIteration.
+    pub fn stop_iteration() -> Self {
+        Self::from_exc_and_msg(
+            unsafe { *crate::runtime::error::PyExc_StopIteration.get() },
+            "",
+        )
+    }
+
     /// Internal helper: set exception via PyErr_SetString, then fetch it back.
     fn from_exc_and_msg(exc_type: *mut RawPyObject, msg: &str) -> Self {
         let cstr = std::ffi::CString::new(msg).unwrap_or_else(|_| {

@@ -69,9 +69,9 @@ pub enum OpCode {
     // ─── Jumps and control flow ───
     /// Absolute jump
     JumpAbsolute = 70,
-    /// Jump if TOS is false (pop)
+    /// Jump if TOS is false (no pop)
     JumpIfFalse = 71,
-    /// Jump if TOS is true (pop)
+    /// Jump if TOS is true (no pop)
     JumpIfTrue = 72,
     /// Pop and jump if false
     PopJumpIfFalse = 73,
@@ -83,8 +83,10 @@ pub enum OpCode {
     CallFunction = 80,
     /// Return TOS from function
     ReturnValue = 81,
-    /// Make a function from code object + name
+    /// Make a function from code object on TOS; arg = number of defaults below code
     MakeFunction = 82,
+    /// Call function with keyword args; arg = total nargs, kw names tuple on TOS
+    CallFunctionKW = 83,
 
     // ─── Container operations ───
     /// Build a list from N items on stack
@@ -103,6 +105,7 @@ pub enum OpCode {
     // ─── Import ───
     ImportName = 100,
     ImportFrom = 101,
+    ImportStar = 102,
 
     // ─── Loop / iterator ───
     GetIter = 110,
@@ -111,12 +114,44 @@ pub enum OpCode {
     // ─── Print (for simple debugging) ───
     PrintExpr = 120,
 
-    // ─── Misc ───
+    // ─── Loop control ───
     Nop = 0,
     SetupLoop = 130,
     PopBlock = 131,
     BreakLoop = 132,
     ContinueLoop = 133,
+
+    // ─── Exception handling ───
+    SetupExcept = 140,
+    SetupFinally = 141,
+    PopExcept = 142,
+    EndFinally = 143,
+    RaiseVarargs = 144,
+
+    // ─── Class ───
+    LoadBuildClass = 150,
+
+    // ─── Delete ───
+    DeleteName = 155,
+    DeleteFast = 156,
+    DeleteAttr = 157,
+    DeleteSubscr = 158,
+
+    // ─── Closure ───
+    LoadDeref = 161,
+    StoreDeref = 162,
+    MakeClosure = 163,
+
+    // ─── Comprehension helpers ───
+    ListAppend = 170,
+    SetAdd = 171,
+    MapAdd = 172,
+
+    // ─── Generator ───
+    YieldValue = 180,
+
+    // ─── Slice ───
+    BuildSlice = 190,
 }
 
 /// A single bytecode instruction
@@ -140,8 +175,20 @@ pub struct CodeObject {
     pub filename: String,
     /// Function name (or "<module>" for top-level)
     pub name: String,
-    /// Number of arguments (for functions)
+    /// Number of positional arguments (for functions)
     pub argcount: u32,
+    /// Number of keyword-only arguments
+    pub kwonlyargcount: u32,
+    /// Whether function has *args
+    pub has_vararg: bool,
+    /// Whether function has **kwargs
+    pub has_kwarg: bool,
+    /// Free variable names (for closures — loaded from enclosing cells)
+    pub freevars: Vec<String>,
+    /// Cell variable names (for closures — captured by inner functions)
+    pub cellvars: Vec<String>,
+    /// Whether this code object is a generator
+    pub is_generator: bool,
 }
 
 impl CodeObject {
@@ -154,6 +201,12 @@ impl CodeObject {
             filename,
             name,
             argcount: 0,
+            kwonlyargcount: 0,
+            has_vararg: false,
+            has_kwarg: false,
+            freevars: Vec::new(),
+            cellvars: Vec::new(),
+            is_generator: false,
         }
     }
 
@@ -171,6 +224,16 @@ impl CodeObject {
         }
         let idx = self.names.len() as u32;
         self.names.push(name.to_string());
+        idx
+    }
+
+    /// Add a local variable name and return its index.
+    pub fn add_varname(&mut self, name: &str) -> u32 {
+        if let Some(idx) = self.varnames.iter().position(|n| n == name) {
+            return idx as u32;
+        }
+        let idx = self.varnames.len() as u32;
+        self.varnames.push(name.to_string());
         idx
     }
 
