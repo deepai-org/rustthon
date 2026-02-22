@@ -96,6 +96,10 @@ pub type NewFunc = unsafe extern "C" fn(
 /// freefunc: void (*)(void *)
 pub type FreeFunc = unsafe extern "C" fn(*mut c_void);
 
+/// visitproc: int (*)(PyObject *, void *)
+/// Used by tp_traverse to visit referenced objects.
+pub type VisitProc = unsafe extern "C" fn(*mut RawPyObject, *mut c_void) -> c_int;
+
 /// PyCFunction: PyObject *(*)(PyObject *, PyObject *)
 pub type PyCFunction =
     unsafe extern "C" fn(*mut RawPyObject, *mut RawPyObject) -> *mut RawPyObject;

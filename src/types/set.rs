@@ -12,9 +12,9 @@
 //!   PyObject *weakreflist   (8 bytes)
 
 use crate::object::pyobject::RawPyObject;
-use crate::object::typeobj::{RawPyTypeObject, PY_TPFLAGS_DEFAULT, PY_TPFLAGS_HAVE_GC};
+use crate::object::typeobj::{RawPyTypeObject, VisitProc, PY_TPFLAGS_DEFAULT, PY_TPFLAGS_HAVE_GC};
 use crate::object::SyncUnsafeCell;
-use std::os::raw::c_int;
+use std::os::raw::{c_int, c_void};
 use std::ptr;
 
 // ─── Struct layouts ───
@@ -230,21 +230,83 @@ unsafe fn set_resize(s: *mut PySetObject, min_used: isize) {
 
 // ─── Dealloc ───
 
+/// Dealloc for set objects.
+/// CPython contract for GC types: (1) untrack, (2) clear members, (3) free.
 unsafe extern "C" fn set_dealloc(obj: *mut RawPyObject) {
+    // 1. Remove from GC tracking BEFORE touching members
+    crate::object::gc::PyObject_GC_UnTrack(obj as *mut c_void);
+    // 2. Clear all key references
     let s = obj as *mut PySetObject;
     let table = (*s).table;
     let mask = (*s).mask as usize;
     for i in 0..=mask {
-        let entry = &*table.add(i);
+        let entry = &mut *table.add(i);
         if is_active(entry) {
-            (*entry.key).decref();
+            let k = entry.key;
+            entry.key = ptr::null_mut();
+            (*k).decref();
         }
     }
     // Free table if heap-allocated
     if table != smalltable_ptr(s) && !table.is_null() {
         libc::free(table as *mut libc::c_void);
     }
-    crate::object::gc::PyObject_GC_Del(obj as *mut libc::c_void);
+    // 3. Free the object (GC head + object)
+    crate::object::gc::PyObject_GC_Del(obj as *mut c_void);
+}
+
+// ─── tp_traverse / tp_clear ───
+
+unsafe extern "C" fn set_traverse(
+    obj: *mut RawPyObject,
+    visit: *mut c_void,
+    arg: *mut c_void,
+) -> c_int {
+    crate::ffi::panic_guard::guard_int("set_traverse", || unsafe {
+        let visit: VisitProc = std::mem::transmute(visit);
+        let s = obj as *mut PySetObject;
+        let table = (*s).table;
+        let mask = (*s).mask as usize;
+        for i in 0..=mask {
+            let entry = &*table.add(i);
+            if is_active(entry) {
+                let ret = visit(entry.key, arg);
+                if ret != 0 {
+                    return ret;
+                }
+            }
+        }
+        0
+    })
+}
+
+unsafe extern "C" fn set_clear_tp(obj: *mut RawPyObject) -> c_int {
+    crate::ffi::panic_guard::guard_int("set_clear_tp", || unsafe {
+        let s = obj as *mut PySetObject;
+        let table = (*s).table;
+        let mask = (*s).mask as usize;
+        for i in 0..=mask {
+            let entry = &mut *table.add(i);
+            if is_active(entry) {
+                (*entry.key).decref();
+            }
+            entry.key = ptr::null_mut();
+            entry.hash = 0;
+        }
+        // Free table if heap-allocated
+        if table != smalltable_ptr(s) && !table.is_null() {
+            libc::free(table as *mut libc::c_void);
+        }
+        // Reset to empty inline table
+        (*s).fill = 0;
+        (*s).used = 0;
+        (*s).mask = (SMALLTABLE_SIZE - 1) as isize;
+        (*s).table = smalltable_ptr(s);
+        for i in 0..SMALLTABLE_SIZE {
+            (*s).smalltable[i] = SetEntry { key: ptr::null_mut(), hash: 0 };
+        }
+        0
+    })
 }
 
 // ─── C API ───
@@ -378,5 +440,7 @@ pub extern "C" fn PySet_Check(obj: *mut RawPyObject) -> c_int {
 
 pub unsafe fn init_set_type() {
     (*PySet_Type.get()).tp_dealloc = Some(set_dealloc);
+    (*PySet_Type.get()).tp_traverse = Some(set_traverse);
+    (*PySet_Type.get()).tp_clear = Some(set_clear_tp);
     (*PySet_Type.get()).tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_HAVE_GC;
 }

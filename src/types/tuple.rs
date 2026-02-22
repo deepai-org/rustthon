@@ -8,9 +8,9 @@
 //! Items are stored inline — no separate heap allocation.
 
 use crate::object::pyobject::{RawPyObject, RawPyVarObject};
-use crate::object::typeobj::{RawPyTypeObject, PY_TPFLAGS_DEFAULT, PY_TPFLAGS_TUPLE_SUBCLASS, PY_TPFLAGS_HAVE_GC};
+use crate::object::typeobj::{RawPyTypeObject, VisitProc, PY_TPFLAGS_DEFAULT, PY_TPFLAGS_TUPLE_SUBCLASS, PY_TPFLAGS_HAVE_GC};
 use crate::object::SyncUnsafeCell;
-use std::os::raw::c_int;
+use std::os::raw::{c_int, c_void};
 use std::ptr;
 
 /// Fixed portion of PyTupleObject (24 bytes).
@@ -43,16 +43,49 @@ pub fn tuple_type() -> *mut RawPyTypeObject {
     PyTuple_Type.get()
 }
 
+/// Dealloc for tuple objects.
+/// CPython contract for GC types: (1) untrack, (2) clear members, (3) free.
 unsafe extern "C" fn tuple_dealloc(obj: *mut RawPyObject) {
+    // 1. Remove from GC tracking BEFORE touching members
+    crate::object::gc::PyObject_GC_UnTrack(obj as *mut c_void);
+    // 2. Decref all items
     let t = obj as *mut PyTupleObject;
     let size = (*t).ob_base.ob_size;
     let items = ob_item(t);
     for i in 0..size as usize {
         let item = *items.add(i);
-        if !item.is_null() { (*item).decref(); }
+        if !item.is_null() {
+            *items.add(i) = ptr::null_mut();
+            (*item).decref();
+        }
     }
-    // GC-tracked: free via GC del (frees from GC head)
-    crate::object::gc::PyObject_GC_Del(obj as *mut libc::c_void);
+    // 3. Free the object (GC head + object)
+    crate::object::gc::PyObject_GC_Del(obj as *mut c_void);
+}
+
+// ─── tp_traverse ───
+
+unsafe extern "C" fn tuple_traverse(
+    obj: *mut RawPyObject,
+    visit: *mut c_void,
+    arg: *mut c_void,
+) -> c_int {
+    crate::ffi::panic_guard::guard_int("tuple_traverse", || unsafe {
+        let visit: VisitProc = std::mem::transmute(visit);
+        let t = obj as *mut PyTupleObject;
+        let size = (*t).ob_base.ob_size;
+        let items = ob_item(t);
+        for i in 0..size as usize {
+            let item = *items.add(i);
+            if !item.is_null() {
+                let ret = visit(item, arg);
+                if ret != 0 {
+                    return ret;
+                }
+            }
+        }
+        0
+    })
 }
 
 // ─── C API ───
@@ -165,5 +198,7 @@ pub extern "C" fn PyTuple_Check(obj: *mut RawPyObject) -> c_int {
 
 pub unsafe fn init_tuple_type() {
     (*PyTuple_Type.get()).tp_dealloc = Some(tuple_dealloc);
+    (*PyTuple_Type.get()).tp_traverse = Some(tuple_traverse);
+    // No tp_clear — tuples are immutable (matches CPython)
     (*PyTuple_Type.get()).tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_TUPLE_SUBCLASS | PY_TPFLAGS_HAVE_GC;
 }

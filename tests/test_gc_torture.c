@@ -636,6 +636,110 @@ static void test_nested_cycle(void) {
 }
 
 /* ═══════════════════════════════════════════════════════
+ *  TEST SUITE 4b: Cycle Collection Verification
+ * ═══════════════════════════════════════════════════════ */
+
+static void test_gc_collect_self_ref_list(void) {
+    printf("\n=== Cycle Collection: Self-Referencing List ===\n");
+
+    /* Create a self-referencing list and drop our local ref.
+     * The list's only remaining reference is from itself (the cycle).
+     * PyGC_Collect should detect and free it. */
+    PyObject *list = PyList_New(0);
+    PyList_Append(list, list);  /* list[0] = list — creates cycle */
+
+    TEST("Self-ref list: refcount >= 2 before drop");
+    CHECK(list->ob_refcnt >= 2, "got %zd", list->ob_refcnt);
+
+    TEST("Self-ref list: is GC-tracked");
+    CHECK(_PyObject_GC_IS_TRACKED(list) == 1, "not tracked");
+
+    /* Drop our local reference. Now only the self-ref keeps it alive. */
+    Py_DecRef(list);
+
+    /* Collect — should find and free the cycle */
+    Py_ssize_t freed = PyGC_Collect();
+    TEST("PyGC_Collect returns > 0 for self-ref list");
+    CHECK(freed > 0, "got %zd", freed);
+}
+
+static void test_gc_collect_list_dict_cycle(void) {
+    printf("\n=== Cycle Collection: List <-> Dict ===\n");
+
+    /* Create list <-> dict cycle, drop all external refs, collect */
+    PyObject *list = PyList_New(0);
+    PyObject *dict = PyDict_New();
+
+    PyList_Append(list, dict);           /* list[0] = dict */
+    PyDict_SetItemString(dict, "back", list); /* dict["back"] = list */
+
+    TEST("List-dict cycle: both tracked");
+    CHECK(_PyObject_GC_IS_TRACKED(list) && _PyObject_GC_IS_TRACKED(dict),
+          "not tracked");
+
+    /* Drop both external refs — only the cycle keeps them alive */
+    Py_DecRef(list);
+    Py_DecRef(dict);
+
+    Py_ssize_t freed = PyGC_Collect();
+    TEST("PyGC_Collect returns > 0 for list<->dict cycle");
+    CHECK(freed > 0, "got %zd", freed);
+}
+
+static void test_gc_collect_non_cyclic_survives(void) {
+    printf("\n=== Cycle Collection: Non-Cyclic Survives ===\n");
+
+    /* Create a list with items but no cycle. It has an external ref.
+     * PyGC_Collect should NOT free it. */
+    PyObject *list = PyList_New(0);
+    PyObject *n1 = PyLong_FromLong(1);
+    PyObject *n2 = PyLong_FromLong(2);
+    PyList_Append(list, n1);
+    PyList_Append(list, n2);
+    Py_DecRef(n1);
+    Py_DecRef(n2);
+
+    Py_ssize_t rc_before = list->ob_refcnt;
+    Py_ssize_t freed = PyGC_Collect();
+
+    TEST("Non-cyclic list survives GC (refcount unchanged)");
+    CHECK(list->ob_refcnt == rc_before, "before=%zd, after=%zd",
+          rc_before, list->ob_refcnt);
+
+    TEST("Non-cyclic list: size still 2");
+    CHECK(PyList_Size(list) == 2, "got %zd", PyList_Size(list));
+
+    Py_DecRef(list);
+    TEST("Non-cyclic cleanup no crash");
+    CHECK(1, "");
+}
+
+static void test_gc_collect_multi_object_cycle(void) {
+    printf("\n=== Cycle Collection: Multi-Object Cycle ===\n");
+
+    /* Create: list1 -> dict -> list2 -> list1 */
+    PyObject *list1 = PyList_New(0);
+    PyObject *dict  = PyDict_New();
+    PyObject *list2 = PyList_New(0);
+
+    PyList_Append(list1, dict);              /* list1[0] = dict */
+    PyDict_SetItemString(dict, "next", list2); /* dict["next"] = list2 */
+    PyList_Append(list2, list1);             /* list2[0] = list1 */
+
+    TEST("3-object cycle created");
+    CHECK(1, "");
+
+    /* Drop all external refs */
+    Py_DecRef(list1);
+    Py_DecRef(dict);
+    Py_DecRef(list2);
+
+    Py_ssize_t freed = PyGC_Collect();
+    TEST("PyGC_Collect returns > 0 for 3-object cycle");
+    CHECK(freed > 0, "got %zd", freed);
+}
+
+/* ═══════════════════════════════════════════════════════
  *  TEST SUITE 5: Object Lifecycle Stress
  * ═══════════════════════════════════════════════════════ */
 
@@ -1008,6 +1112,12 @@ int main(void) {
     test_circular_list_dict();
     test_self_referencing_list();
     test_nested_cycle();
+
+    /* Cycle collection verification */
+    test_gc_collect_self_ref_list();
+    test_gc_collect_list_dict_cycle();
+    test_gc_collect_non_cyclic_survives();
+    test_gc_collect_multi_object_cycle();
 
     /* Object lifecycle */
     test_object_mass_creation();

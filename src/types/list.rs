@@ -6,9 +6,9 @@
 //!   Py_ssize_t allocated     (8 bytes: capacity of ob_item)
 
 use crate::object::pyobject::{RawPyObject, RawPyVarObject};
-use crate::object::typeobj::{RawPyTypeObject, PY_TPFLAGS_DEFAULT, PY_TPFLAGS_LIST_SUBCLASS, PY_TPFLAGS_HAVE_GC};
+use crate::object::typeobj::{RawPyTypeObject, VisitProc, PY_TPFLAGS_DEFAULT, PY_TPFLAGS_LIST_SUBCLASS, PY_TPFLAGS_HAVE_GC};
 use crate::object::SyncUnsafeCell;
-use std::os::raw::c_int;
+use std::os::raw::{c_int, c_void};
 use std::ptr;
 
 /// Exact CPython PyListObject layout.
@@ -81,13 +81,18 @@ unsafe fn list_ensure_capacity(list: *mut PyListObject, needed: isize) {
 }
 
 /// Dealloc for list objects.
+/// CPython contract for GC types: (1) untrack, (2) clear members, (3) free.
 unsafe extern "C" fn list_dealloc(obj: *mut RawPyObject) {
+    // 1. Remove from GC tracking BEFORE touching members.
+    //    If a decref in step 2 triggers a GC run, we must not be traversable.
+    crate::object::gc::PyObject_GC_UnTrack(obj as *mut c_void);
+    // 2. Clear all item references
     let list = obj as *mut PyListObject;
     let size = (*list).ob_base.ob_size;
-    // Decref all items
     if !(*list).ob_item.is_null() {
         for i in 0..size as usize {
             let item = *(*list).ob_item.add(i);
+            *(*list).ob_item.add(i) = ptr::null_mut();
             if !item.is_null() {
                 (*item).decref();
             }
@@ -95,8 +100,52 @@ unsafe extern "C" fn list_dealloc(obj: *mut RawPyObject) {
         // Free the item array
         libc::free((*list).ob_item as *mut libc::c_void);
     }
-    // Free the object itself (GC-tracked: free from GC head)
-    crate::object::gc::PyObject_GC_Del(obj as *mut libc::c_void);
+    // 3. Free the object (GC head + object)
+    crate::object::gc::PyObject_GC_Del(obj as *mut c_void);
+}
+
+// ─── tp_traverse / tp_clear ───
+
+unsafe extern "C" fn list_traverse(
+    obj: *mut RawPyObject,
+    visit: *mut c_void,
+    arg: *mut c_void,
+) -> c_int {
+    crate::ffi::panic_guard::guard_int("list_traverse", || unsafe {
+        let visit: VisitProc = std::mem::transmute(visit);
+        let list = obj as *mut PyListObject;
+        let size = (*list).ob_base.ob_size;
+        if !(*list).ob_item.is_null() {
+            for i in 0..size as usize {
+                let item = *(*list).ob_item.add(i);
+                if !item.is_null() {
+                    let ret = visit(item, arg);
+                    if ret != 0 {
+                        return ret;
+                    }
+                }
+            }
+        }
+        0
+    })
+}
+
+unsafe extern "C" fn list_clear(obj: *mut RawPyObject) -> c_int {
+    crate::ffi::panic_guard::guard_int("list_clear", || unsafe {
+        let list = obj as *mut PyListObject;
+        let size = (*list).ob_base.ob_size;
+        if !(*list).ob_item.is_null() {
+            for i in 0..size as usize {
+                let item = *(*list).ob_item.add(i);
+                *(*list).ob_item.add(i) = ptr::null_mut();
+                if !item.is_null() {
+                    (*item).decref();
+                }
+            }
+        }
+        (*list).ob_base.ob_size = 0;
+        0
+    })
 }
 
 // ─── C API ───
@@ -302,5 +351,7 @@ pub unsafe extern "C" fn PyList_Check(obj: *mut RawPyObject) -> c_int {
 
 pub unsafe fn init_list_type() {
     (*PyList_Type.get()).tp_dealloc = Some(list_dealloc);
+    (*PyList_Type.get()).tp_traverse = Some(list_traverse);
+    (*PyList_Type.get()).tp_clear = Some(list_clear);
     (*PyList_Type.get()).tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_LIST_SUBCLASS | PY_TPFLAGS_HAVE_GC;
 }

@@ -11,9 +11,9 @@
 //! Entries are in insertion order. Index table maps hash -> entry index.
 
 use crate::object::pyobject::RawPyObject;
-use crate::object::typeobj::{RawPyTypeObject, PY_TPFLAGS_DEFAULT, PY_TPFLAGS_DICT_SUBCLASS, PY_TPFLAGS_HAVE_GC};
+use crate::object::typeobj::{RawPyTypeObject, VisitProc, PY_TPFLAGS_DEFAULT, PY_TPFLAGS_DICT_SUBCLASS, PY_TPFLAGS_HAVE_GC};
 use crate::object::SyncUnsafeCell;
-use std::os::raw::c_int;
+use std::os::raw::{c_int, c_void};
 use std::ptr;
 
 // ─── Struct layouts ───
@@ -233,24 +233,30 @@ unsafe fn lookup_key(
 
 // ─── Dealloc ───
 
+/// Dealloc for dict objects.
+/// CPython contract for GC types: (1) untrack, (2) clear members, (3) free.
 unsafe extern "C" fn dict_dealloc(obj: *mut RawPyObject) {
+    // 1. Remove from GC tracking BEFORE touching members
+    crate::object::gc::PyObject_GC_UnTrack(obj as *mut c_void);
+    // 2. Clear all key/value references
     let d = obj as *mut PyDictObject;
     let keys = (*d).ma_keys;
     if !keys.is_null() {
         let entries = dk_entries(keys);
         let n = (*keys).dk_nentries;
         for i in 0..n as usize {
-            let entry = &*entries.add(i);
-            if !entry.me_key.is_null() {
-                (*entry.me_key).decref();
-            }
-            if !entry.me_value.is_null() {
-                (*entry.me_value).decref();
-            }
+            let entry = &mut *entries.add(i);
+            let k = entry.me_key;
+            let v = entry.me_value;
+            entry.me_key = ptr::null_mut();
+            entry.me_value = ptr::null_mut();
+            if !k.is_null() { (*k).decref(); }
+            if !v.is_null() { (*v).decref(); }
         }
         free_keys(keys);
     }
-    crate::object::gc::PyObject_GC_Del(obj as *mut libc::c_void);
+    // 3. Free the object (GC head + object)
+    crate::object::gc::PyObject_GC_Del(obj as *mut c_void);
 }
 
 // ─── Resize ───
@@ -294,6 +300,47 @@ unsafe fn dict_resize(d: *mut PyDictObject, min_used: isize) {
     }
 
     (*d).ma_keys = new_keys;
+}
+
+// ─── tp_traverse / tp_clear ───
+
+unsafe extern "C" fn dict_traverse(
+    obj: *mut RawPyObject,
+    visit: *mut c_void,
+    arg: *mut c_void,
+) -> c_int {
+    crate::ffi::panic_guard::guard_int("dict_traverse", || unsafe {
+        let visit: VisitProc = std::mem::transmute(visit);
+        let d = obj as *mut PyDictObject;
+        let keys = (*d).ma_keys;
+        if !keys.is_null() {
+            let entries = dk_entries(keys);
+            let n = (*keys).dk_nentries;
+            for i in 0..n as usize {
+                let entry = &*entries.add(i);
+                if !entry.me_key.is_null() {
+                    let ret = visit(entry.me_key, arg);
+                    if ret != 0 {
+                        return ret;
+                    }
+                }
+                if !entry.me_value.is_null() {
+                    let ret = visit(entry.me_value, arg);
+                    if ret != 0 {
+                        return ret;
+                    }
+                }
+            }
+        }
+        0
+    })
+}
+
+unsafe extern "C" fn dict_clear_tp(obj: *mut RawPyObject) -> c_int {
+    crate::ffi::panic_guard::guard_int("dict_clear_tp", || unsafe {
+        PyDict_Clear(obj);
+        0
+    })
 }
 
 // ─── C API ───
@@ -696,5 +743,7 @@ pub unsafe extern "C" fn PyDict_Check(obj: *mut RawPyObject) -> c_int {
 
 pub unsafe fn init_dict_type() {
     (*PyDict_Type.get()).tp_dealloc = Some(dict_dealloc);
+    (*PyDict_Type.get()).tp_traverse = Some(dict_traverse);
+    (*PyDict_Type.get()).tp_clear = Some(dict_clear_tp);
     (*PyDict_Type.get()).tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_DICT_SUBCLASS | PY_TPFLAGS_HAVE_GC;
 }
