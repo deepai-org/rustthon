@@ -92,6 +92,7 @@ Type objects are exported as actual ~400-byte `RawPyTypeObject` structs (DATA sy
 - `PyType_Ready` with real slot inheritance from base types
 - Exception hierarchy as real `PyTypeObject` instances with `tp_base` chains
 - 16-byte `PyGC_Head` prepended before all GC-tracked objects
+- Cyclic garbage collector: `tp_traverse`/`tp_clear` for list, tuple, dict, set; mark-and-sweep cycle detection with three-pass INCREF shield; PEP 442 `tp_finalize` with resurrection detection; `tp_is_gc` dynamic opt-out
 - All allocation via `libc::calloc`/`malloc` (not `std::alloc`)
 - Three-tier allocator: `PyMem_Raw*`, `PyMem_*`, `PyObject_*`
 - GIL emulation via `parking_lot::Mutex`
@@ -129,7 +130,7 @@ src/
 │   ├── pyobject.rs     # RawPyObject, RawPyVarObject, PyGCHead, PyObjectWithData<T>
 │   ├── typeobj.rs      # RawPyTypeObject, PyType_Type, PyBaseObject_Type, PyType_Ready
 │   ├── refcount.rs     # Py_IncRef/DecRef exports
-│   └── gc.rs           # GC allocation (_PyObject_GC_New) and tracking
+│   └── gc.rs           # GC allocation, tracking, and cyclic garbage collector
 ├── types/
 │   ├── none.rs         # None singleton (_Py_NoneStruct)
 │   ├── boolobject.rs   # Bool as int subtype, _Py_TrueStruct/_Py_FalseStruct statics
@@ -174,14 +175,14 @@ build.rs                # cc crate build script for varargs.c
 | Test Suite | Tests | What it verifies |
 |------------|-------|------------------|
 | `test_abi.c` | 97 | Struct layouts at byte offsets |
-| `test_gc_torture.c` | 99 | GC headers, cycles, allocator |
+| `test_gc_torture.c` | 109 | GC headers, cycle collection, allocator |
 | `test_ext_driver.c` | 49 | Full C API protocol |
 | `test_markupsafe.c` | 18 | Self-compiled markupsafe |
 | `test_ujson.c` | 48 | Self-compiled ujson |
 | `test_prebuilt.c` | 68 | Prebuilt pip wheel `.so` files |
 | `test_cython.c` | 20 | Cython-compiled extension |
 | `test_bcrypt.c` | 10 | PyO3 bcrypt extension |
-| **TOTAL** | **409** | |
+| **TOTAL** | **419** | |
 
 All 8 suites run via `./run_tests.sh`.
 
