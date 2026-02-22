@@ -124,6 +124,28 @@ struct BoundBuiltinMethod {
     method_name: String,
 }
 
+/// Generator tag (uses same tag space as BOUND_METHOD_TAG but different struct)
+const GENERATOR_TAG: i64 = 3i64 << 62; // shares tag space, distinguished by struct type
+
+/// A Python generator (from functions with yield).
+/// Holds a suspended frame that can be resumed.
+struct RustGenerator {
+    frame: Frame,
+    /// The function this generator was created from (for globals/builtins)
+    func_globals: HashMap<String, PyObjectRef>,
+    func_builtins: HashMap<String, PyObjectRef>,
+    /// Whether the generator has been exhausted
+    exhausted: bool,
+    /// Whether the generator has been started (first next() call done)
+    started: bool,
+}
+
+/// Result of resuming a generator frame
+enum GeneratorResult {
+    Yielded(PyObjectRef),
+    Returned,
+}
+
 /// Target found when unwinding the block stack after an exception.
 enum UnwindTarget {
     ExceptHandler { ip: usize, stack_depth: usize },
@@ -172,6 +194,8 @@ impl VM {
             ("bool", builtin_bool),
             ("float", builtin_float),
             ("hex", builtin_hex),
+            ("oct", builtin_oct),
+            ("bin", builtin_bin),
             ("sorted", builtin_sorted),
             ("reversed", builtin_reversed),
             ("enumerate", builtin_enumerate),
@@ -1202,6 +1226,14 @@ impl VM {
                     return Err(PyErr::type_error("MakeClosure not used — use MakeFunction"));
                 }
 
+                OpCode::YieldValue => {
+                    // YieldValue in the normal execution path means this function
+                    // was called directly (not as a generator). This shouldn't happen
+                    // if is_generator detection works correctly, but handle gracefully.
+                    let val = frame.pop()?;
+                    return Ok(Some(val));
+                }
+
                 _ => {
                     return Err(PyErr::type_error(&format!(
                         "Unimplemented opcode: {:?}", instr.opcode
@@ -1496,6 +1528,24 @@ impl VM {
             child_frame.locals.insert(kwarg_name.clone(), kwargs_dict);
         }
 
+        // If this is a generator function, create a generator object instead of executing
+        if func.code.is_generator {
+            self.call_depth -= 1;
+            let gen = Box::new(RustGenerator {
+                frame: child_frame,
+                func_globals: func.globals.clone(),
+                func_builtins: func.builtins.clone(),
+                exhausted: false,
+                started: false,
+            });
+            let gen_ptr = Box::into_raw(gen) as usize as i64;
+            // Use GENERATOR_TAG to mark this as a generator
+            // We use the same tag as BOUND_METHOD_TAG but distinguish by struct
+            // Actually, let's use a negative marker to distinguish
+            // Store as negative i64 to distinguish from functions/classes/bound methods
+            return new_int(py, -(gen_ptr));
+        }
+
         let result = self.run_frame(py, &mut child_frame);
         self.call_depth -= 1;
         result
@@ -1629,6 +1679,12 @@ impl VM {
         }
         drop(cached);
 
+        // Try builtin stdlib module
+        if let Some(module) = self.try_builtin_module(py, name)? {
+            PY_MODULE_CACHE.lock().unwrap().insert(name.to_string(), module.clone());
+            return Ok(module);
+        }
+
         // Build search paths: directory of the current file, current directory, "."
         let search_dirs: Vec<String> = vec![
             ".".to_string(),
@@ -1714,6 +1770,95 @@ impl VM {
 
         Err(PyErr::import_error(name))
     }
+
+    /// Try to create a builtin stdlib module by name.
+    fn try_builtin_module(
+        &self,
+        py: Python<'_>,
+        name: &str,
+    ) -> Result<Option<PyObjectRef>, PyErr> {
+        let pairs = match name {
+            "sys" => {
+                let mut p = Vec::new();
+                p.push((new_str(py, "__name__")?, new_str(py, "sys")?));
+                p.push((new_str(py, "platform")?, new_str(py, "darwin")?));
+                p.push((new_str(py, "maxsize")?, new_int(py, i64::MAX)?));
+                p.push((new_str(py, "maxunicode")?, new_int(py, 0x10FFFF)?));
+                // version_info as a tuple (3, 11, 0, 'final', 0)
+                let vi = build_tuple(py, vec![
+                    new_int(py, 3)?, new_int(py, 11)?, new_int(py, 0)?,
+                    new_str(py, "final")?, new_int(py, 0)?,
+                ])?;
+                p.push((new_str(py, "version_info")?, vi));
+                p.push((new_str(py, "version")?, new_str(py, "3.11.0 (rustthon)")?));
+                // sys.path as a list
+                let path = build_list(py, vec![new_str(py, ".")?])?;
+                p.push((new_str(py, "path")?, path));
+                // sys.modules as an empty dict (placeholder)
+                let modules = build_dict(py, Vec::new())?;
+                p.push((new_str(py, "modules")?, modules));
+                // sys.argv
+                let argv = build_list(py, vec![new_str(py, "rustthon")?])?;
+                p.push((new_str(py, "argv")?, argv));
+                // sys.executable
+                p.push((new_str(py, "executable")?, new_str(py, "./rustthon")?));
+                // sys.stdin/stdout/stderr as None placeholders
+                p.push((new_str(py, "stdout")?, none_obj(py)));
+                p.push((new_str(py, "stderr")?, none_obj(py)));
+                p.push((new_str(py, "stdin")?, none_obj(py)));
+                // sys.getdefaultencoding()
+                p.push((new_str(py, "byteorder")?, new_str(py, "little")?));
+                p
+            }
+            "os" | "os.path" | "posixpath" => {
+                let mut p = Vec::new();
+                p.push((new_str(py, "__name__")?, new_str(py, name)?));
+                p.push((new_str(py, "sep")?, new_str(py, "/")?));
+                p.push((new_str(py, "altsep")?, none_obj(py)));
+                p.push((new_str(py, "extsep")?, new_str(py, ".")?));
+                p.push((new_str(py, "pathsep")?, new_str(py, ":")?));
+                p.push((new_str(py, "linesep")?, new_str(py, "\n")?));
+                p.push((new_str(py, "curdir")?, new_str(py, ".")?));
+                p.push((new_str(py, "pardir")?, new_str(py, "..")?));
+                p.push((new_str(py, "name")?, new_str(py, "posix")?));
+                // os.getcwd() as a callable
+                let getcwd_fn = unsafe {
+                    PyObjectRef::from_raw(create_builtin_function("getcwd", stdlib_os_getcwd))
+                };
+                p.push((new_str(py, "getcwd")?, getcwd_fn));
+
+                // os.path module as a nested dict
+                let mut path_pairs = Vec::new();
+                path_pairs.push((new_str(py, "__name__")?, new_str(py, "os.path")?));
+                path_pairs.push((new_str(py, "sep")?, new_str(py, "/")?));
+                let join_fn = unsafe {
+                    PyObjectRef::from_raw(create_builtin_function("join", stdlib_os_path_join))
+                };
+                path_pairs.push((new_str(py, "join")?, join_fn));
+                let exists_fn = unsafe {
+                    PyObjectRef::from_raw(create_builtin_function("exists", stdlib_os_path_exists))
+                };
+                path_pairs.push((new_str(py, "exists")?, exists_fn));
+                let dirname_fn = unsafe {
+                    PyObjectRef::from_raw(create_builtin_function("dirname", stdlib_os_path_dirname))
+                };
+                path_pairs.push((new_str(py, "dirname")?, dirname_fn));
+                let basename_fn = unsafe {
+                    PyObjectRef::from_raw(create_builtin_function("basename", stdlib_os_path_basename))
+                };
+                path_pairs.push((new_str(py, "basename")?, basename_fn));
+                let path_mod = build_dict(py, path_pairs)?;
+                p.push((new_str(py, "path")?, path_mod));
+                // os.environ as an empty dict
+                let environ = build_dict(py, Vec::new())?;
+                p.push((new_str(py, "environ")?, environ));
+                p
+            }
+            _ => return Ok(None),
+        };
+        let module_dict = build_dict(py, pairs)?;
+        Ok(Some(module_dict))
+    }
 }
 
 // Global module cache for Python source imports
@@ -1726,6 +1871,16 @@ static PY_MODULE_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, PyO
 /// Stored as a tuple: (source_obj, int_index)
 fn get_iterator(py: Python<'_>, obj: &PyObjectRef) -> PyResult {
     let raw = obj.as_raw();
+
+    // Check for generator (negative int marker)
+    if is_int(raw) {
+        let val = get_int_value(raw);
+        if val < 0 {
+            // Generator — it IS its own iterator, just pass through
+            return Ok(obj.clone());
+        }
+    }
+
     unsafe {
         // If it already has tp_iter, use it
         let tp = (*raw).ob_type;
@@ -1749,6 +1904,26 @@ fn get_iterator(py: Python<'_>, obj: &PyObjectRef) -> PyResult {
 /// Get next item from iterator, or None if exhausted.
 fn iter_next(py: Python<'_>, iter: &PyObjectRef) -> Option<PyObjectRef> {
     let raw = iter.as_raw();
+
+    // Check for generator (negative int marker)
+    if is_int(raw) {
+        let val = get_int_value(raw);
+        if val < 0 {
+            let gen_ptr = (-val) as usize as *mut RustGenerator;
+            let gen = unsafe { &mut *gen_ptr };
+            if gen.exhausted {
+                return None;
+            }
+            // Resume the generator frame
+            match resume_generator(py, gen) {
+                GeneratorResult::Yielded(value) => return Some(value),
+                GeneratorResult::Returned => {
+                    gen.exhausted = true;
+                    return None;
+                }
+            }
+        }
+    }
 
     // Check if it has tp_iternext
     unsafe {
@@ -1821,6 +1996,56 @@ fn iter_next(py: Python<'_>, iter: &PyObjectRef) -> Option<PyObjectRef> {
 
         (*item).incref();
         Some(PyObjectRef::from_raw(item))
+    }
+}
+
+/// Resume a generator frame, executing until YieldValue or ReturnValue.
+fn resume_generator(py: Python<'_>, gen: &mut RustGenerator) -> GeneratorResult {
+    // If generator has already yielded, push None as the "sent" value
+    // (the result of the yield expression). next() sends None; send(v) would send v.
+    if gen.started {
+        gen.frame.push(none_obj(py));
+    }
+    gen.started = true;
+
+    let frame = &mut gen.frame;
+    let mut vm = VM::new(); // Temporary VM for executing generator opcodes
+    let mut saved_exception: Option<PyErr> = None;
+
+    loop {
+        if frame.ip >= frame.code.instructions.len() {
+            return GeneratorResult::Returned;
+        }
+        let instr = frame.code.instructions[frame.ip].clone();
+        frame.ip += 1;
+
+        // Special handling for YieldValue — suspend execution and return value
+        if instr.opcode == OpCode::YieldValue {
+            if let Ok(val) = frame.pop() {
+                return GeneratorResult::Yielded(val);
+            }
+            return GeneratorResult::Returned;
+        }
+
+        // Special handling for ReturnValue — generator is done
+        if instr.opcode == OpCode::ReturnValue {
+            return GeneratorResult::Returned;
+        }
+
+        // Execute other opcodes normally via the VM's execute_opcode
+        match vm.execute_opcode(py, frame, &instr, &mut saved_exception) {
+            Ok(Some(_)) => {
+                // ReturnValue was hit (shouldn't happen here since we catch it above)
+                return GeneratorResult::Returned;
+            }
+            Ok(None) => {
+                // Normal execution, continue
+            }
+            Err(_) => {
+                // Error — treat as exhausted
+                return GeneratorResult::Returned;
+            }
+        }
     }
 }
 
@@ -2586,6 +2811,23 @@ unsafe extern "C" fn builtin_hasattr(
     let obj = crate::types::tuple::PyTuple_GetItem(args, 0);
     let name = crate::types::tuple::PyTuple_GetItem(args, 1);
     if obj.is_null() || name.is_null() { return crate::object::safe_api::py_false(); }
+    // Handle our tagged int markers for instances/classes
+    if is_int(obj) {
+        let marker_val = get_int_value(obj);
+        let attr_name = crate::types::unicode::unicode_value(name).to_string();
+        if is_instance_marker(marker_val) {
+            let inst = &*(extract_ptr(marker_val) as *const RustInstance);
+            if inst.attrs.contains_key(&attr_name) { return crate::object::safe_api::py_true(); }
+            let class = &*inst.class;
+            if class.namespace.contains_key(&attr_name) { return crate::object::safe_api::py_true(); }
+            return crate::object::safe_api::py_false();
+        }
+        if is_class_marker(marker_val) {
+            let class = &*(extract_ptr(marker_val) as *const RustClass);
+            if class.namespace.contains_key(&attr_name) { return crate::object::safe_api::py_true(); }
+            return crate::object::safe_api::py_false();
+        }
+    }
     let result = crate::ffi::object_api::PyObject_GetAttr(obj, name);
     if result.is_null() {
         crate::runtime::error::PyErr_Clear();
@@ -2602,6 +2844,45 @@ unsafe extern "C" fn builtin_getattr(
     let nargs = crate::types::tuple::PyTuple_Size(args);
     let obj = crate::types::tuple::PyTuple_GetItem(args, 0);
     let name = crate::types::tuple::PyTuple_GetItem(args, 1);
+    // Handle our tagged int markers for instances/classes
+    if is_int(obj) {
+        let marker_val = get_int_value(obj);
+        let attr_name = crate::types::unicode::unicode_value(name).to_string();
+        if is_instance_marker(marker_val) {
+            let inst = &*(extract_ptr(marker_val) as *const RustInstance);
+            if let Some(val) = inst.attrs.get(&attr_name) {
+                let raw = val.as_raw();
+                (*raw).incref();
+                return raw;
+            }
+            let class = &*inst.class;
+            if let Some(val) = class.namespace.get(&attr_name) {
+                let raw = val.as_raw();
+                (*raw).incref();
+                return raw;
+            }
+            if nargs >= 3 {
+                let default = crate::types::tuple::PyTuple_GetItem(args, 2);
+                (*default).incref();
+                return default;
+            }
+            return ptr::null_mut();
+        }
+        if is_class_marker(marker_val) {
+            let class = &*(extract_ptr(marker_val) as *const RustClass);
+            if let Some(val) = class.namespace.get(&attr_name) {
+                let raw = val.as_raw();
+                (*raw).incref();
+                return raw;
+            }
+            if nargs >= 3 {
+                let default = crate::types::tuple::PyTuple_GetItem(args, 2);
+                (*default).incref();
+                return default;
+            }
+            return ptr::null_mut();
+        }
+    }
     let result = crate::ffi::object_api::PyObject_GetAttr(obj, name);
     if result.is_null() && nargs >= 3 {
         crate::runtime::error::PyErr_Clear();
@@ -2774,9 +3055,33 @@ unsafe extern "C" fn builtin_repr_fn(
 ) -> *mut RawPyObject {
     let obj = crate::types::tuple::PyTuple_GetItem(args, 0);
     if obj.is_null() { return create_str("None"); }
+    // Handle common types directly for better repr output
+    if is_none(obj) { return create_str("None"); }
+    if is_bool(obj) {
+        return if get_int_value(obj) != 0 { create_str("True") } else { create_str("False") };
+    }
+    if is_int(obj) { return create_str(&format!("{}", get_int_value(obj))); }
+    if is_float(obj) { return create_str(&format!("{}", get_float_value(obj))); }
+    if is_str(obj) {
+        let s = crate::types::unicode::unicode_value(obj);
+        return create_str(&format!("'{}'", s));
+    }
+    // Fall back to PyObject_Repr for other types
     let repr = crate::ffi::object_api::PyObject_Repr(obj);
     if repr.is_null() {
-        create_str(&format!("<object at {:p}>", obj))
+        // Last resort: format as <type object at 0x...>
+        Python::with_gil(|py| {
+            let obj_ref = PyObjectRef::from_raw(obj);
+            (*obj).incref(); // from_raw doesn't incref
+            match py_repr(py, &obj_ref) {
+                Ok(r) => {
+                    let raw = r.as_raw();
+                    (*raw).incref();
+                    raw
+                }
+                Err(_) => create_str(&format!("<object at {:p}>", obj)),
+            }
+        })
     } else {
         repr
     }
@@ -2818,6 +3123,30 @@ unsafe extern "C" fn builtin_hex(
         create_str(&format!("-0x{:x}", -val))
     } else {
         create_str(&format!("0x{:x}", val))
+    }
+}
+
+unsafe extern "C" fn builtin_oct(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let obj = crate::types::tuple::PyTuple_GetItem(args, 0);
+    let val = get_int_value(obj);
+    if val < 0 {
+        create_str(&format!("-0o{:o}", -val))
+    } else {
+        create_str(&format!("0o{:o}", val))
+    }
+}
+
+unsafe extern "C" fn builtin_bin(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let obj = crate::types::tuple::PyTuple_GetItem(args, 0);
+    let val = get_int_value(obj);
+    if val < 0 {
+        create_str(&format!("-0b{:b}", -val))
+    } else {
+        create_str(&format!("0b{:b}", val))
     }
 }
 
@@ -2978,6 +3307,26 @@ unsafe extern "C" fn builtin_list_ctor(
         }
         return result;
     }
+    // Generic iterable: use get_iterator/iter_next for generators and other iterables
+    if is_int(obj) && get_int_value(obj) < 0 {
+        // Generator marker — iterate via resume_generator
+        return Python::with_gil(|py| {
+            (*obj).incref();
+            let gen_obj = PyObjectRef::from_raw(obj);
+            let result = crate::types::list::PyList_New(0);
+            loop {
+                match iter_next(py, &gen_obj) {
+                    Some(item) => {
+                        let raw_item = item.as_raw();
+                        (*raw_item).incref();
+                        crate::types::list::PyList_Append(result, raw_item);
+                    }
+                    None => break,
+                }
+            }
+            result
+        });
+    }
     crate::types::list::PyList_New(0)
 }
 
@@ -3082,6 +3431,74 @@ unsafe extern "C" fn builtin_map(
         return iterable;
     }
     crate::types::list::PyList_New(0)
+}
+
+// ─── Stdlib module functions ───
+
+unsafe extern "C" fn stdlib_os_getcwd(
+    _self: *mut RawPyObject, _args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    create_str(&cwd)
+}
+
+unsafe extern "C" fn stdlib_os_path_join(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let nargs = crate::types::tuple::PyTuple_Size(args);
+    if nargs == 0 { return create_str(""); }
+    let mut result = String::new();
+    for i in 0..nargs {
+        let part = crate::types::tuple::PyTuple_GetItem(args, i);
+        let s = crate::types::unicode::unicode_value(part);
+        if s.starts_with('/') {
+            result = s.to_string();
+        } else if result.is_empty() || result.ends_with('/') {
+            result.push_str(s);
+        } else {
+            result.push('/');
+            result.push_str(s);
+        }
+    }
+    create_str(&result)
+}
+
+unsafe extern "C" fn stdlib_os_path_exists(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let path = crate::types::tuple::PyTuple_GetItem(args, 0);
+    let s = crate::types::unicode::unicode_value(path);
+    if std::path::Path::new(&s).exists() {
+        crate::object::safe_api::py_true()
+    } else {
+        crate::object::safe_api::py_false()
+    }
+}
+
+unsafe extern "C" fn stdlib_os_path_dirname(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let path = crate::types::tuple::PyTuple_GetItem(args, 0);
+    let s = crate::types::unicode::unicode_value(path);
+    let dir = std::path::Path::new(&s)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    create_str(&dir)
+}
+
+unsafe extern "C" fn stdlib_os_path_basename(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let path = crate::types::tuple::PyTuple_GetItem(args, 0);
+    let s = crate::types::unicode::unicode_value(path);
+    let base = std::path::Path::new(&s)
+        .file_name()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    create_str(&base)
 }
 
 // ─── Method detection helpers ───

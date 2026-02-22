@@ -499,6 +499,23 @@ impl<'py> Compiler<'py> {
                 self.compile_expr(&starred.value)?;
             }
 
+            Expr::Yield(yield_expr) => {
+                if let Some(ref value) = yield_expr.value {
+                    self.compile_expr(value)?;
+                } else {
+                    let idx = self.add_none_const();
+                    self.emit(OpCode::LoadConst, idx);
+                }
+                self.emit(OpCode::YieldValue, 0);
+            }
+
+            Expr::YieldFrom(yield_from) => {
+                // Simplified: just yield each item from the iterable
+                self.compile_expr(&yield_from.value)?;
+                self.emit(OpCode::GetIter, 0);
+                // TODO: proper yield from protocol
+            }
+
             Expr::Slice(slice) => {
                 // Compile slice(lower, upper, step) → BuildSlice(nargs)
                 // Push lower (or None), upper (or None), optionally step
@@ -805,6 +822,9 @@ impl<'py> Compiler<'py> {
             func_code.add_varname(&kwarg.arg.to_string());
         }
 
+        // Detect if function is a generator (contains yield)
+        func_code.is_generator = self.contains_yield(&func_def.body);
+
         // Scan for nonlocal declarations first
         let nonlocals = self.scan_nonlocals(&func_def.body);
 
@@ -933,6 +953,49 @@ impl<'py> Compiler<'py> {
             }
             _ => {}
         }
+    }
+
+    /// Check if function body contains any `yield` expressions (generator detection).
+    fn contains_yield(&self, stmts: &[Stmt]) -> bool {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Expr(expr_stmt) => {
+                    if self.expr_contains_yield(&expr_stmt.value) { return true; }
+                }
+                Stmt::Assign(assign) => {
+                    if self.expr_contains_yield(&assign.value) { return true; }
+                }
+                Stmt::Return(ret) => {
+                    if let Some(ref v) = ret.value {
+                        if self.expr_contains_yield(v) { return true; }
+                    }
+                }
+                Stmt::For(for_stmt) => {
+                    if self.contains_yield(&for_stmt.body) { return true; }
+                    if self.contains_yield(&for_stmt.orelse) { return true; }
+                }
+                Stmt::While(while_stmt) => {
+                    if self.contains_yield(&while_stmt.body) { return true; }
+                    if self.contains_yield(&while_stmt.orelse) { return true; }
+                }
+                Stmt::If(if_stmt) => {
+                    if self.contains_yield(&if_stmt.body) { return true; }
+                    if self.contains_yield(&if_stmt.orelse) { return true; }
+                }
+                Stmt::Try(try_stmt) => {
+                    if self.contains_yield(&try_stmt.body) { return true; }
+                    if self.contains_yield(&try_stmt.orelse) { return true; }
+                    if self.contains_yield(&try_stmt.finalbody) { return true; }
+                }
+                // Don't recurse into nested function/class defs
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn expr_contains_yield(&self, expr: &Expr) -> bool {
+        matches!(expr, Expr::Yield(_) | Expr::YieldFrom(_))
     }
 
     /// Scan function body for `nonlocal` declarations (does NOT recurse into nested functions).
