@@ -20,9 +20,11 @@ use crate::object::safe_api::{
 };
 use crate::runtime::gil::Python;
 use crate::runtime::pyerr::{PyErr, PyResult};
-use crate::vm::frame::Frame;
+use crate::vm::frame::{Frame, CellMap};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr;
+use std::rc::Rc;
 
 /// Stored code object for user-defined functions.
 /// The compiler stores a Box<CodeObject> as a raw pointer encoded in an int constant.
@@ -72,6 +74,8 @@ pub struct RustFunction {
     pub builtins: HashMap<String, PyObjectRef>,
     pub defaults: Vec<PyObjectRef>,
     pub name: String,
+    /// Cell map for closures — shared with enclosing/inner functions via Rc.
+    pub cells: Option<CellMap>,
 }
 
 /// A user-defined Python class (VM-internal representation).
@@ -97,19 +101,28 @@ pub struct RustInstance {
 }
 
 // Tag bits to distinguish class/instance/function pointers stored as int markers.
-// We use the high bit of the i64 value:
+// We use the high bits of the i64 value:
 // - Functions: stored as-is (heap pointers, always positive, low bits)
 // - Classes:   pointer | CLASS_TAG
 // - Instances: pointer | INSTANCE_TAG
+// - BoundMethods: pointer | BOUND_METHOD_TAG (for builtin type methods)
 const CLASS_TAG: i64 = 1 << 62;
 const INSTANCE_TAG: i64 = 2i64 << 62;
+const BOUND_METHOD_TAG: i64 = 3i64 << 62;
 const TAG_MASK: i64 = 3i64 << 62;
 const PTR_MASK: i64 = !TAG_MASK;
 
 fn is_class_marker(val: i64) -> bool { val & TAG_MASK == CLASS_TAG }
 fn is_instance_marker(val: i64) -> bool { val & TAG_MASK == INSTANCE_TAG }
+fn is_bound_method_marker(val: i64) -> bool { val & TAG_MASK == BOUND_METHOD_TAG }
 fn is_function_marker(val: i64) -> bool { val != 0 && val & TAG_MASK == 0 }
 fn extract_ptr(val: i64) -> usize { (val & PTR_MASK) as usize }
+
+/// A bound builtin method: self_obj + method name
+struct BoundBuiltinMethod {
+    self_obj: PyObjectRef,
+    method_name: String,
+}
 
 /// Target found when unwinding the block stack after an exception.
 enum UnwindTarget {
@@ -303,6 +316,12 @@ impl VM {
                 OpCode::StoreName => {
                     let name = frame.code.names[instr.arg as usize].clone();
                     let obj = frame.pop()?;
+                    // Sync to cell map if this variable is captured by inner closures
+                    if frame.code.cellvars.contains(&name) {
+                        if let Some(ref cm) = frame.cells {
+                            cm.borrow_mut().insert(name.clone(), obj.clone());
+                        }
+                    }
                     frame.store_name(&name, obj);
                 }
 
@@ -592,12 +611,39 @@ impl VM {
                         for (k, v) in &frame.locals {
                             captured_globals.insert(k.clone(), v.clone());
                         }
+
+                        // Capture cells for closures: if the inner function has
+                        // freevars, it needs access to the enclosing scope's cells.
+                        // We share the same CellMap via Rc so writes are visible.
+                        let cells = if !code.freevars.is_empty() {
+                            // Get or create the enclosing frame's cell map
+                            let cell_map = frame.cells.get_or_insert_with(|| {
+                                Rc::new(RefCell::new(HashMap::new()))
+                            });
+                            // Seed any freevars that are currently in frame.locals
+                            // but not yet in the cell map
+                            {
+                                let mut cm = cell_map.borrow_mut();
+                                for fv in &code.freevars {
+                                    if !cm.contains_key(fv) {
+                                        if let Some(val) = frame.locals.get(fv) {
+                                            cm.insert(fv.clone(), val.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            Some(Rc::clone(cell_map))
+                        } else {
+                            None
+                        };
+
                         let rust_func = RustFunction {
                             code,
                             globals: captured_globals,
                             builtins: frame.builtins.clone(),
                             defaults,
                             name: func_name,
+                            cells,
                         };
                         let func_box = Box::new(rust_func);
                         let func_ptr = Box::into_raw(func_box);
@@ -815,25 +861,42 @@ impl VM {
                             frame.push(attr);
                         }
                     } else {
-                        // Non-int object — use C API
-                        let attr = py_get_attr(py, &obj, &name)
-                            .or_else(|_| {
-                                unsafe {
-                                    if crate::types::dict::PyDict_Check(obj.as_raw()) != 0 {
-                                        let name_cstr = std::ffi::CString::new(name.as_str()).unwrap();
-                                        let item = crate::types::dict::PyDict_GetItemString(
-                                            obj.as_raw(),
-                                            name_cstr.as_ptr(),
-                                        );
-                                        PyObjectRef::borrow_or_err(item)
-                                    } else {
-                                        Err(PyErr::attribute_error(&format!(
-                                            "object has no attribute '{}'", name
-                                        )))
+                        // Check for string/list/dict methods before falling to C API
+                        let raw = obj.as_raw();
+                        let has_method = unsafe {
+                            (is_str(raw) && is_str_method(&name)) ||
+                            (crate::types::list::PyList_Check(raw) != 0 && is_list_method(&name)) ||
+                            (crate::types::dict::PyDict_Check(raw) != 0 && is_dict_method(&name))
+                        };
+                        if has_method {
+                            let bm = Box::new(BoundBuiltinMethod {
+                                self_obj: obj.clone(),
+                                method_name: name.clone(),
+                            });
+                            let bm_ptr = Box::into_raw(bm) as usize as i64;
+                            let marker = new_int(py, bm_ptr | BOUND_METHOD_TAG)?;
+                            frame.push(marker);
+                        } else {
+                            // Non-int object — use C API
+                            let attr = py_get_attr(py, &obj, &name)
+                                .or_else(|_| {
+                                    unsafe {
+                                        if crate::types::dict::PyDict_Check(obj.as_raw()) != 0 {
+                                            let name_cstr = std::ffi::CString::new(name.as_str()).unwrap();
+                                            let item = crate::types::dict::PyDict_GetItemString(
+                                                obj.as_raw(),
+                                                name_cstr.as_ptr(),
+                                            );
+                                            PyObjectRef::borrow_or_err(item)
+                                        } else {
+                                            Err(PyErr::attribute_error(&format!(
+                                                "object has no attribute '{}'", name
+                                            )))
+                                        }
                                     }
-                                }
-                            })?;
-                        frame.push(attr);
+                                })?;
+                            frame.push(attr);
+                        }
                     }
                 }
 
@@ -949,6 +1012,12 @@ impl VM {
                 OpCode::StoreFast => {
                     let name = frame.code.varnames[instr.arg as usize].clone();
                     let obj = frame.pop()?;
+                    // Sync to cell map if this variable is captured by inner closures
+                    if frame.code.cellvars.contains(&name) {
+                        if let Some(ref cm) = frame.cells {
+                            cm.borrow_mut().insert(name.clone(), obj.clone());
+                        }
+                    }
                     frame.locals.insert(name, obj);
                 }
 
@@ -1086,6 +1155,53 @@ impl VM {
                     }
                 }
 
+                // ─── Slice ───
+                OpCode::BuildSlice => {
+                    // BuildSlice(2): pop upper, lower → push (lower, upper, None) as slice tuple
+                    // BuildSlice(3): pop step, upper, lower → push (lower, upper, step) as slice tuple
+                    let nargs = instr.arg;
+                    if nargs == 3 {
+                        let step = frame.pop()?;
+                        let upper = frame.pop()?;
+                        let lower = frame.pop()?;
+                        let slice = build_tuple(py, vec![lower, upper, step])?;
+                        frame.push(slice);
+                    } else {
+                        let upper = frame.pop()?;
+                        let lower = frame.pop()?;
+                        let step = none_obj(py);
+                        let slice = build_tuple(py, vec![lower, upper, step])?;
+                        frame.push(slice);
+                    }
+                }
+
+                // ─── Closure operations ───
+                OpCode::LoadDeref => {
+                    let name = &frame.code.freevars[instr.arg as usize];
+                    let val = frame.cells.as_ref()
+                        .and_then(|cm| cm.borrow().get(name).cloned())
+                        .ok_or_else(|| PyErr::runtime_error(
+                            &format!("free variable '{}' referenced before assignment in enclosing scope", name)
+                        ))?;
+                    frame.push(val);
+                }
+
+                OpCode::StoreDeref => {
+                    let name = frame.code.freevars[instr.arg as usize].clone();
+                    let val = frame.pop()?;
+                    if let Some(ref cm) = frame.cells {
+                        cm.borrow_mut().insert(name, val);
+                    } else {
+                        return Err(PyErr::runtime_error("StoreDeref without cell map"));
+                    }
+                }
+
+                OpCode::MakeClosure => {
+                    // Same as MakeFunction but currently unused —
+                    // closures go through MakeFunction + freevars detection
+                    return Err(PyErr::type_error("MakeClosure not used — use MakeFunction"));
+                }
+
                 _ => {
                     return Err(PyErr::type_error(&format!(
                         "Unimplemented opcode: {:?}", instr.opcode
@@ -1130,6 +1246,16 @@ impl VM {
         args: &[PyObjectRef],
         _kwargs: &[(String, PyObjectRef)],
     ) -> PyResult {
+        // Check for bound builtin method (string/list/dict methods)
+        if is_int(func.as_raw()) {
+            let marker_val = get_int_value(func.as_raw());
+            if is_bound_method_marker(marker_val) {
+                let bm_ptr = extract_ptr(marker_val) as *const BoundBuiltinMethod;
+                let bm = unsafe { &*bm_ptr };
+                return call_bound_method(py, bm, args);
+            }
+        }
+
         // Check for bound method (2-tuple: (func_marker, instance_marker))
         unsafe {
             if crate::types::tuple::PyTuple_Check(func.as_raw()) != 0 {
@@ -1292,6 +1418,16 @@ impl VM {
             if !child_frame.builtins.contains_key(k) {
                 child_frame.builtins.insert(k.clone(), v.clone());
             }
+        }
+
+        // Pass cell map for closures (inner function receiving parent's cells)
+        if func.cells.is_some() {
+            child_frame.cells = func.cells.clone();
+        }
+        // If this function has cellvars (it's an outer function whose variables
+        // will be captured by inner closures), initialize its cell map
+        if !func.code.cellvars.is_empty() && child_frame.cells.is_none() {
+            child_frame.cells = Some(Rc::new(RefCell::new(HashMap::new())));
         }
 
         // Bind arguments to locals
@@ -1821,22 +1957,49 @@ fn binary_floordiv(py: Python<'_>, left: &PyObjectRef, right: &PyObjectRef) -> P
 fn binary_mod(py: Python<'_>, left: &PyObjectRef, right: &PyObjectRef) -> PyResult {
     let (l, r) = (left.as_raw(), right.as_raw());
     if is_str(l) {
-        // String formatting: "hello %s" % "world"
         let fmt = crate::types::unicode::unicode_value(l);
-        let val_str = if is_str(r) {
-            crate::types::unicode::unicode_value(r).to_string()
-        } else if is_int(r) {
-            format!("{}", get_int_value(r))
-        } else if is_float(r) {
-            format!("{}", get_float_value(r))
-        } else {
-            format!("{:?}", r)
-        };
-        // Simple %s/%d/%r replacement
-        let result = fmt.replacen("%s", &val_str, 1)
-            .replacen("%d", &val_str, 1)
-            .replacen("%r", &val_str, 1);
-        return new_str(py, &result);
+        // Collect format values — if right is a tuple, extract items
+        let mut values: Vec<String> = Vec::new();
+        unsafe {
+            if crate::types::tuple::PyTuple_Check(r) != 0 {
+                let n = crate::types::tuple::PyTuple_Size(r);
+                for i in 0..n {
+                    let item = crate::types::tuple::PyTuple_GetItem(r, i);
+                    values.push(format_pyobj(item));
+                }
+            } else {
+                values.push(format_pyobj(r));
+            }
+        }
+        // Replace %s, %d, %r, %f in order
+        let mut result = fmt.to_string();
+        let mut val_idx = 0;
+        let mut i = 0;
+        let chars: Vec<char> = result.chars().collect();
+        let mut output = String::new();
+        while i < chars.len() {
+            if chars[i] == '%' && i + 1 < chars.len() {
+                match chars[i + 1] {
+                    's' | 'd' | 'r' | 'f' | 'i' => {
+                        if val_idx < values.len() {
+                            output.push_str(&values[val_idx]);
+                            val_idx += 1;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    '%' => {
+                        output.push('%');
+                        i += 2;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            output.push(chars[i]);
+            i += 1;
+        }
+        return new_str(py, &output);
     }
     if is_int(l) && is_int(r) {
         let lv = get_int_value(l);
@@ -1999,9 +2162,75 @@ fn objs_equal(a: *mut RawPyObject, b: *mut RawPyObject) -> bool {
     false
 }
 
-fn subscr_fallback(_py: Python<'_>, obj: &PyObjectRef, key: &PyObjectRef) -> PyResult {
+fn subscr_fallback(py: Python<'_>, obj: &PyObjectRef, key: &PyObjectRef) -> PyResult {
     let (o, k) = (obj.as_raw(), key.as_raw());
     unsafe {
+        // Check if key is a slice tuple (lower, upper, step)
+        if crate::types::tuple::PyTuple_Check(k) != 0 {
+            let size = crate::types::tuple::PyTuple_Size(k);
+            if size == 3 {
+                // This is a slice operation
+                let lower_raw = crate::types::tuple::PyTuple_GetItem(k, 0);
+                let upper_raw = crate::types::tuple::PyTuple_GetItem(k, 1);
+                let _step_raw = crate::types::tuple::PyTuple_GetItem(k, 2);
+
+                if is_str(o) {
+                    let s = crate::types::unicode::unicode_value(o);
+                    let chars: Vec<char> = s.chars().collect();
+                    let len = chars.len() as i64;
+                    let start = if is_none(lower_raw) { 0 } else {
+                        let v = get_int_value(lower_raw);
+                        if v < 0 { std::cmp::max(0, len + v) } else { std::cmp::min(v, len) }
+                    };
+                    let end = if is_none(upper_raw) { len } else {
+                        let v = get_int_value(upper_raw);
+                        if v < 0 { std::cmp::max(0, len + v) } else { std::cmp::min(v, len) }
+                    };
+                    if start >= end {
+                        return new_str(py, "");
+                    }
+                    let sliced: String = chars[start as usize..end as usize].iter().collect();
+                    return new_str(py, &sliced);
+                }
+
+                if crate::types::list::PyList_Check(o) != 0 {
+                    let len = crate::types::list::PyList_Size(o) as i64;
+                    let start = if is_none(lower_raw) { 0 } else {
+                        let v = get_int_value(lower_raw);
+                        if v < 0 { std::cmp::max(0, len + v) } else { std::cmp::min(v, len) }
+                    };
+                    let end = if is_none(upper_raw) { len } else {
+                        let v = get_int_value(upper_raw);
+                        if v < 0 { std::cmp::max(0, len + v) } else { std::cmp::min(v, len) }
+                    };
+                    let mut items = Vec::new();
+                    for i in start..end {
+                        let item = crate::types::list::PyList_GetItem(o, i as isize);
+                        items.push(PyObjectRef::borrow_or_err(item)?);
+                    }
+                    return build_list(py, items);
+                }
+
+                if crate::types::tuple::PyTuple_Check(o) != 0 {
+                    let len = crate::types::tuple::PyTuple_Size(o) as i64;
+                    let start = if is_none(lower_raw) { 0 } else {
+                        let v = get_int_value(lower_raw);
+                        if v < 0 { std::cmp::max(0, len + v) } else { std::cmp::min(v, len) }
+                    };
+                    let end = if is_none(upper_raw) { len } else {
+                        let v = get_int_value(upper_raw);
+                        if v < 0 { std::cmp::max(0, len + v) } else { std::cmp::min(v, len) }
+                    };
+                    let mut items = Vec::new();
+                    for i in start..end {
+                        let item = crate::types::tuple::PyTuple_GetItem(o, i as isize);
+                        items.push(PyObjectRef::borrow_or_err(item)?);
+                    }
+                    return build_tuple(py, items);
+                }
+            }
+        }
+
         if crate::types::list::PyList_Check(o) != 0 {
             let idx = get_int_value(k) as isize;
             let len = crate::types::list::PyList_Size(o);
@@ -2853,4 +3082,449 @@ unsafe extern "C" fn builtin_map(
         return iterable;
     }
     crate::types::list::PyList_New(0)
+}
+
+// ─── Method detection helpers ───
+
+fn is_str_method(name: &str) -> bool {
+    matches!(name,
+        "upper" | "lower" | "strip" | "lstrip" | "rstrip" |
+        "split" | "join" | "replace" | "find" | "rfind" |
+        "startswith" | "endswith" | "count" | "index" |
+        "isdigit" | "isalpha" | "isalnum" | "isspace" |
+        "title" | "capitalize" | "swapcase" | "center" |
+        "ljust" | "rjust" | "zfill" | "format" | "encode"
+    )
+}
+
+fn is_list_method(name: &str) -> bool {
+    matches!(name,
+        "append" | "extend" | "insert" | "remove" | "pop" |
+        "clear" | "index" | "count" | "sort" | "reverse" | "copy"
+    )
+}
+
+fn is_dict_method(name: &str) -> bool {
+    matches!(name,
+        "keys" | "values" | "items" | "get" | "pop" |
+        "update" | "clear" | "copy" | "setdefault"
+    )
+}
+
+/// Execute a bound builtin method (string/list/dict methods)
+fn call_bound_method(py: Python<'_>, bm: &BoundBuiltinMethod, args: &[PyObjectRef]) -> PyResult {
+    let raw = bm.self_obj.as_raw();
+    let name = bm.method_name.as_str();
+
+    unsafe {
+        // ─── String methods ───
+        if is_str(raw) {
+            let s = crate::types::unicode::unicode_value(raw);
+            match name {
+                "upper" => return new_str(py, &s.to_uppercase()),
+                "lower" => return new_str(py, &s.to_lowercase()),
+                "strip" => return new_str(py, s.trim()),
+                "lstrip" => return new_str(py, s.trim_start()),
+                "rstrip" => return new_str(py, s.trim_end()),
+                "title" => {
+                    let result: String = s.split_whitespace()
+                        .map(|w| {
+                            let mut c = w.chars();
+                            match c.next() {
+                                None => String::new(),
+                                Some(f) => {
+                                    let upper: String = f.to_uppercase().collect();
+                                    upper + &c.as_str().to_lowercase()
+                                }
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    return new_str(py, &result);
+                }
+                "capitalize" => {
+                    if s.is_empty() { return new_str(py, ""); }
+                    let mut chars = s.chars();
+                    let first: String = chars.next().unwrap().to_uppercase().collect();
+                    let rest: String = chars.as_str().to_lowercase();
+                    return new_str(py, &format!("{}{}", first, rest));
+                }
+                "swapcase" => {
+                    let result: String = s.chars().map(|c| {
+                        if c.is_uppercase() { c.to_lowercase().to_string() }
+                        else { c.to_uppercase().to_string() }
+                    }).collect();
+                    return new_str(py, &result);
+                }
+                "split" => {
+                    let sep = if !args.is_empty() && is_str(args[0].as_raw()) {
+                        crate::types::unicode::unicode_value(args[0].as_raw()).to_string()
+                    } else {
+                        " ".to_string()
+                    };
+                    let parts: Vec<PyObjectRef> = if sep == " " && (args.is_empty() || !is_str(args[0].as_raw())) {
+                        // Default split: split on any whitespace
+                        s.split_whitespace()
+                            .map(|p| new_str(py, p).unwrap())
+                            .collect()
+                    } else {
+                        s.split(&sep)
+                            .map(|p| new_str(py, p).unwrap())
+                            .collect()
+                    };
+                    return build_list(py, parts);
+                }
+                "join" => {
+                    if args.is_empty() {
+                        return Err(PyErr::type_error("join() takes exactly one argument"));
+                    }
+                    let iterable_raw = args[0].as_raw();
+                    let mut parts = Vec::new();
+                    if crate::types::list::PyList_Check(iterable_raw) != 0 {
+                        let n = crate::types::list::PyList_Size(iterable_raw);
+                        for i in 0..n {
+                            let item = crate::types::list::PyList_GetItem(iterable_raw, i);
+                            if is_str(item) {
+                                parts.push(crate::types::unicode::unicode_value(item).to_string());
+                            }
+                        }
+                    } else if crate::types::tuple::PyTuple_Check(iterable_raw) != 0 {
+                        let n = crate::types::tuple::PyTuple_Size(iterable_raw);
+                        for i in 0..n {
+                            let item = crate::types::tuple::PyTuple_GetItem(iterable_raw, i);
+                            if is_str(item) {
+                                parts.push(crate::types::unicode::unicode_value(item).to_string());
+                            }
+                        }
+                    }
+                    return new_str(py, &parts.join(&s));
+                }
+                "replace" => {
+                    if args.len() < 2 {
+                        return Err(PyErr::type_error("replace() takes at least 2 arguments"));
+                    }
+                    let old = crate::types::unicode::unicode_value(args[0].as_raw());
+                    let new_s = crate::types::unicode::unicode_value(args[1].as_raw());
+                    return new_str(py, &s.replace(&old, &new_s));
+                }
+                "find" => {
+                    if args.is_empty() {
+                        return Err(PyErr::type_error("find() takes at least 1 argument"));
+                    }
+                    let substr = crate::types::unicode::unicode_value(args[0].as_raw());
+                    let idx = s.find(&substr).map(|i| i as i64).unwrap_or(-1);
+                    return new_int(py, idx);
+                }
+                "rfind" => {
+                    if args.is_empty() {
+                        return Err(PyErr::type_error("rfind() takes at least 1 argument"));
+                    }
+                    let substr = crate::types::unicode::unicode_value(args[0].as_raw());
+                    let idx = s.rfind(&substr).map(|i| i as i64).unwrap_or(-1);
+                    return new_int(py, idx);
+                }
+                "startswith" => {
+                    if args.is_empty() {
+                        return Err(PyErr::type_error("startswith() takes at least 1 argument"));
+                    }
+                    let prefix = crate::types::unicode::unicode_value(args[0].as_raw());
+                    return Ok(if s.starts_with(&prefix) { true_obj(py) } else { false_obj(py) });
+                }
+                "endswith" => {
+                    if args.is_empty() {
+                        return Err(PyErr::type_error("endswith() takes at least 1 argument"));
+                    }
+                    let suffix = crate::types::unicode::unicode_value(args[0].as_raw());
+                    return Ok(if s.ends_with(&suffix) { true_obj(py) } else { false_obj(py) });
+                }
+                "count" => {
+                    if args.is_empty() {
+                        return Err(PyErr::type_error("count() takes at least 1 argument"));
+                    }
+                    let sub = crate::types::unicode::unicode_value(args[0].as_raw());
+                    return new_int(py, s.matches(&sub).count() as i64);
+                }
+                "isdigit" => return Ok(if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) { true_obj(py) } else { false_obj(py) }),
+                "isalpha" => return Ok(if !s.is_empty() && s.chars().all(|c| c.is_alphabetic()) { true_obj(py) } else { false_obj(py) }),
+                "isalnum" => return Ok(if !s.is_empty() && s.chars().all(|c| c.is_alphanumeric()) { true_obj(py) } else { false_obj(py) }),
+                "isspace" => return Ok(if !s.is_empty() && s.chars().all(|c| c.is_whitespace()) { true_obj(py) } else { false_obj(py) }),
+                "encode" => {
+                    let bytes = s.as_bytes();
+                    let result = crate::types::bytes::PyBytes_FromStringAndSize(
+                        bytes.as_ptr() as *const std::ffi::c_char,
+                        bytes.len() as isize,
+                    );
+                    return PyObjectRef::steal_or_err(result);
+                }
+                "format" => {
+                    // Simple str.format with positional args
+                    let mut result = s.to_string();
+                    for (i, arg) in args.iter().enumerate() {
+                        let placeholder = format!("{{{}}}", i);
+                        let val_str = format_pyobj(arg.as_raw());
+                        result = result.replacen(&placeholder, &val_str, 1);
+                    }
+                    // Also handle bare {}
+                    for arg in args.iter() {
+                        let val_str = format_pyobj(arg.as_raw());
+                        result = result.replacen("{}", &val_str, 1);
+                    }
+                    return new_str(py, &result);
+                }
+                _ => {}
+            }
+        }
+
+        // ─── List methods ───
+        if crate::types::list::PyList_Check(raw) != 0 {
+            match name {
+                "append" => {
+                    if args.is_empty() {
+                        return Err(PyErr::type_error("append() takes exactly one argument"));
+                    }
+                    (*args[0].as_raw()).incref();
+                    crate::types::list::PyList_Append(raw, args[0].as_raw());
+                    return Ok(none_obj(py));
+                }
+                "extend" => {
+                    if args.is_empty() {
+                        return Err(PyErr::type_error("extend() takes exactly one argument"));
+                    }
+                    let iterable = args[0].as_raw();
+                    if crate::types::list::PyList_Check(iterable) != 0 {
+                        let n = crate::types::list::PyList_Size(iterable);
+                        for i in 0..n {
+                            let item = crate::types::list::PyList_GetItem(iterable, i);
+                            (*item).incref();
+                            crate::types::list::PyList_Append(raw, item);
+                        }
+                    }
+                    return Ok(none_obj(py));
+                }
+                "insert" => {
+                    if args.len() < 2 {
+                        return Err(PyErr::type_error("insert() takes exactly 2 arguments"));
+                    }
+                    let idx = get_int_value(args[0].as_raw());
+                    (*args[1].as_raw()).incref();
+                    crate::types::list::PyList_Insert(raw, idx as isize, args[1].as_raw());
+                    return Ok(none_obj(py));
+                }
+                "pop" => {
+                    let n = crate::types::list::PyList_Size(raw);
+                    if n == 0 {
+                        return Err(PyErr::type_error("pop from empty list"));
+                    }
+                    let idx = if !args.is_empty() {
+                        get_int_value(args[0].as_raw()) as isize
+                    } else {
+                        n - 1
+                    };
+                    let real_idx = if idx < 0 { n + idx } else { idx };
+                    let item = crate::types::list::PyList_GetItem(raw, real_idx);
+                    let result = PyObjectRef::borrow_or_err(item)?;
+                    // Shift elements down
+                    for i in real_idx..n-1 {
+                        let next = crate::types::list::PyList_GetItem(raw, i+1);
+                        (*next).incref();
+                        crate::types::list::PyList_SetItem(raw, i, next);
+                    }
+                    let list_obj = raw as *mut crate::types::list::PyListObject;
+                    (*list_obj).ob_base.ob_size -= 1;
+                    return Ok(result);
+                }
+                "reverse" => {
+                    let n = crate::types::list::PyList_Size(raw);
+                    for i in 0..n/2 {
+                        let a = crate::types::list::PyList_GetItem(raw, i);
+                        let b = crate::types::list::PyList_GetItem(raw, n-1-i);
+                        (*a).incref();
+                        (*b).incref();
+                        crate::types::list::PyList_SetItem(raw, i, b);
+                        crate::types::list::PyList_SetItem(raw, n-1-i, a);
+                    }
+                    return Ok(none_obj(py));
+                }
+                "sort" => {
+                    let n = crate::types::list::PyList_Size(raw) as usize;
+                    let mut items: Vec<(i64, *mut RawPyObject)> = Vec::new();
+                    for i in 0..n {
+                        let item = crate::types::list::PyList_GetItem(raw, i as isize);
+                        let key = if is_int(item) { get_int_value(item) }
+                                  else if is_float(item) { get_float_value(item) as i64 }
+                                  else { 0 };
+                        items.push((key, item));
+                    }
+                    items.sort_by_key(|(k, _)| *k);
+                    for (i, (_, item)) in items.iter().enumerate() {
+                        (**item).incref();
+                        crate::types::list::PyList_SetItem(raw, i as isize, *item);
+                    }
+                    return Ok(none_obj(py));
+                }
+                "copy" => {
+                    let n = crate::types::list::PyList_Size(raw);
+                    let mut items = Vec::new();
+                    for i in 0..n {
+                        let item = crate::types::list::PyList_GetItem(raw, i);
+                        items.push(PyObjectRef::borrow_or_err(item)?);
+                    }
+                    return build_list(py, items);
+                }
+                "clear" => {
+                    let list_obj = raw as *mut crate::types::list::PyListObject;
+                    (*list_obj).ob_base.ob_size = 0;
+                    return Ok(none_obj(py));
+                }
+                "count" => {
+                    if args.is_empty() {
+                        return Err(PyErr::type_error("count() takes exactly one argument"));
+                    }
+                    let target = args[0].as_raw();
+                    let n = crate::types::list::PyList_Size(raw);
+                    let mut count = 0i64;
+                    for i in 0..n {
+                        let item = crate::types::list::PyList_GetItem(raw, i);
+                        if objects_equal(item, target) {
+                            count += 1;
+                        }
+                    }
+                    return new_int(py, count);
+                }
+                "index" => {
+                    if args.is_empty() {
+                        return Err(PyErr::type_error("index() takes at least 1 argument"));
+                    }
+                    let target = args[0].as_raw();
+                    let n = crate::types::list::PyList_Size(raw);
+                    for i in 0..n {
+                        let item = crate::types::list::PyList_GetItem(raw, i);
+                        if objects_equal(item, target) {
+                            return new_int(py, i as i64);
+                        }
+                    }
+                    return Err(PyErr::runtime_error("value not in list"));
+                }
+                "remove" => {
+                    if args.is_empty() {
+                        return Err(PyErr::type_error("remove() takes exactly one argument"));
+                    }
+                    return Ok(none_obj(py));
+                }
+                _ => {}
+            }
+        }
+
+        // ─── Dict methods ───
+        if crate::types::dict::PyDict_Check(raw) != 0 {
+            match name {
+                "keys" => {
+                    let keys = crate::types::dict::PyDict_Keys(raw);
+                    return PyObjectRef::steal_or_err(keys);
+                }
+                "values" => {
+                    let vals = crate::types::dict::PyDict_Values(raw);
+                    return PyObjectRef::steal_or_err(vals);
+                }
+                "items" => {
+                    let items = crate::types::dict::PyDict_Items(raw);
+                    return PyObjectRef::steal_or_err(items);
+                }
+                "get" => {
+                    if args.is_empty() {
+                        return Err(PyErr::type_error("get() takes at least 1 argument"));
+                    }
+                    let key = args[0].as_raw();
+                    let item = crate::types::dict::PyDict_GetItem(raw, key);
+                    if item.is_null() {
+                        if args.len() > 1 {
+                            return Ok(args[1].clone());
+                        }
+                        return Ok(none_obj(py));
+                    }
+                    return PyObjectRef::borrow_or_err(item);
+                }
+                "pop" => {
+                    if args.is_empty() {
+                        return Err(PyErr::type_error("pop() takes at least 1 argument"));
+                    }
+                    let key = args[0].as_raw();
+                    let item = crate::types::dict::PyDict_GetItem(raw, key);
+                    if item.is_null() {
+                        if args.len() > 1 {
+                            return Ok(args[1].clone());
+                        }
+                        return Err(PyErr::runtime_error("KeyError"));
+                    }
+                    let result = PyObjectRef::borrow_or_err(item)?;
+                    crate::types::dict::PyDict_DelItem(raw, key);
+                    return Ok(result);
+                }
+                "update" => {
+                    if !args.is_empty() {
+                        let other = args[0].as_raw();
+                        crate::types::dict::PyDict_Update(raw, other);
+                    }
+                    return Ok(none_obj(py));
+                }
+                "clear" => {
+                    crate::types::dict::PyDict_Clear(raw);
+                    return Ok(none_obj(py));
+                }
+                "copy" => {
+                    let copy = crate::types::dict::PyDict_Copy(raw);
+                    return PyObjectRef::steal_or_err(copy);
+                }
+                "setdefault" => {
+                    if args.is_empty() {
+                        return Err(PyErr::type_error("setdefault() takes at least 1 argument"));
+                    }
+                    let key = args[0].as_raw();
+                    let item = crate::types::dict::PyDict_GetItem(raw, key);
+                    if !item.is_null() {
+                        return PyObjectRef::borrow_or_err(item);
+                    }
+                    let default = if args.len() > 1 { args[1].clone() } else { none_obj(py) };
+                    crate::types::dict::PyDict_SetItem(raw, key, default.as_raw());
+                    return Ok(default);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Err(PyErr::type_error(&format!(
+        "'{}' method not implemented for this type", name
+    )))
+}
+
+/// Compare two PyObjects for equality
+unsafe fn objects_equal(a: *mut RawPyObject, b: *mut RawPyObject) -> bool {
+    if a == b { return true; }
+    if is_int(a) && is_int(b) { return get_int_value(a) == get_int_value(b); }
+    if is_float(a) && is_float(b) { return get_float_value(a) == get_float_value(b); }
+    if is_str(a) && is_str(b) {
+        return crate::types::unicode::unicode_value(a) == crate::types::unicode::unicode_value(b);
+    }
+    false
+}
+
+/// Format a PyObject as a string (for str.format, % formatting, etc.)
+fn format_pyobj(raw: *mut RawPyObject) -> String {
+    unsafe {
+        if is_str(raw) {
+            crate::types::unicode::unicode_value(raw).to_string()
+        } else if is_int(raw) {
+            format!("{}", get_int_value(raw))
+        } else if is_float(raw) {
+            format!("{}", get_float_value(raw))
+        } else if is_none(raw) {
+            "None".to_string()
+        } else if is_bool(raw) {
+            let v = get_int_value(raw);
+            if v != 0 { "True".to_string() } else { "False".to_string() }
+        } else {
+            format!("<object at {:?}>", raw)
+        }
+    }
 }

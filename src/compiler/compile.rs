@@ -274,13 +274,19 @@ impl<'py> Compiler<'py> {
 
             Expr::Name(name) => {
                 let name_str = name.id.to_string();
-                // Check if it's a fast local
-                let varname_idx = self.code_ref().varnames.iter().position(|n| n == &name_str);
-                if let Some(idx) = varname_idx {
-                    self.emit(OpCode::LoadFast, idx as u32);
+                // Check if it's a free variable (nonlocal — loaded from cells)
+                let freevar_idx = self.code_ref().freevars.iter().position(|n| n == &name_str);
+                if let Some(idx) = freevar_idx {
+                    self.emit(OpCode::LoadDeref, idx as u32);
                 } else {
-                    let idx = self.code().add_name(&name_str);
-                    self.emit(OpCode::LoadName, idx);
+                    // Check if it's a fast local
+                    let varname_idx = self.code_ref().varnames.iter().position(|n| n == &name_str);
+                    if let Some(idx) = varname_idx {
+                        self.emit(OpCode::LoadFast, idx as u32);
+                    } else {
+                        let idx = self.code().add_name(&name_str);
+                        self.emit(OpCode::LoadName, idx);
+                    }
                 }
             }
 
@@ -493,6 +499,29 @@ impl<'py> Compiler<'py> {
                 self.compile_expr(&starred.value)?;
             }
 
+            Expr::Slice(slice) => {
+                // Compile slice(lower, upper, step) → BuildSlice(nargs)
+                // Push lower (or None), upper (or None), optionally step
+                if let Some(ref lower) = slice.lower {
+                    self.compile_expr(lower)?;
+                } else {
+                    let idx = self.add_none_const();
+                    self.emit(OpCode::LoadConst, idx);
+                }
+                if let Some(ref upper) = slice.upper {
+                    self.compile_expr(upper)?;
+                } else {
+                    let idx = self.add_none_const();
+                    self.emit(OpCode::LoadConst, idx);
+                }
+                if let Some(ref step) = slice.step {
+                    self.compile_expr(step)?;
+                    self.emit(OpCode::BuildSlice, 3);
+                } else {
+                    self.emit(OpCode::BuildSlice, 2);
+                }
+            }
+
             _ => {
                 let idx = self.add_none_const();
                 self.emit(OpCode::LoadConst, idx);
@@ -582,13 +611,19 @@ impl<'py> Compiler<'py> {
         match target {
             Expr::Name(name) => {
                 let name_str = name.id.to_string();
-                // Check if this is a fast local
-                let varname_idx = self.code_ref().varnames.iter().position(|n| n == &name_str);
-                if let Some(idx) = varname_idx {
-                    self.emit(OpCode::StoreFast, idx as u32);
+                // Check if it's a free variable (nonlocal — stored to cells)
+                let freevar_idx = self.code_ref().freevars.iter().position(|n| n == &name_str);
+                if let Some(idx) = freevar_idx {
+                    self.emit(OpCode::StoreDeref, idx as u32);
                 } else {
-                    let idx = self.code().add_name(&name_str);
-                    self.emit(OpCode::StoreName, idx);
+                    // Check if this is a fast local
+                    let varname_idx = self.code_ref().varnames.iter().position(|n| n == &name_str);
+                    if let Some(idx) = varname_idx {
+                        self.emit(OpCode::StoreFast, idx as u32);
+                    } else {
+                        let idx = self.code().add_name(&name_str);
+                        self.emit(OpCode::StoreName, idx);
+                    }
                 }
             }
             Expr::Subscript(sub) => {
@@ -770,8 +805,28 @@ impl<'py> Compiler<'py> {
             func_code.add_varname(&kwarg.arg.to_string());
         }
 
+        // Scan for nonlocal declarations first
+        let nonlocals = self.scan_nonlocals(&func_def.body);
+
         // Scan body for local variable assignments (simple scope analysis)
         self.scan_locals(&func_def.body, &mut func_code);
+
+        // Remove nonlocal names from varnames and register as freevars
+        if !nonlocals.is_empty() {
+            func_code.varnames.retain(|n| !nonlocals.contains(n));
+            for nl in &nonlocals {
+                if !func_code.freevars.contains(nl) {
+                    func_code.freevars.push(nl.clone());
+                }
+            }
+            // Add nonlocal names to the enclosing code's cellvars
+            let parent_code = self.code_stack.last_mut().unwrap();
+            for nl in &nonlocals {
+                if !parent_code.cellvars.contains(nl) {
+                    parent_code.cellvars.push(nl.clone());
+                }
+            }
+        }
 
         // Push the new code object onto the stack
         self.code_stack.push(func_code);
@@ -878,6 +933,48 @@ impl<'py> Compiler<'py> {
             }
             _ => {}
         }
+    }
+
+    /// Scan function body for `nonlocal` declarations (does NOT recurse into nested functions).
+    fn scan_nonlocals(&self, stmts: &[Stmt]) -> Vec<String> {
+        let mut nonlocals = Vec::new();
+        for stmt in stmts {
+            match stmt {
+                Stmt::Nonlocal(nl) => {
+                    for name in &nl.names {
+                        let s = name.to_string();
+                        if !nonlocals.contains(&s) {
+                            nonlocals.push(s);
+                        }
+                    }
+                }
+                Stmt::For(for_stmt) => {
+                    nonlocals.extend(self.scan_nonlocals(&for_stmt.body));
+                    nonlocals.extend(self.scan_nonlocals(&for_stmt.orelse));
+                }
+                Stmt::While(while_stmt) => {
+                    nonlocals.extend(self.scan_nonlocals(&while_stmt.body));
+                    nonlocals.extend(self.scan_nonlocals(&while_stmt.orelse));
+                }
+                Stmt::If(if_stmt) => {
+                    nonlocals.extend(self.scan_nonlocals(&if_stmt.body));
+                    nonlocals.extend(self.scan_nonlocals(&if_stmt.orelse));
+                }
+                Stmt::Try(try_stmt) => {
+                    nonlocals.extend(self.scan_nonlocals(&try_stmt.body));
+                    for handler in &try_stmt.handlers {
+                        if let ast::ExceptHandler::ExceptHandler(h) = handler {
+                            nonlocals.extend(self.scan_nonlocals(&h.body));
+                        }
+                    }
+                    nonlocals.extend(self.scan_nonlocals(&try_stmt.orelse));
+                    nonlocals.extend(self.scan_nonlocals(&try_stmt.finalbody));
+                }
+                // Don't recurse into nested function/class defs
+                _ => {}
+            }
+        }
+        nonlocals
     }
 
     fn compile_lambda(&mut self, lambda: &ast::ExprLambda) -> Result<(), String> {
@@ -1187,13 +1284,15 @@ impl<'py> Compiler<'py> {
     fn compile_list_comp(&mut self, comp: &ast::ExprListComp) -> Result<(), String> {
         // Build an empty list, iterate, append
         self.emit(OpCode::BuildList, 0);
-        self.compile_comprehension_generators(&comp.generators, &comp.elt, OpCode::ListAppend)?;
+        let total_depth = comp.generators.len() as u32 + 1;
+        self.compile_comprehension_generators(&comp.generators, &comp.elt, OpCode::ListAppend, total_depth)?;
         Ok(())
     }
 
     fn compile_set_comp(&mut self, comp: &ast::ExprSetComp) -> Result<(), String> {
         self.emit(OpCode::BuildSet, 0);
-        self.compile_comprehension_generators(&comp.generators, &comp.elt, OpCode::SetAdd)?;
+        let total_depth = comp.generators.len() as u32 + 1;
+        self.compile_comprehension_generators(&comp.generators, &comp.elt, OpCode::SetAdd, total_depth)?;
         Ok(())
     }
 
@@ -1234,7 +1333,8 @@ impl<'py> Compiler<'py> {
     fn compile_generator_exp(&mut self, genexp: &ast::ExprGeneratorExp) -> Result<(), String> {
         // For now, compile generator expressions as list comprehensions
         self.emit(OpCode::BuildList, 0);
-        self.compile_comprehension_generators(&genexp.generators, &genexp.elt, OpCode::ListAppend)?;
+        let total_depth = genexp.generators.len() as u32 + 1;
+        self.compile_comprehension_generators(&genexp.generators, &genexp.elt, OpCode::ListAppend, total_depth)?;
         // Convert list to iterator
         self.emit(OpCode::GetIter, 0);
         Ok(())
@@ -1245,11 +1345,12 @@ impl<'py> Compiler<'py> {
         generators: &[ast::Comprehension],
         elt: &Expr,
         append_op: OpCode,
+        total_depth: u32,
     ) -> Result<(), String> {
         if generators.is_empty() {
             // Base case: compile the element and append
             self.compile_expr(elt)?;
-            self.emit(append_op, 2); // depth=2
+            self.emit(append_op, total_depth);
             return Ok(());
         }
 
@@ -1271,13 +1372,10 @@ impl<'py> Compiler<'py> {
         }
 
         if generators.len() > 1 {
-            self.compile_comprehension_generators(&generators[1..], elt, append_op)?;
+            self.compile_comprehension_generators(&generators[1..], elt, append_op, total_depth)?;
         } else {
             self.compile_expr(elt)?;
-            // Calculate depth: collection is under iterator(s)
-            // For single generator: collection(bottom), iterator, [item] → depth = 2
-            let depth = (generators.len() + 1) as u32;
-            self.emit(append_op, depth);
+            self.emit(append_op, total_depth);
         }
 
         // Patch skip jumps to continue loop

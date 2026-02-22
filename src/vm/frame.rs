@@ -9,7 +9,14 @@
 use crate::compiler::bytecode::CodeObject;
 use crate::object::pyobject::PyObjectRef;
 use crate::runtime::pyerr::PyErr;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
+
+/// Shared mutable cell storage for closures.
+/// Inner functions hold an Rc to the same map, so writes via `nonlocal`
+/// in an inner function are visible in the outer function and vice versa.
+pub type CellMap = Rc<RefCell<HashMap<String, PyObjectRef>>>;
 
 /// A block on the block stack (for try/except/finally/loop).
 #[derive(Debug, Clone)]
@@ -48,6 +55,8 @@ pub struct Frame {
     pub builtins: HashMap<String, PyObjectRef>,
     /// Block stack for try/except/finally/loop unwinding
     pub block_stack: Vec<Block>,
+    /// Cell variables for closures (shared with inner functions via Rc)
+    pub cells: Option<CellMap>,
 }
 
 impl Frame {
@@ -60,6 +69,7 @@ impl Frame {
             globals: HashMap::new(),
             builtins: HashMap::new(),
             block_stack: Vec::new(),
+            cells: None,
         }
     }
 
