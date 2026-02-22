@@ -2,6 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    println!("cargo:rerun-if-changed=csrc/varargs.c");
     let out_dir = env::var("OUT_DIR").unwrap();
 
     // Compile C source files that implement variadic functions
@@ -23,7 +24,9 @@ fn main() {
          _Py_BuildValue\n\
          __Py_BuildValue_SizeT\n\
          _Py_VaBuildValue\n\
-         _PyTuple_Pack\n"
+         _PyTuple_Pack\n\
+         _PyUnicode_FromFormat\n\
+         _PyErr_Format\n"
     ).unwrap();
     println!("cargo:rustc-cdylib-link-arg=-Wl,-exported_symbols_list,{}", exports_path.display());
 }

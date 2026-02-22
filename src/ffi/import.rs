@@ -221,8 +221,104 @@ pub unsafe extern "C" fn PyImport_AddModule(name: *const c_char) -> *mut RawPyOb
         // Create proper module object (not a dict!)
         let name_obj = crate::types::unicode::PyUnicode_FromString(name);
         let module = crate::types::moduleobject::PyModule_NewObject(name_obj);
-        crate::module::registry::register_module(&name_str, module);
         (*name_obj).decref();
+
+        // For Cython runtime modules, pre-populate with expected attributes
+        if name_str.ends_with("cython_runtime") || name_str.ends_with(".cython_runtime") {
+            let dict = crate::types::moduleobject::PyModule_GetDict(module);
+            crate::types::dict::PyDict_SetItemString(
+                dict,
+                b"cline_in_traceback\0".as_ptr() as *const std::os::raw::c_char,
+                crate::types::boolobject::PyBool_FromLong(0),
+            );
+        }
+
+        crate::module::registry::register_module(&name_str, module);
         module
+    })
+}
+
+/// _Rustthon_CreateStubType — create a simple type that supports instance creation
+/// and setattr. Used by test drivers to pre-register stub types for packages.
+///
+/// Returns a new type object with:
+/// - tp_name = name
+/// - tp_base = base (or PyBaseObject_Type if NULL)
+/// - tp_dictoffset = 16 (instances have __dict__)
+/// - tp_basicsize = 24 (16 for PyObject + 8 for dict ptr)
+/// - All standard slots inherited from base
+#[no_mangle]
+pub unsafe extern "C" fn _Rustthon_CreateStubType(
+    name: *const c_char,
+    base: *mut RawPyObject,
+) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("_Rustthon_CreateStubType", || unsafe {
+        use crate::object::typeobj::{RawPyTypeObject, PyType_Type, PyBaseObject_Type, PyType_Ready};
+
+        let base_tp = if !base.is_null() {
+            base as *mut RawPyTypeObject
+        } else {
+            PyBaseObject_Type.get()
+        };
+
+        let tp = libc::calloc(1, std::mem::size_of::<RawPyTypeObject>()) as *mut RawPyTypeObject;
+        if tp.is_null() {
+            return ptr::null_mut();
+        }
+        std::ptr::write(tp, RawPyTypeObject::zeroed());
+
+        // Heap-allocate a copy of the name
+        if !name.is_null() {
+            let name_cstr = CStr::from_ptr(name);
+            let name_bytes = name_cstr.to_bytes_with_nul();
+            let name_copy = libc::malloc(name_bytes.len()) as *mut u8;
+            if !name_copy.is_null() {
+                std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_copy, name_bytes.len());
+                (*tp).tp_name = name_copy as *const c_char;
+            }
+        }
+
+        (*tp).ob_base.ob_type = PyType_Type.get();
+        (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+        (*tp).tp_basicsize = 24; // 16 (PyObject) + 8 (dict ptr)
+        (*tp).tp_dictoffset = 16; // dict pointer at offset 16
+        (*tp).tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
+            | crate::object::typeobj::PY_TPFLAGS_BASETYPE;
+        (*tp).tp_base = base_tp;
+
+        // Create tp_bases tuple
+        let bases = crate::types::tuple::PyTuple_New(1);
+        let base_obj = base_tp as *mut RawPyObject;
+        (*base_obj).incref();
+        crate::types::tuple::PyTuple_SetItem(bases, 0, base_obj);
+        (*tp).tp_bases = bases;
+
+        // PyType_Ready will inherit all slots from base
+        let ret = PyType_Ready(tp);
+        if ret < 0 {
+            libc::free(tp as *mut std::ffi::c_void);
+            return ptr::null_mut();
+        }
+
+        tp as *mut RawPyObject
+    })
+}
+
+/// PyImport_GetModule — look up a module in sys.modules by name (borrowed reference).
+#[no_mangle]
+pub unsafe extern "C" fn PyImport_GetModule(name: *mut RawPyObject) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyImport_GetModule", || unsafe {
+        if name.is_null() {
+            return ptr::null_mut();
+        }
+        let name_str = crate::types::unicode::PyUnicode_AsUTF8(name);
+        if name_str.is_null() {
+            return ptr::null_mut();
+        }
+        let s = CStr::from_ptr(name_str).to_string_lossy();
+        match crate::module::registry::get_module(&s) {
+            Some(m) => m, // borrowed reference
+            None => ptr::null_mut(),
+        }
     })
 }

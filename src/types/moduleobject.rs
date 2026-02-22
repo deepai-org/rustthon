@@ -36,10 +36,18 @@ unsafe extern "C" fn module_getattro(
         (*result).incref();
         return result;
     }
-    // Attribute not found — set AttributeError
+    // Attribute not found — set AttributeError with useful message
+    let name_s = crate::types::unicode::PyUnicode_AsUTF8(name);
+    let attr = if !name_s.is_null() {
+        std::ffi::CStr::from_ptr(name_s).to_string_lossy()
+    } else {
+        std::borrow::Cow::Borrowed("(null)")
+    };
+    let data = PyObjectWithData::<ModuleData>::data_from_raw(obj);
+    let msg = format!("module '{}' has no attribute '{}'\0", data.name, attr);
     crate::runtime::error::PyErr_SetString(
         *crate::runtime::error::PyExc_AttributeError.get(),
-        b"module has no attribute\0".as_ptr() as *const _,
+        msg.as_ptr() as *const _,
     );
     ptr::null_mut()
 }
@@ -396,6 +404,8 @@ pub unsafe extern "C" fn PyModuleDef_Init(def: *mut PyModuleDef) -> *mut RawPyOb
                 }
                 if (*slot).slot == PY_MOD_EXEC && !(*slot).value.is_null() {
                     let exec_func: PyModExecFunc = std::mem::transmute((*slot).value);
+                    // Clear any stale error before calling exec
+                    crate::runtime::error::PyErr_Clear();
                     let result = exec_func(module);
                     if result != 0 {
                         return ptr::null_mut();

@@ -11,32 +11,96 @@ use std::cell::RefCell;
 use std::os::raw::c_void;
 use std::ptr;
 
-/// Matches CPython's PyThreadState (simplified but ABI-compatible for common fields)
+/// CPython 3.11 _PyCFrame layout (24 bytes on 64-bit)
+#[repr(C)]
+pub struct PyCFrame {
+    pub use_tracing: u8,
+    pub _pad: [u8; 7],
+    pub current_frame: *mut c_void, // _PyInterpreterFrame *
+    pub previous: *mut PyCFrame,
+}
+
+/// CPython 3.11 _PyErr_StackItem — exception handler stack entry.
+/// Used by `except` clauses to save/restore the active exception.
+#[repr(C)]
+pub struct PyErrStackItem {
+    /// The handled exception value (or NULL if none).
+    pub exc_value: *mut RawPyObject,
+    /// Previous item in the exception stack chain.
+    pub previous_item: *mut PyErrStackItem,
+}
+
+/// Matches CPython 3.11 PyThreadState layout exactly (360 bytes).
+/// Verified offsets against CPython 3.11 headers via offsetof().
+/// Cython reads curexc_type at offset 96 and exc_info at offset 120 directly.
 #[repr(C)]
 pub struct PyThreadState {
-    /// Previous thread state in the linked list
+    // offset 0
     pub prev: *mut PyThreadState,
-    /// Next thread state
+    // offset 8
     pub next: *mut PyThreadState,
-    /// The interpreter this thread belongs to
+    // offset 16
     pub interp: *mut PyInterpreterState,
+    // offset 24
+    pub _initialized: i32,
+    // offset 28
+    pub _static: i32,
+    // offset 32
+    pub recursion_remaining: i32,
+    // offset 36
+    pub recursion_limit: i32,
+    // offset 40
+    pub recursion_headroom: i32,
+    // offset 44
+    pub tracing: i32,
+    // offset 48
+    pub tracing_what: i32,
+    // offset 52 (padding for 8-byte alignment of cframe)
+    pub _pad52: i32,
+    // offset 56
+    pub cframe: *mut PyCFrame,
+    // offset 64
+    pub c_profilefunc: *mut c_void, // Py_tracefunc
+    // offset 72
+    pub c_tracefunc: *mut c_void,   // Py_tracefunc
+    // offset 80
+    pub c_profileobj: *mut RawPyObject,
+    // offset 88
+    pub c_traceobj: *mut RawPyObject,
 
-    /// Current exception info
+    // offset 96 — curexc_type (Cython reads directly at 0x60)
     pub curexc_type: *mut RawPyObject,
+    // offset 104
     pub curexc_value: *mut RawPyObject,
+    // offset 112
     pub curexc_traceback: *mut RawPyObject,
 
-    /// Exception state for generators
-    pub exc_state_type: *mut RawPyObject,
-    pub exc_state_value: *mut RawPyObject,
-    pub exc_state_traceback: *mut RawPyObject,
+    // offset 120 — exc_info pointer (Cython reads at 0x78)
+    // Points to the top of the exception handler stack (initially &exc_state)
+    pub exc_info: *mut PyErrStackItem,
 
-    /// Current recursion depth
-    pub recursion_depth: i32,
-    pub recursion_limit: i32,
-
-    /// Thread ID
+    // offset 128 — per-thread dict
+    pub dict: *mut RawPyObject,
+    // offset 136
+    pub gilstate_counter: i32,
+    // offset 140 (padding)
+    pub _pad140: i32,
+    // offset 144
+    pub async_exc: *mut RawPyObject,
+    // offset 152
     pub thread_id: u64,
+    // offset 160
+    pub native_thread_id: u64,
+
+    // offsets 168..320 — padding to match CPython layout
+    // (trash_delete_nesting, on_delete, on_delete_data, coroutine_origin_tracking_depth,
+    //  async_gen fields, datastack, etc.)
+    pub _reserved: [u8; 152],
+
+    // offset 320 — the bottom of the exception handler stack (inline)
+    pub exc_state: PyErrStackItem,
+    // offset 336..360 — remaining CPython fields (root_cframe, etc.)
+    pub _reserved2: [u8; 24],
 }
 
 /// Matches CPython's PyInterpreterState (simplified)
@@ -89,16 +153,28 @@ pub unsafe fn create_thread_state(interp: *mut PyInterpreterState) -> *mut PyThr
         prev: ptr::null_mut(),
         next: (*interp).tstate_head,
         interp,
+        _initialized: 1,
+        _static: 0,
+        recursion_remaining: 1000,
+        recursion_limit: 1000,
+        recursion_headroom: 50,
+        tracing: 0,
+        tracing_what: 0,
+        _pad52: 0,
+        cframe: ptr::null_mut(),
+        c_profilefunc: ptr::null_mut(),
+        c_tracefunc: ptr::null_mut(),
+        c_profileobj: ptr::null_mut(),
+        c_traceobj: ptr::null_mut(),
         curexc_type: ptr::null_mut(),
         curexc_value: ptr::null_mut(),
         curexc_traceback: ptr::null_mut(),
-        exc_state_type: ptr::null_mut(),
-        exc_state_value: ptr::null_mut(),
-        exc_state_traceback: ptr::null_mut(),
-        recursion_depth: 0,
-        recursion_limit: 1000,
+        exc_info: ptr::null_mut(), // will be set below
+        dict: ptr::null_mut(),
+        gilstate_counter: 0,
+        _pad140: 0,
+        async_exc: ptr::null_mut(),
         thread_id: {
-            // Use a hash of the thread id as a stable u64 identifier
             let id = std::thread::current().id();
             let id_str = format!("{:?}", id);
             let mut hash: u64 = 5381;
@@ -107,7 +183,17 @@ pub unsafe fn create_thread_state(interp: *mut PyInterpreterState) -> *mut PyThr
             }
             hash
         },
+        native_thread_id: 0,
+        _reserved: [0u8; 152],
+        exc_state: PyErrStackItem {
+            exc_value: ptr::null_mut(),
+            previous_item: ptr::null_mut(),
+        },
+        _reserved2: [0u8; 24],
     }));
+
+    // exc_info must point to &tstate->exc_state (the bottom of the exception stack)
+    (*tstate).exc_info = &mut (*tstate).exc_state as *mut PyErrStackItem;
 
     // Link into interpreter's thread list
     if !(*interp).tstate_head.is_null() {

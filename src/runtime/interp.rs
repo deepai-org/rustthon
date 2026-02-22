@@ -16,8 +16,136 @@ pub fn initialize() {
     // Create the main thread state
     thread_state::init_thread_state();
 
+    // Create the builtins module (Cython extensions need this)
+    init_builtins();
+
     // Initialize module search paths
     init_search_paths();
+}
+
+/// Create the `builtins` module with exception classes and built-in types.
+/// Cython calls `__Pyx_GetBuiltinName` which does
+/// `PyObject_GetAttr(builtins_module, name)`.
+fn init_builtins() {
+    use crate::module::registry::register_module;
+    use crate::runtime::error;
+
+    unsafe {
+        let name = crate::types::unicode::PyUnicode_FromString(
+            b"builtins\0".as_ptr() as *const _,
+        );
+        let module = crate::types::moduleobject::PyModule_NewObject(name);
+        (*name).decref();
+
+        let dict = crate::types::moduleobject::PyModule_GetDict(module);
+
+        // Helper macro to add an exception to builtins
+        macro_rules! add_exc {
+            ($name:expr, $exc:expr) => {
+                crate::types::dict::PyDict_SetItemString(
+                    dict,
+                    $name.as_ptr() as *const _,
+                    *$exc.get(),
+                );
+            };
+        }
+
+        // Exception classes
+        add_exc!(b"BaseException\0", error::PyExc_BaseException);
+        add_exc!(b"Exception\0", error::PyExc_Exception);
+        add_exc!(b"TypeError\0", error::PyExc_TypeError);
+        add_exc!(b"ValueError\0", error::PyExc_ValueError);
+        add_exc!(b"OverflowError\0", error::PyExc_OverflowError);
+        add_exc!(b"RuntimeError\0", error::PyExc_RuntimeError);
+        add_exc!(b"KeyError\0", error::PyExc_KeyError);
+        add_exc!(b"IndexError\0", error::PyExc_IndexError);
+        add_exc!(b"AttributeError\0", error::PyExc_AttributeError);
+        add_exc!(b"StopIteration\0", error::PyExc_StopIteration);
+        add_exc!(b"MemoryError\0", error::PyExc_MemoryError);
+        add_exc!(b"SystemError\0", error::PyExc_SystemError);
+        add_exc!(b"OSError\0", error::PyExc_OSError);
+        add_exc!(b"IOError\0", error::PyExc_IOError);
+        add_exc!(b"NotImplementedError\0", error::PyExc_NotImplementedError);
+        add_exc!(b"ImportError\0", error::PyExc_ImportError);
+        add_exc!(b"NameError\0", error::PyExc_NameError);
+        add_exc!(b"UnboundLocalError\0", error::PyExc_UnboundLocalError);
+        add_exc!(b"ZeroDivisionError\0", error::PyExc_ZeroDivisionError);
+        add_exc!(b"ModuleNotFoundError\0", error::PyExc_ModuleNotFoundError);
+        add_exc!(b"LookupError\0", error::PyExc_LookupError);
+        add_exc!(b"ArithmeticError\0", error::PyExc_ArithmeticError);
+        add_exc!(b"UnicodeDecodeError\0", error::PyExc_UnicodeDecodeError);
+        add_exc!(b"UnicodeEncodeError\0", error::PyExc_UnicodeEncodeError);
+        add_exc!(b"UnicodeError\0", error::PyExc_UnicodeError);
+        add_exc!(b"Warning\0", error::PyExc_Warning);
+        add_exc!(b"DeprecationWarning\0", error::PyExc_DeprecationWarning);
+        add_exc!(b"RuntimeWarning\0", error::PyExc_RuntimeWarning);
+        add_exc!(b"UserWarning\0", error::PyExc_UserWarning);
+
+        // Built-in type objects
+        macro_rules! add_type {
+            ($name:expr, $tp:expr) => {
+                crate::types::dict::PyDict_SetItemString(
+                    dict,
+                    $name.as_ptr() as *const _,
+                    $tp.get() as *mut crate::object::pyobject::RawPyObject,
+                );
+            };
+        }
+
+        add_type!(b"int\0", crate::types::longobject::PyLong_Type);
+        add_type!(b"float\0", crate::types::floatobject::PyFloat_Type);
+        add_type!(b"bool\0", crate::types::boolobject::PyBool_Type);
+        add_type!(b"str\0", crate::types::unicode::PyUnicode_Type);
+        add_type!(b"bytes\0", crate::types::bytes::PyBytes_Type);
+        add_type!(b"list\0", crate::types::list::PyList_Type);
+        add_type!(b"tuple\0", crate::types::tuple::PyTuple_Type);
+        add_type!(b"dict\0", crate::types::dict::PyDict_Type);
+        add_type!(b"set\0", crate::types::set::PySet_Type);
+        add_type!(b"type\0", crate::object::typeobj::PyType_Type);
+        add_type!(b"object\0", crate::object::typeobj::PyBaseObject_Type);
+
+        // Built-in constants
+        crate::types::dict::PyDict_SetItemString(
+            dict, b"None\0".as_ptr() as *const _, crate::types::none::return_none(),
+        );
+        crate::types::dict::PyDict_SetItemString(
+            dict, b"True\0".as_ptr() as *const _, crate::types::boolobject::PyBool_FromLong(1),
+        );
+        crate::types::dict::PyDict_SetItemString(
+            dict, b"False\0".as_ptr() as *const _, crate::types::boolobject::PyBool_FromLong(0),
+        );
+
+        register_module("builtins", module);
+
+        // Create _cython_3_1_4 module that Cython extensions expect
+        // Cython looks up `cline_in_traceback` here for debug settings.
+        init_cython_runtime();
+    }
+}
+
+/// Create Cython's internal runtime module.
+/// Cython-generated code imports `_cython_3_1_4` and looks up `cline_in_traceback`.
+fn init_cython_runtime() {
+    unsafe {
+        // Create a generic cython runtime module name that covers multiple versions
+        for mod_name in &[
+            "cython_runtime",
+        ] {
+            let name = crate::types::unicode::PyUnicode_FromString(
+                std::ffi::CString::new(*mod_name).unwrap().as_ptr(),
+            );
+            let module = crate::types::moduleobject::PyModule_NewObject(name);
+            (*name).decref();
+            let dict = crate::types::moduleobject::PyModule_GetDict(module);
+            // Set cline_in_traceback = False
+            crate::types::dict::PyDict_SetItemString(
+                dict,
+                b"cline_in_traceback\0".as_ptr() as *const _,
+                crate::types::boolobject::PyBool_FromLong(0),
+            );
+            crate::module::registry::register_module(mod_name, module);
+        }
+    }
 }
 
 /// Set up module search paths from environment and common locations.

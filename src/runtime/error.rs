@@ -2,54 +2,62 @@
 //!
 //! CPython uses thread-local state to track the current exception.
 //! C extensions check PyErr_Occurred() and set errors with PyErr_SetString().
-//! We replicate this exact mechanism.
+//!
+//! CRITICAL: Cython bypasses PyErr_Occurred() and reads curexc_type directly
+//! from PyThreadState. All error state MUST be stored in PyThreadState at
+//! the correct offsets (curexc_type at offset 96 for CPython 3.11 ABI).
 
 use crate::object::pyobject::RawPyObject;
 use crate::object::StaticPtr;
-use std::cell::RefCell;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
 
-/// Thread-local error state, matching CPython's error indicator.
-struct ErrorState {
-    /// The exception type (borrowed reference to a type object)
-    exc_type: *mut RawPyObject,
-    /// The exception value
-    exc_value: *mut RawPyObject,
-    /// The traceback
-    exc_traceback: *mut RawPyObject,
+/// Get the current error state from PyThreadState.
+/// Returns pointers to the curexc_type/value/traceback fields.
+#[inline]
+unsafe fn get_tstate_err() -> (*mut *mut RawPyObject, *mut *mut RawPyObject, *mut *mut RawPyObject) {
+    let tstate = crate::runtime::thread_state::_PyThreadState_UncheckedGet();
+    if tstate.is_null() {
+        // Fallback: should not happen after init
+        return (ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+    }
+    (
+        &mut (*tstate).curexc_type as *mut _,
+        &mut (*tstate).curexc_value as *mut _,
+        &mut (*tstate).curexc_traceback as *mut _,
+    )
 }
 
-impl ErrorState {
-    fn new() -> Self {
-        ErrorState {
-            exc_type: ptr::null_mut(),
-            exc_value: ptr::null_mut(),
-            exc_traceback: ptr::null_mut(),
-        }
-    }
-
-    fn clear(&mut self) {
-        // In a full implementation, we'd Py_XDECREF these
-        self.exc_type = ptr::null_mut();
-        self.exc_value = ptr::null_mut();
-        self.exc_traceback = ptr::null_mut();
-    }
-
-    fn is_set(&self) -> bool {
-        !self.exc_type.is_null()
+/// Set error in the current thread state.
+#[inline]
+unsafe fn tstate_set_error(exc_type: *mut RawPyObject, exc_value: *mut RawPyObject, exc_tb: *mut RawPyObject) {
+    let tstate = crate::runtime::thread_state::_PyThreadState_UncheckedGet();
+    if !tstate.is_null() {
+        (*tstate).curexc_type = exc_type;
+        (*tstate).curexc_value = exc_value;
+        (*tstate).curexc_traceback = exc_tb;
     }
 }
 
-thread_local! {
-    static ERROR_STATE: RefCell<ErrorState> = RefCell::new(ErrorState::new());
+/// Clear error in the current thread state.
+#[inline]
+unsafe fn tstate_clear_error() {
+    let tstate = crate::runtime::thread_state::_PyThreadState_UncheckedGet();
+    if !tstate.is_null() {
+        (*tstate).curexc_type = ptr::null_mut();
+        (*tstate).curexc_value = ptr::null_mut();
+        (*tstate).curexc_traceback = ptr::null_mut();
+    }
 }
 
-fn with_error<F, R>(f: F) -> R
-where
-    F: FnOnce(&mut ErrorState) -> R,
-{
-    ERROR_STATE.with(|state| f(&mut state.borrow_mut()))
+/// Check if an error is set in the current thread state.
+#[inline]
+unsafe fn tstate_error_occurred() -> *mut RawPyObject {
+    let tstate = crate::runtime::thread_state::_PyThreadState_UncheckedGet();
+    if tstate.is_null() {
+        return ptr::null_mut();
+    }
+    (*tstate).curexc_type
 }
 
 // ─── C API exports ───
@@ -58,13 +66,12 @@ where
 /// This is the most common way C extensions signal errors.
 #[no_mangle]
 pub unsafe extern "C" fn PyErr_SetString(exc_type: *mut RawPyObject, message: *const c_char) {
-    with_error(|state| {
-        state.exc_type = exc_type;
-        if !message.is_null() {
-            state.exc_value = crate::types::unicode::PyUnicode_FromString(message);
-        }
-        state.exc_traceback = ptr::null_mut();
-    });
+    let value = if !message.is_null() {
+        crate::types::unicode::PyUnicode_FromString(message)
+    } else {
+        ptr::null_mut()
+    };
+    tstate_set_error(exc_type, value, ptr::null_mut());
 }
 
 /// PyErr_SetObject - set an error with a type and value object.
@@ -73,29 +80,19 @@ pub unsafe extern "C" fn PyErr_SetObject(
     exc_type: *mut RawPyObject,
     exc_value: *mut RawPyObject,
 ) {
-    with_error(|state| {
-        state.exc_type = exc_type;
-        state.exc_value = exc_value;
-        state.exc_traceback = ptr::null_mut();
-    });
+    tstate_set_error(exc_type, exc_value, ptr::null_mut());
 }
 
 /// PyErr_Occurred - check if an error is set. Returns the exception type or NULL.
 #[no_mangle]
 pub unsafe extern "C" fn PyErr_Occurred() -> *mut RawPyObject {
-    with_error(|state| {
-        if state.is_set() {
-            state.exc_type
-        } else {
-            ptr::null_mut()
-        }
-    })
+    tstate_error_occurred()
 }
 
 /// PyErr_Clear - clear the current error.
 #[no_mangle]
 pub unsafe extern "C" fn PyErr_Clear() {
-    with_error(|state| state.clear());
+    unsafe { tstate_clear_error(); }
 }
 
 /// PyErr_Fetch - fetch and clear the error indicator.
@@ -106,21 +103,19 @@ pub unsafe extern "C" fn PyErr_Fetch(
     pvalue: *mut *mut RawPyObject,
     ptraceback: *mut *mut RawPyObject,
 ) {
-    with_error(|state| {
-        if !ptype.is_null() {
-            *ptype = state.exc_type;
-        }
-        if !pvalue.is_null() {
-            *pvalue = state.exc_value;
-        }
-        if !ptraceback.is_null() {
-            *ptraceback = state.exc_traceback;
-        }
-        // Clear without decref (ownership transferred to caller)
-        state.exc_type = ptr::null_mut();
-        state.exc_value = ptr::null_mut();
-        state.exc_traceback = ptr::null_mut();
-    });
+    let tstate = crate::runtime::thread_state::_PyThreadState_UncheckedGet();
+    if tstate.is_null() {
+        if !ptype.is_null() { *ptype = ptr::null_mut(); }
+        if !pvalue.is_null() { *pvalue = ptr::null_mut(); }
+        if !ptraceback.is_null() { *ptraceback = ptr::null_mut(); }
+        return;
+    }
+    if !ptype.is_null() { *ptype = (*tstate).curexc_type; }
+    if !pvalue.is_null() { *pvalue = (*tstate).curexc_value; }
+    if !ptraceback.is_null() { *ptraceback = (*tstate).curexc_traceback; }
+    (*tstate).curexc_type = ptr::null_mut();
+    (*tstate).curexc_value = ptr::null_mut();
+    (*tstate).curexc_traceback = ptr::null_mut();
 }
 
 /// PyErr_Restore - set the error indicator from fetched values.
@@ -130,11 +125,7 @@ pub unsafe extern "C" fn PyErr_Restore(
     exc_value: *mut RawPyObject,
     exc_traceback: *mut RawPyObject,
 ) {
-    with_error(|state| {
-        state.exc_type = exc_type;
-        state.exc_value = exc_value;
-        state.exc_traceback = exc_traceback;
-    });
+    tstate_set_error(exc_type, exc_value, exc_traceback);
 }
 
 /// PyErr_NormalizeException - normalize the exception.
@@ -153,11 +144,7 @@ pub unsafe extern "C" fn PyErr_NormalizeException(
 /// PyErr_SetNone - set an error with no value.
 #[no_mangle]
 pub unsafe extern "C" fn PyErr_SetNone(exc_type: *mut RawPyObject) {
-    with_error(|state| {
-        state.exc_type = exc_type;
-        state.exc_value = ptr::null_mut();
-        state.exc_traceback = ptr::null_mut();
-    });
+    tstate_set_error(exc_type, ptr::null_mut(), ptr::null_mut());
 }
 
 /// PyErr_ExceptionMatches - check if the current exception matches a given type.
@@ -165,24 +152,47 @@ pub unsafe extern "C" fn PyErr_SetNone(exc_type: *mut RawPyObject) {
 #[no_mangle]
 pub unsafe extern "C" fn PyErr_ExceptionMatches(exc: *mut RawPyObject) -> i32 {
     crate::ffi::panic_guard::guard_i32("PyErr_ExceptionMatches", || unsafe {
-        with_error(|state| {
-            if state.exc_type.is_null() || exc.is_null() {
-                return 0;
+        let cur_type = tstate_error_occurred();
+        if cur_type.is_null() || exc.is_null() {
+            if std::env::var("RUSTTHON_TRACE").is_ok() {
+                eprintln!("[rustthon] PyErr_ExceptionMatches({:p}): cur_type={:p} -> 0 (null)", exc, cur_type);
             }
-            if state.exc_type == exc {
+            return 0;
+        }
+        if cur_type == exc {
+            if std::env::var("RUSTTHON_TRACE").is_ok() {
+                eprintln!("[rustthon] PyErr_ExceptionMatches({:p}): exact match -> 1", exc);
+            }
+            return 1;
+        }
+        // Walk tp_base chain of the current exception type
+        let exc_tp = exc as *mut RawPyTypeObject;
+        let mut cur = cur_type as *mut RawPyTypeObject;
+        while !cur.is_null() {
+            if cur as *mut RawPyObject == exc || cur == exc_tp {
+                if std::env::var("RUSTTHON_TRACE").is_ok() {
+                    eprintln!("[rustthon] PyErr_ExceptionMatches({:p}): subtype match -> 1", exc);
+                }
                 return 1;
             }
-            // Walk tp_base chain of the current exception type
-            let exc_tp = exc as *mut RawPyTypeObject;
-            let mut cur = state.exc_type as *mut RawPyTypeObject;
-            while !cur.is_null() {
-                if cur as *mut RawPyObject == exc || cur == exc_tp {
-                    return 1;
-                }
-                cur = (*cur).tp_base;
-            }
-            0
-        })
+            cur = (*cur).tp_base;
+        }
+        if std::env::var("RUSTTHON_TRACE").is_ok() {
+            let cur_name = if !cur_type.is_null() {
+                let cur_tp = cur_type as *mut RawPyTypeObject;
+                if !(*cur_tp).tp_name.is_null() {
+                    std::ffi::CStr::from_ptr((*cur_tp).tp_name).to_string_lossy().into_owned()
+                } else { format!("{:p}", cur_type) }
+            } else { "null".to_string() };
+            let exc_name = if !exc.is_null() {
+                let exc_tpp = exc as *mut RawPyTypeObject;
+                if !(*exc_tpp).tp_name.is_null() {
+                    std::ffi::CStr::from_ptr((*exc_tpp).tp_name).to_string_lossy().into_owned()
+                } else { format!("{:p}", exc) }
+            } else { "null".to_string() };
+            eprintln!("[rustthon] PyErr_ExceptionMatches: cur='{}' exc='{}' -> 0 (NO MATCH)", cur_name, exc_name);
+        }
+        0
     })
 }
 
@@ -212,20 +222,7 @@ pub unsafe extern "C" fn PyErr_GivenExceptionMatches(
     })
 }
 
-/// PyErr_Format - set error with a formatted string.
-/// For now, just passes the format string directly.
-#[no_mangle]
-pub unsafe extern "C" fn PyErr_Format(
-    exc_type: *mut RawPyObject,
-    format: *const c_char,
-    // varargs not supported in Rust extern "C" easily,
-    // but we can handle the common case
-) -> *mut RawPyObject {
-    crate::ffi::panic_guard::guard_ptr("PyErr_Format", || unsafe {
-        PyErr_SetString(exc_type, format);
-        ptr::null_mut()
-    })
-}
+// PyErr_Format is implemented in csrc/varargs.c (C variadic function)
 
 /// PyErr_BadArgument
 #[no_mangle]
@@ -341,6 +338,10 @@ use crate::object::typeobj::RawPyTypeObject;
 #[no_mangle] pub static PyExc_ArithmeticError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
 #[no_mangle] pub static PyExc_IOError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
 #[no_mangle] pub static PyExc_ImportError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_NameError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_UnboundLocalError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_ZeroDivisionError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
+#[no_mangle] pub static PyExc_ModuleNotFoundError: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
 #[no_mangle] pub static PyExc_DeprecationWarning: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
 #[no_mangle] pub static PyExc_RuntimeWarning: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
 #[no_mangle] pub static PyExc_UserWarning: StaticPtr<*mut RawPyObject> = StaticPtr::new(ptr::null_mut());
@@ -433,8 +434,18 @@ pub unsafe fn init_exceptions() {
     *PyExc_UnicodeDecodeError.get() = alloc_exc_type(b"UnicodeDecodeError\0", unicode_err);
     *PyExc_UnicodeEncodeError.get() = alloc_exc_type(b"UnicodeEncodeError\0", unicode_err);
 
-    // ImportError
+    // ImportError hierarchy
     *PyExc_ImportError.get() = alloc_exc_type(b"ImportError\0", exc);
+    let import_err = *PyExc_ImportError.get() as *mut RawPyTypeObject;
+    *PyExc_ModuleNotFoundError.get() = alloc_exc_type(b"ModuleNotFoundError\0", import_err);
+
+    // NameError hierarchy
+    *PyExc_NameError.get() = alloc_exc_type(b"NameError\0", exc);
+    let name_err = *PyExc_NameError.get() as *mut RawPyTypeObject;
+    *PyExc_UnboundLocalError.get() = alloc_exc_type(b"UnboundLocalError\0", name_err);
+
+    // ArithmeticError subclass: ZeroDivisionError
+    *PyExc_ZeroDivisionError.get() = alloc_exc_type(b"ZeroDivisionError\0", arith);
 
     // Warning hierarchy
     *PyExc_Warning.get() = alloc_exc_type(b"Warning\0", exc);

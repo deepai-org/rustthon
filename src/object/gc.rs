@@ -84,9 +84,6 @@ pub unsafe extern "C" fn _PyObject_GC_New(
 ) -> *mut RawPyObject {
     crate::ffi::panic_guard::guard_ptr("_PyObject_GC_New", || unsafe {
         if tp.is_null() {
-            eprintln!("[rustthon] FATAL: _PyObject_GC_New called with NULL type pointer!");
-            eprintln!("  This usually means a C extension failed to create a type (PyType_FromSpec* returned NULL)");
-            eprintln!("  but the extension continued to use the NULL type pointer.");
             return std::ptr::null_mut();
         }
         let obj_size = (*tp).tp_basicsize as usize;
@@ -94,7 +91,6 @@ pub unsafe extern "C" fn _PyObject_GC_New(
         let total = GC_HEAD_SIZE + obj_size;
         let raw = libc::calloc(1, total) as *mut u8;
         if raw.is_null() {
-            eprintln!("Fatal: out of memory in _PyObject_GC_New");
             std::process::abort();
         }
 
@@ -102,15 +98,6 @@ pub unsafe extern "C" fn _PyObject_GC_New(
         let obj = raw.add(GC_HEAD_SIZE) as *mut RawPyObject;
         std::ptr::write(&mut (*obj).ob_refcnt, AtomicIsize::new(1));
         (*obj).ob_type = tp;
-
-        // Debug: trace large object allocations (CyFunction etc.)
-        if obj_size > 100 {
-            let tp_name = if !tp.is_null() && !(*tp).tp_name.is_null() {
-                std::ffi::CStr::from_ptr((*tp).tp_name).to_str().unwrap_or("???")
-            } else { "(null tp)" };
-            eprintln!("[rustthon] _PyObject_GC_New: tp={:p} name={} basicsize={} -> obj={:p}, ob_type={:p}",
-                tp, tp_name, obj_size, obj, (*obj).ob_type);
-        }
 
         // Track the object
         PyObject_GC_Track(obj as *mut c_void);
@@ -436,8 +423,8 @@ unsafe fn gc_collect_impl() -> isize {
     let mut unreachable = find_unreachable(&tracked_snapshot);
 
     if unreachable.is_empty() {
-        // Clean up gc_next/gc_prev fields
-        cleanup_gc_fields(&tracked_snapshot);
+        // Clean up gc_next/gc_prev fields — no objects freed, snapshot is safe
+        cleanup_gc_fields_snapshot(&tracked_snapshot);
         return 0;
     }
 
@@ -499,7 +486,7 @@ unsafe fn gc_collect_impl() -> isize {
         unreachable = find_unreachable(&tracked_snapshot);
 
         if unreachable.is_empty() {
-            cleanup_gc_fields(&tracked_snapshot);
+            cleanup_gc_fields_snapshot(&tracked_snapshot);
             return 0;
         }
     }
@@ -553,14 +540,25 @@ unsafe fn gc_collect_impl() -> isize {
         }
     }
 
-    // Clean up gc_next/gc_prev fields on surviving objects
-    cleanup_gc_fields(&tracked_snapshot);
+    // Clean up gc_next/gc_prev fields on surviving objects.
+    // CRITICAL: Only iterate objects still in the tracked set — the unreachable
+    // objects have been freed and their memory may have been reused. Accessing
+    // freed gc_head pointers is a use-after-free bug.
+    with_gc(|state| {
+        for &gc_addr in &state.tracked {
+            let gc = gc_addr as *mut PyGCHead;
+            (*gc).gc_next = 0;
+            (*gc).gc_prev &= !GC_REACHABLE;
+        }
+    });
 
     n_garbage
 }
 
-/// Reset gc_next and GC_REACHABLE on all still-tracked objects.
-unsafe fn cleanup_gc_fields(tracked: &[*mut RawPyObject]) {
+/// Reset gc_next and GC_REACHABLE on objects from a snapshot.
+/// ONLY safe to call when no objects in the snapshot have been freed.
+/// Used in early-return paths where no garbage was collected.
+unsafe fn cleanup_gc_fields_snapshot(tracked: &[*mut RawPyObject]) {
     for &obj in tracked {
         let gc = gc_head_from_obj(obj as *mut c_void);
         if (*gc).gc_prev & GC_TRACKED != 0 {
@@ -584,4 +582,25 @@ pub unsafe extern "C" fn _PyObject_GC_UNTRACK(op: *mut c_void) {
     crate::ffi::panic_guard::guard_void("_PyObject_GC_UNTRACK", || unsafe {
         PyObject_GC_UnTrack(op);
     })
+}
+
+/// PyGC_Enable — enable the garbage collector.
+#[no_mangle]
+pub unsafe extern "C" fn PyGC_Enable() -> c_int {
+    // Always "enabled" — return previous state (1 = was enabled)
+    1
+}
+
+/// PyGC_Disable — disable the garbage collector.
+#[no_mangle]
+pub unsafe extern "C" fn PyGC_Disable() -> c_int {
+    // Stub: return previous state (1 = was enabled)
+    1
+}
+
+/// PyObject_GC_IsFinalized — check if an object has been finalized.
+/// Always returns 0 (not finalized) since we don't track finalization state.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_GC_IsFinalized(op: *mut RawPyObject) -> c_int {
+    0
 }

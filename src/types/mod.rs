@@ -12,6 +12,7 @@ pub mod dict;
 pub mod set;
 pub mod moduleobject;
 pub mod funcobject;
+pub mod capsule;
 
 /// Initialize all built-in type objects.
 /// Must be called once at startup before any objects are created.
@@ -46,6 +47,22 @@ pub fn init_types() {
                 if (*$ty.get()).tp_base.is_null() {
                     (*$ty.get()).tp_base = PyBaseObject_Type.get();
                 }
+                // Inherit key slots from base if not set
+                let base = (*$ty.get()).tp_base;
+                if !base.is_null() {
+                    if (*$ty.get()).tp_getattro.is_none() {
+                        (*$ty.get()).tp_getattro = (*base).tp_getattro;
+                    }
+                    if (*$ty.get()).tp_setattro.is_none() {
+                        (*$ty.get()).tp_setattro = (*base).tp_setattro;
+                    }
+                    if (*$ty.get()).tp_alloc.is_none() {
+                        (*$ty.get()).tp_alloc = (*base).tp_alloc;
+                    }
+                    if (*$ty.get()).tp_free.is_none() {
+                        (*$ty.get()).tp_free = (*base).tp_free;
+                    }
+                }
             };
         }
 
@@ -62,6 +79,9 @@ pub fn init_types() {
 
         // 5. Initialize exception hierarchy
         crate::runtime::error::init_exceptions();
+
+        // 6. Initialize method type
+        crate::ffi::object_api::init_method_type();
     }
 
     // Touch singletons to force lazy initialization

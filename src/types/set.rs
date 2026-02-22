@@ -75,7 +75,16 @@ fn hash_string(s: &str) -> isize {
 
 unsafe fn hash_object(obj: *mut RawPyObject) -> isize {
     if (*obj).ob_type == crate::types::unicode::unicode_type() {
-        hash_string(crate::types::unicode::unicode_value(obj))
+        // Check cached hash first (CPython stores computed hash in PyASCIIObject.hash)
+        let ascii = obj as *mut crate::types::unicode::PyASCIIObject;
+        let cached = (*ascii).hash;
+        if cached != -1 {
+            return cached;
+        }
+        let h = hash_string(crate::types::unicode::unicode_value(obj));
+        // Cache the computed hash back in the string object
+        (*ascii).hash = h;
+        h
     } else if (*obj).ob_type == crate::types::longobject::long_type()
            || (*obj).ob_type == crate::types::boolobject::bool_type() {
         let v = crate::types::longobject::long_as_i64(obj);

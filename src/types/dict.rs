@@ -101,7 +101,16 @@ fn hash_string(s: &str) -> isize {
 
 unsafe fn hash_object(obj: *mut RawPyObject) -> isize {
     if (*obj).ob_type == crate::types::unicode::unicode_type() {
-        hash_string(crate::types::unicode::unicode_value(obj))
+        // Check cached hash first (CPython stores computed hash in PyASCIIObject.hash)
+        let ascii = obj as *mut crate::types::unicode::PyASCIIObject;
+        let cached = (*ascii).hash;
+        if cached != -1 {
+            return cached;
+        }
+        let h = hash_string(crate::types::unicode::unicode_value(obj));
+        // Cache the computed hash back in the string object
+        (*ascii).hash = h;
+        h
     } else if (*obj).ob_type == crate::types::longobject::long_type()
            || (*obj).ob_type == crate::types::boolobject::bool_type() {
         let v = crate::types::longobject::long_as_i64(obj);
@@ -476,6 +485,26 @@ pub unsafe extern "C" fn PyDict_GetItemWithError(
 ) -> *mut RawPyObject {
     crate::ffi::panic_guard::guard_ptr("PyDict_GetItemWithError", || unsafe {
         PyDict_GetItem(dict, key)
+    })
+}
+
+/// _PyDict_GetItem_KnownHash — look up a key with a precomputed hash.
+#[no_mangle]
+pub unsafe extern "C" fn _PyDict_GetItem_KnownHash(
+    dict: *mut RawPyObject,
+    key: *mut RawPyObject,
+    hash: isize,
+) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("_PyDict_GetItem_KnownHash", || unsafe {
+        if dict.is_null() || key.is_null() { return ptr::null_mut(); }
+        let d = dict as *mut PyDictObject;
+        let entry_ix = lookup_key((*d).ma_keys, hash, key);
+        if entry_ix >= 0 {
+            let entries = dk_entries((*d).ma_keys);
+            (*entries.add(entry_ix as usize)).me_value
+        } else {
+            ptr::null_mut()
+        }
     })
 }
 

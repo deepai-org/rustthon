@@ -53,6 +53,309 @@ extern int PyFloat_Check(PyObject *o);
 extern int PyLong_Check(PyObject *o);
 extern int PyObject_TypeCheck(PyObject *o, void *tp);
 
+extern PyObject *PyObject_Str(PyObject *);
+extern PyObject *PyObject_Repr(PyObject *);
+
+/* ═══════════════════════════════════════════════════════
+ *  PyUnicode_FromFormat
+ *
+ *  CPython-compatible variadic format function.
+ *  Supports: %s (C string), %U (PyObject* unicode), %S (PyObject_Str),
+ *            %R (PyObject_Repr), %d/%i (int), %ld/%li (long),
+ *            %zd/%zi (Py_ssize_t), %p (pointer), %% (literal %)
+ *            %.NNNs (truncated string), %c (char), %u (unsigned)
+ * ═══════════════════════════════════════════════════════ */
+
+PyObject *PyUnicode_FromFormat(const char *format, ...) {
+    if (!format) return PyUnicode_FromString("");
+
+    char buf[4096];
+    char *out = buf;
+    char *end = buf + sizeof(buf) - 1;
+
+    va_list vargs;
+    va_start(vargs, format);
+
+    const char *f = format;
+    while (*f && out < end) {
+        if (*f != '%') {
+            *out++ = *f++;
+            continue;
+        }
+        f++; /* skip '%' */
+
+        /* Parse optional width/precision */
+        int precision = -1;
+        if (*f == '.') {
+            f++;
+            precision = 0;
+            while (*f >= '0' && *f <= '9') {
+                precision = precision * 10 + (*f - '0');
+                f++;
+            }
+        }
+
+        /* Parse optional length modifier */
+        int long_flag = 0, size_flag = 0;
+        if (*f == 'l') { long_flag = 1; f++; }
+        else if (*f == 'z') { size_flag = 1; f++; }
+
+        switch (*f) {
+        case 's': {
+            const char *s = va_arg(vargs, const char *);
+            if (!s) s = "(null)";
+            int len = (int)strlen(s);
+            if (precision >= 0 && precision < len) len = precision;
+            if (out + len > end) len = (int)(end - out);
+            memcpy(out, s, len);
+            out += len;
+            break;
+        }
+        case 'U': {
+            PyObject *obj = va_arg(vargs, PyObject *);
+            if (obj) {
+                const char *s = PyUnicode_AsUTF8(obj);
+                if (s) {
+                    int len = (int)strlen(s);
+                    if (out + len > end) len = (int)(end - out);
+                    memcpy(out, s, len);
+                    out += len;
+                }
+            }
+            break;
+        }
+        case 'S': {
+            PyObject *obj = va_arg(vargs, PyObject *);
+            if (obj) {
+                PyObject *str = PyObject_Str(obj);
+                if (str) {
+                    const char *s = PyUnicode_AsUTF8(str);
+                    if (s) {
+                        int len = (int)strlen(s);
+                        if (out + len > end) len = (int)(end - out);
+                        memcpy(out, s, len);
+                        out += len;
+                    }
+                }
+            }
+            break;
+        }
+        case 'R': {
+            PyObject *obj = va_arg(vargs, PyObject *);
+            if (obj) {
+                PyObject *repr = PyObject_Repr(obj);
+                if (repr) {
+                    const char *s = PyUnicode_AsUTF8(repr);
+                    if (s) {
+                        int len = (int)strlen(s);
+                        if (out + len > end) len = (int)(end - out);
+                        memcpy(out, s, len);
+                        out += len;
+                    }
+                }
+            }
+            break;
+        }
+        case 'd':
+        case 'i': {
+            char tmp[32];
+            if (long_flag) snprintf(tmp, sizeof(tmp), "%ld", va_arg(vargs, long));
+            else if (size_flag) snprintf(tmp, sizeof(tmp), "%zd", va_arg(vargs, Py_ssize_t));
+            else snprintf(tmp, sizeof(tmp), "%d", va_arg(vargs, int));
+            int len = (int)strlen(tmp);
+            if (out + len > end) len = (int)(end - out);
+            memcpy(out, tmp, len);
+            out += len;
+            break;
+        }
+        case 'u': {
+            char tmp[32];
+            if (long_flag) snprintf(tmp, sizeof(tmp), "%lu", va_arg(vargs, unsigned long));
+            else if (size_flag) snprintf(tmp, sizeof(tmp), "%zu", va_arg(vargs, size_t));
+            else snprintf(tmp, sizeof(tmp), "%u", va_arg(vargs, unsigned int));
+            int len = (int)strlen(tmp);
+            if (out + len > end) len = (int)(end - out);
+            memcpy(out, tmp, len);
+            out += len;
+            break;
+        }
+        case 'x': {
+            char tmp[32];
+            snprintf(tmp, sizeof(tmp), "%x", va_arg(vargs, unsigned int));
+            int len = (int)strlen(tmp);
+            if (out + len > end) len = (int)(end - out);
+            memcpy(out, tmp, len);
+            out += len;
+            break;
+        }
+        case 'p': {
+            char tmp[32];
+            snprintf(tmp, sizeof(tmp), "%p", va_arg(vargs, void *));
+            int len = (int)strlen(tmp);
+            if (out + len > end) len = (int)(end - out);
+            memcpy(out, tmp, len);
+            out += len;
+            break;
+        }
+        case 'c': {
+            int ch = va_arg(vargs, int);
+            *out++ = (char)ch;
+            break;
+        }
+        case '%':
+            *out++ = '%';
+            break;
+        default:
+            *out++ = '%';
+            if (out < end) *out++ = *f;
+            break;
+        }
+        f++;
+    }
+    *out = '\0';
+
+    va_end(vargs);
+    return PyUnicode_FromString(buf);
+}
+
+/* ═══════════════════════════════════════════════════════
+ *  PyErr_Format
+ *
+ *  Set an error with printf-style formatting.
+ *  Must be C variadic since extensions pass format args.
+ * ═══════════════════════════════════════════════════════ */
+
+extern void PyErr_SetString(PyObject *, const char *);
+
+PyObject *PyErr_Format(PyObject *exc_type, const char *format, ...) {
+    if (!format) {
+        PyErr_SetString(exc_type, "");
+        return (PyObject *)0;
+    }
+
+    char buf[4096];
+    char *out = buf;
+    char *end = buf + sizeof(buf) - 1;
+
+    va_list vargs;
+    va_start(vargs, format);
+
+    const char *f = format;
+    while (*f && out < end) {
+        if (*f != '%') {
+            *out++ = *f++;
+            continue;
+        }
+        f++;
+
+        int precision = -1;
+        if (*f == '.') {
+            f++;
+            precision = 0;
+            while (*f >= '0' && *f <= '9') {
+                precision = precision * 10 + (*f - '0');
+                f++;
+            }
+        }
+
+        int long_flag = 0, size_flag = 0;
+        if (*f == 'l') { long_flag = 1; f++; }
+        else if (*f == 'z') { size_flag = 1; f++; }
+
+        switch (*f) {
+        case 's': {
+            const char *s = va_arg(vargs, const char *);
+            if (!s) s = "(null)";
+            int len = (int)strlen(s);
+            if (precision >= 0 && precision < len) len = precision;
+            if (out + len > end) len = (int)(end - out);
+            memcpy(out, s, len);
+            out += len;
+            break;
+        }
+        case 'U': {
+            PyObject *obj = va_arg(vargs, PyObject *);
+            if (obj) {
+                const char *s = PyUnicode_AsUTF8(obj);
+                if (s) {
+                    int len = (int)strlen(s);
+                    if (out + len > end) len = (int)(end - out);
+                    memcpy(out, s, len);
+                    out += len;
+                }
+            }
+            break;
+        }
+        case 'S': {
+            PyObject *obj = va_arg(vargs, PyObject *);
+            if (obj) {
+                PyObject *str = PyObject_Str(obj);
+                if (str) {
+                    const char *s = PyUnicode_AsUTF8(str);
+                    if (s) {
+                        int len = (int)strlen(s);
+                        if (out + len > end) len = (int)(end - out);
+                        memcpy(out, s, len);
+                        out += len;
+                    }
+                }
+            }
+            break;
+        }
+        case 'R': {
+            PyObject *obj = va_arg(vargs, PyObject *);
+            if (obj) {
+                PyObject *repr = PyObject_Repr(obj);
+                if (repr) {
+                    const char *s = PyUnicode_AsUTF8(repr);
+                    if (s) {
+                        int len = (int)strlen(s);
+                        if (out + len > end) len = (int)(end - out);
+                        memcpy(out, s, len);
+                        out += len;
+                    }
+                }
+            }
+            break;
+        }
+        case 'd':
+        case 'i': {
+            char tmp[32];
+            if (long_flag) snprintf(tmp, sizeof(tmp), "%ld", va_arg(vargs, long));
+            else if (size_flag) snprintf(tmp, sizeof(tmp), "%zd", va_arg(vargs, Py_ssize_t));
+            else snprintf(tmp, sizeof(tmp), "%d", va_arg(vargs, int));
+            int len = (int)strlen(tmp);
+            if (out + len > end) len = (int)(end - out);
+            memcpy(out, tmp, len);
+            out += len;
+            break;
+        }
+        case 'p': {
+            char tmp[32];
+            snprintf(tmp, sizeof(tmp), "%p", va_arg(vargs, void *));
+            int len = (int)strlen(tmp);
+            if (out + len > end) len = (int)(end - out);
+            memcpy(out, tmp, len);
+            out += len;
+            break;
+        }
+        case '%':
+            *out++ = '%';
+            break;
+        default:
+            *out++ = '%';
+            if (out < end) *out++ = *f;
+            break;
+        }
+        f++;
+    }
+    *out = '\0';
+
+    va_end(vargs);
+    PyErr_SetString(exc_type, buf);
+    return (PyObject *)0;
+}
+
 /* ═══════════════════════════════════════════════════════
  *  PyArg_ParseTuple
  * ═══════════════════════════════════════════════════════ */

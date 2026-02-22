@@ -149,18 +149,60 @@ pub unsafe extern "C" fn PyObject_IsTrue(obj: *mut RawPyObject) -> c_int {
         if crate::types::boolobject::is_bool(obj) {
             return if crate::types::boolobject::is_true(obj) { 1 } else { 0 };
         }
-        // Check nb_bool
         let tp = (*obj).ob_type;
+        // Int check: ob_size == 0 means zero (falsy)
+        if !tp.is_null() && ((*tp).tp_flags & crate::object::typeobj::PY_TPFLAGS_LONG_SUBCLASS) != 0 {
+            let var_obj = obj as *mut crate::object::pyobject::RawPyVarObject;
+            return if (*var_obj).ob_size == 0 { 0 } else { 1 };
+        }
+        // Float check: 0.0 is falsy
+        if !tp.is_null() && (*obj).ob_type == crate::types::floatobject::float_type() {
+            let fval = crate::types::floatobject::PyFloat_AsDouble(obj);
+            return if fval == 0.0 { 0 } else { 1 };
+        }
+        // Check nb_bool
         if !tp.is_null() && !(*tp).tp_as_number.is_null() {
             if let Some(nb_bool) = (*(*tp).tp_as_number).nb_bool {
                 return nb_bool(obj);
             }
+        }
+        // String check: empty string is falsy
+        if !tp.is_null() && ((*tp).tp_flags & crate::object::typeobj::PY_TPFLAGS_UNICODE_SUBCLASS) != 0 {
+            let len = crate::types::unicode::PyUnicode_GetLength(obj);
+            return if len == 0 { 0 } else { 1 };
+        }
+        // Bytes check: empty bytes is falsy
+        if !tp.is_null() && ((*tp).tp_flags & crate::object::typeobj::PY_TPFLAGS_BYTES_SUBCLASS) != 0 {
+            let len = crate::types::bytes::PyBytes_Size(obj);
+            return if len == 0 { 0 } else { 1 };
         }
         // Check sq_length (empty containers are falsy)
         if !tp.is_null() && !(*tp).tp_as_sequence.is_null() {
             if let Some(sq_length) = (*(*tp).tp_as_sequence).sq_length {
                 let len = sq_length(obj);
                 return if len > 0 { 1 } else { 0 };
+            }
+        }
+        // Check mp_length (empty dicts/maps are falsy)
+        if !tp.is_null() && !(*tp).tp_as_mapping.is_null() {
+            if let Some(mp_length) = (*(*tp).tp_as_mapping).mp_length {
+                let len = mp_length(obj);
+                return if len > 0 { 1 } else { 0 };
+            }
+        }
+        // List/tuple/dict/set: check via known types
+        if !tp.is_null() {
+            if ((*tp).tp_flags & crate::object::typeobj::PY_TPFLAGS_LIST_SUBCLASS) != 0 {
+                let len = crate::types::list::PyList_Size(obj);
+                return if len == 0 { 0 } else { 1 };
+            }
+            if ((*tp).tp_flags & crate::object::typeobj::PY_TPFLAGS_TUPLE_SUBCLASS) != 0 {
+                let len = crate::types::tuple::PyTuple_Size(obj);
+                return if len == 0 { 0 } else { 1 };
+            }
+            if ((*tp).tp_flags & crate::object::typeobj::PY_TPFLAGS_DICT_SUBCLASS) != 0 {
+                let len = crate::types::dict::PyDict_Size(obj);
+                return if len == 0 { 0 } else { 1 };
             }
         }
         // Default: true
@@ -244,20 +286,40 @@ pub unsafe extern "C" fn PyObject_GetAttrString(
             if let Some(getattro) = (*tp).tp_getattro {
                 let name_obj = crate::types::unicode::PyUnicode_FromString(name);
                 let result = getattro(obj, name_obj);
+                // If getattro returned NULL but didn't set an exception, set AttributeError
+                if result.is_null() && crate::runtime::error::PyErr_Occurred().is_null() {
+                    crate::runtime::error::PyErr_SetString(
+                        *crate::runtime::error::PyExc_AttributeError.get(),
+                        name,
+                    );
+                }
                 (*name_obj).decref();
                 return result;
             }
             // Fall back to tp_getattr (legacy)
             if let Some(getattr) = (*tp).tp_getattr {
-                return getattr(obj, name as *mut c_char);
+                let result = getattr(obj, name as *mut c_char);
+                if result.is_null() && crate::runtime::error::PyErr_Occurred().is_null() {
+                    crate::runtime::error::PyErr_SetString(
+                        *crate::runtime::error::PyExc_AttributeError.get(),
+                        name,
+                    );
+                }
+                return result;
             }
         }
 
-        // For module objects, check their dict
-        if !tp.is_null() && (*tp).tp_name == crate::types::moduleobject::module_type() as *const _ as *const c_char {
-            // It's a module - look in its dict
-        }
-
+        // No getattr slot — set AttributeError
+        let name_s = if !name.is_null() {
+            std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()
+        } else { "(null)".to_string() };
+        let tp_name = if !tp.is_null() && !(*tp).tp_name.is_null() {
+            std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy().into_owned()
+        } else { "(null)".to_string() };
+        crate::runtime::error::PyErr_SetString(
+            *crate::runtime::error::PyExc_AttributeError.get(),
+            name,
+        );
         ptr::null_mut()
     })
 }
@@ -278,10 +340,34 @@ pub unsafe extern "C" fn PyObject_SetAttrString(
             if let Some(setattro) = (*tp).tp_setattro {
                 let name_obj = crate::types::unicode::PyUnicode_FromString(name);
                 let result = setattro(obj, name_obj, value);
+                // Ensure exception is set on failure
+                if result < 0 && crate::runtime::error::PyErr_Occurred().is_null() {
+                    crate::runtime::error::PyErr_SetString(
+                        *crate::runtime::error::PyExc_AttributeError.get(),
+                        name,
+                    );
+                }
                 (*name_obj).decref();
                 return result;
             }
         }
+        // No tp_setattro — try to set in tp_dict for type objects
+        if !tp.is_null() && crate::object::typeobj::is_type_object(obj) {
+            // obj is a type object — set in its tp_dict
+            let type_obj = obj as *mut crate::object::typeobj::RawPyTypeObject;
+            let dict = (*type_obj).tp_dict;
+            if !dict.is_null() {
+                let name_obj = crate::types::unicode::PyUnicode_FromString(name);
+                let result = crate::types::dict::PyDict_SetItem(dict, name_obj, value);
+                (*name_obj).decref();
+                return result;
+            }
+        }
+        // Set AttributeError
+        crate::runtime::error::PyErr_SetString(
+            *crate::runtime::error::PyExc_AttributeError.get(),
+            name,
+        );
         -1
     })
 }
@@ -299,8 +385,52 @@ pub unsafe extern "C" fn PyObject_GetAttr(
         let tp = (*obj).ob_type;
         if !tp.is_null() {
             if let Some(getattro) = (*tp).tp_getattro {
-                return getattro(obj, name);
+                let result = getattro(obj, name);
+                // Debug trace
+                if std::env::var("RUSTTHON_TRACE").is_ok() && result.is_null() {
+                    let name_str = crate::types::unicode::PyUnicode_AsUTF8(name);
+                    let attr = if !name_str.is_null() {
+                        std::ffi::CStr::from_ptr(name_str).to_string_lossy().into_owned()
+                    } else { "(null)".to_string() };
+                    let tp_name = if !(*tp).tp_name.is_null() {
+                        std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy().into_owned()
+                    } else { "(null)".to_string() };
+                    eprintln!("[rustthon] PyObject_GetAttr: '{}' NOT FOUND on type '{}', err_set={}",
+                        attr, tp_name, !crate::runtime::error::PyErr_Occurred().is_null());
+                }
+                // Ensure exception is set on failure
+                if result.is_null() && crate::runtime::error::PyErr_Occurred().is_null() {
+                    let name_cstr = crate::types::unicode::PyUnicode_AsUTF8(name);
+                    let attr = if !name_cstr.is_null() {
+                        std::ffi::CStr::from_ptr(name_cstr).to_string_lossy().into_owned()
+                    } else { "?".to_string() };
+                    let obj_tp_name = if !tp.is_null() && !(*tp).tp_name.is_null() {
+                        std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy().into_owned()
+                    } else { "?".to_string() };
+                    let msg = format!("'{}' object has no attribute '{}'\0", obj_tp_name, attr);
+                    crate::runtime::error::PyErr_SetString(
+                        *crate::runtime::error::PyExc_AttributeError.get(),
+                        msg.as_ptr() as *const c_char,
+                    );
+                }
+                return result;
             }
+        }
+        // No getattr slot — set AttributeError
+        {
+            let obj_tp = (*obj).ob_type;
+            let tp_name_s = if !obj_tp.is_null() && !(*obj_tp).tp_name.is_null() {
+                std::ffi::CStr::from_ptr((*obj_tp).tp_name).to_string_lossy().into_owned()
+            } else { format!("unknown({:p})", obj_tp) };
+            let name_cstr = crate::types::unicode::PyUnicode_AsUTF8(name);
+            let attr_s = if !name_cstr.is_null() {
+                std::ffi::CStr::from_ptr(name_cstr).to_string_lossy().into_owned()
+            } else { "?".to_string() };
+            let msg = format!("'{}' object has no attribute '{}'\0", tp_name_s, attr_s);
+            crate::runtime::error::PyErr_SetString(
+                *crate::runtime::error::PyExc_AttributeError.get(),
+                msg.as_ptr() as *const c_char,
+            );
         }
         ptr::null_mut()
     })
@@ -320,9 +450,21 @@ pub unsafe extern "C" fn PyObject_SetAttr(
         let tp = (*obj).ob_type;
         if !tp.is_null() {
             if let Some(setattro) = (*tp).tp_setattro {
-                return setattro(obj, name, value);
+                let result = setattro(obj, name, value);
+                if result < 0 && crate::runtime::error::PyErr_Occurred().is_null() {
+                    crate::runtime::error::PyErr_SetString(
+                        *crate::runtime::error::PyExc_AttributeError.get(),
+                        b"can't set attribute\0".as_ptr() as *const c_char,
+                    );
+                }
+                return result;
             }
         }
+        // No setattr slot
+        crate::runtime::error::PyErr_SetString(
+            *crate::runtime::error::PyExc_AttributeError.get(),
+            b"can't set attribute\0".as_ptr() as *const c_char,
+        );
         -1
     })
 }
@@ -741,6 +883,71 @@ pub unsafe extern "C" fn PyNumber_Index(obj: *mut RawPyObject) -> *mut RawPyObje
     })
 }
 
+/// PyMethodObject — a bound method (function + self).
+/// Layout matches CPython's PyMethodObject.
+#[repr(C)]
+pub struct PyMethodObject {
+    pub ob_refcnt: std::sync::atomic::AtomicIsize,
+    pub ob_type: *mut RawPyTypeObject,
+    pub im_func: *mut RawPyObject,
+    pub im_self: *mut RawPyObject,
+    pub im_weakreflist: *mut RawPyObject,
+}
+
+/// method_call — tp_call for PyMethod_Type.
+/// Prepends self to the args tuple and calls the underlying function.
+unsafe extern "C" fn method_call(
+    method: *mut RawPyObject,
+    args: *mut RawPyObject,
+    kwargs: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let m = method as *mut PyMethodObject;
+    let func = (*m).im_func;
+    let self_obj = (*m).im_self;
+    // Build new args tuple: (self, *args)
+    let nargs = if args.is_null() { 0 } else { crate::types::tuple::PyTuple_GET_SIZE(args) };
+    let new_args = crate::types::tuple::PyTuple_New(nargs + 1);
+    if !self_obj.is_null() {
+        (*self_obj).incref();
+    }
+    crate::types::tuple::PyTuple_SET_ITEM(new_args, 0, self_obj);
+    for i in 0..nargs {
+        let arg = crate::types::tuple::PyTuple_GET_ITEM(args, i);
+        if !arg.is_null() {
+            (*arg).incref();
+        }
+        crate::types::tuple::PyTuple_SET_ITEM(new_args, i + 1, arg);
+    }
+
+    let result = PyObject_Call(func, new_args, kwargs);
+    (*new_args).decref();
+    result
+}
+
+/// method_dealloc — tp_dealloc for PyMethod_Type.
+unsafe extern "C" fn method_dealloc(obj: *mut RawPyObject) {
+    let m = obj as *mut PyMethodObject;
+    if !(*m).im_func.is_null() {
+        (*(*m).im_func).decref();
+    }
+    if !(*m).im_self.is_null() {
+        (*(*m).im_self).decref();
+    }
+    libc::free(obj as *mut _);
+}
+
+/// Initialize PyMethod_Type slots (called during Py_Initialize).
+pub unsafe fn init_method_type() {
+    let tp = crate::object::typeobj::PyMethod_Type.get();
+    (*tp).tp_call = Some(method_call);
+    (*tp).tp_dealloc = Some(method_dealloc);
+    (*tp).tp_basicsize = std::mem::size_of::<PyMethodObject>() as isize;
+    (*tp).ob_base.ob_type = crate::object::typeobj::PyType_Type.get();
+    (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
+    (*tp).tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
+        | crate::object::typeobj::PY_TPFLAGS_READY;
+}
+
 /// PyMethod_New — create a bound method from a function and an instance.
 #[no_mangle]
 pub unsafe extern "C" fn PyMethod_New(
@@ -748,19 +955,23 @@ pub unsafe extern "C" fn PyMethod_New(
     self_obj: *mut RawPyObject,
 ) -> *mut RawPyObject {
     crate::ffi::panic_guard::guard_ptr("PyMethod_New", || unsafe {
-        // Simplified: create a tuple (func, self) as a method stand-in.
-        // A real implementation would use a PyMethodObject type.
         if func.is_null() {
             return ptr::null_mut();
         }
-        let method = crate::types::tuple::PyTuple_New(2);
+        let m = libc::calloc(1, std::mem::size_of::<PyMethodObject>()) as *mut PyMethodObject;
+        if m.is_null() {
+            return ptr::null_mut();
+        }
+        std::ptr::write(&mut (*m).ob_refcnt, std::sync::atomic::AtomicIsize::new(1));
+        (*m).ob_type = crate::object::typeobj::PyMethod_Type.get();
         (*func).incref();
-        crate::types::tuple::PyTuple_SET_ITEM(method, 0, func);
+        (*m).im_func = func;
         if !self_obj.is_null() {
             (*self_obj).incref();
         }
-        crate::types::tuple::PyTuple_SET_ITEM(method, 1, self_obj);
-        method
+        (*m).im_self = self_obj;
+        (*m).im_weakreflist = ptr::null_mut();
+        m as *mut RawPyObject
     })
 }
 
@@ -778,6 +989,371 @@ pub unsafe extern "C" fn PyCMethod_New(
             return ptr::null_mut();
         }
         crate::types::funcobject::PyCFunction_NewEx(ml, self_obj, module)
+    })
+}
+
+/// PyObject_HasAttr — check if an object has an attribute (by PyObject name).
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_HasAttr(
+    obj: *mut RawPyObject,
+    name: *mut RawPyObject,
+) -> c_int {
+    crate::ffi::panic_guard::guard_int("PyObject_HasAttr", || unsafe {
+        let attr = PyObject_GetAttr(obj, name);
+        if attr.is_null() {
+            crate::runtime::error::PyErr_Clear();
+            0
+        } else {
+            (*attr).decref();
+            1
+        }
+    })
+}
+
+/// PyObject_IsSubclass — check if derived is a subclass of cls.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_IsSubclass(
+    derived: *mut RawPyObject,
+    cls: *mut RawPyObject,
+) -> c_int {
+    crate::ffi::panic_guard::guard_int("PyObject_IsSubclass", || unsafe {
+        if derived.is_null() || cls.is_null() {
+            return -1;
+        }
+        crate::object::typeobj::PyType_IsSubtype(
+            derived as *mut RawPyTypeObject,
+            cls as *mut RawPyTypeObject,
+        )
+    })
+}
+
+/// PyObject_CallMethodObjArgs — call a method on an object.
+/// The method name and args are PyObject*s, terminated by NULL.
+/// Since Rust can't handle C varargs, this is a C shim.
+/// Here we provide a simplified version that handles 0-3 args.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_CallMethodObjArgs(
+    obj: *mut RawPyObject,
+    name: *mut RawPyObject,
+    // varargs: PyObject*, ..., NULL — handled by C shim in csrc/varargs.c
+) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyObject_CallMethodObjArgs", || unsafe {
+        if obj.is_null() || name.is_null() {
+            return ptr::null_mut();
+        }
+        let method = PyObject_GetAttr(obj, name);
+        if method.is_null() {
+            return ptr::null_mut();
+        }
+        // Called with no extra args (the varargs are NULL-terminated, and the
+        // first vararg after `name` is NULL for no-arg calls)
+        let result = PyObject_CallNoArgs(method);
+        (*method).decref();
+        result
+    })
+}
+
+/// PyObject_CallFinalizerFromDealloc — call tp_finalize if set, then check
+/// if the object was resurrected. Returns 0 if dealloc should proceed, -1 if resurrected.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_CallFinalizerFromDealloc(
+    obj: *mut RawPyObject,
+) -> c_int {
+    crate::ffi::panic_guard::guard_int("PyObject_CallFinalizerFromDealloc", || unsafe {
+        if obj.is_null() {
+            return 0;
+        }
+        let tp = (*obj).ob_type;
+        if tp.is_null() {
+            return 0;
+        }
+        if let Some(finalize) = (*tp).tp_finalize {
+            // Temporarily resurrect the object (prevent double-free)
+            (*obj).ob_refcnt.store(1, std::sync::atomic::Ordering::Relaxed);
+            finalize(obj);
+            // Check if something took a reference during finalization
+            let refcnt = (*obj).ob_refcnt.load(std::sync::atomic::Ordering::Relaxed);
+            if refcnt > 1 {
+                // Object was resurrected — undo the dealloc
+                (*obj).ob_refcnt.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                return -1;
+            }
+            // Set refcnt back to 0 for dealloc
+            (*obj).ob_refcnt.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        0
+    })
+}
+
+/// PyObject_VectorcallDict — call a callable with args array + kwargs dict.
+/// Used by Cython's __Pyx_PyObject_Call.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_VectorcallDict(
+    callable: *mut RawPyObject,
+    args: *const *mut RawPyObject,
+    nargsf: usize,
+    kwdict: *mut RawPyObject,
+) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyObject_VectorcallDict", || unsafe {
+        if callable.is_null() {
+            return ptr::null_mut();
+        }
+        let nargs = nargsf & !(1usize << (usize::BITS - 1)); // mask out PY_VECTORCALL_ARGUMENTS_OFFSET
+
+        // Build args tuple
+        let args_tuple = crate::types::tuple::PyTuple_New(nargs as isize);
+        if !args.is_null() {
+            for i in 0..nargs {
+                let arg = *args.add(i);
+                if !arg.is_null() {
+                    (*arg).incref();
+                }
+                crate::types::tuple::PyTuple_SET_ITEM(args_tuple, i as isize, arg);
+            }
+        }
+
+        let result = PyObject_Call(callable, args_tuple, kwdict);
+        (*args_tuple).decref();
+        result
+    })
+}
+
+/// PyObject_Vectorcall — call a callable with vectorcall protocol.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_Vectorcall(
+    callable: *mut RawPyObject,
+    args: *const *mut RawPyObject,
+    nargsf: usize,
+    kwnames: *mut RawPyObject,
+) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyObject_Vectorcall", || unsafe {
+        // Simplified: ignore kwnames, delegate to VectorcallDict with no kwargs
+        PyObject_VectorcallDict(callable, args, nargsf, ptr::null_mut())
+    })
+}
+
+/// PyObject_VectorcallMethod — call a method by name with vectorcall args.
+#[no_mangle]
+pub unsafe extern "C" fn PyObject_VectorcallMethod(
+    name: *mut RawPyObject,
+    args: *const *mut RawPyObject,
+    nargsf: usize,
+    kwnames: *mut RawPyObject,
+) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyObject_VectorcallMethod", || unsafe {
+        if name.is_null() || args.is_null() {
+            return ptr::null_mut();
+        }
+        let nargs = nargsf & !(1usize << (usize::BITS - 1));
+        if nargs == 0 {
+            return ptr::null_mut();
+        }
+        // args[0] is self
+        let self_obj = *args.add(0);
+        if self_obj.is_null() {
+            return ptr::null_mut();
+        }
+        let method = PyObject_GetAttr(self_obj, name);
+        if method.is_null() {
+            return ptr::null_mut();
+        }
+        // Build args tuple from args[1..nargs]
+        let actual_nargs = nargs - 1;
+        let args_tuple = crate::types::tuple::PyTuple_New(actual_nargs as isize);
+        for i in 0..actual_nargs {
+            let arg = *args.add(i + 1);
+            if !arg.is_null() {
+                (*arg).incref();
+            }
+            crate::types::tuple::PyTuple_SET_ITEM(args_tuple, i as isize, arg);
+        }
+        let result = PyObject_Call(method, args_tuple, ptr::null_mut());
+        (*args_tuple).decref();
+        (*method).decref();
+        result
+    })
+}
+
+/// PySequence_Contains — check if a sequence contains a value.
+#[no_mangle]
+pub unsafe extern "C" fn PySequence_Contains(
+    seq: *mut RawPyObject,
+    value: *mut RawPyObject,
+) -> c_int {
+    crate::ffi::panic_guard::guard_int("PySequence_Contains", || unsafe {
+        if seq.is_null() || value.is_null() {
+            return -1;
+        }
+        let tp = (*seq).ob_type;
+        // Try sq_contains first
+        if !tp.is_null() && !(*tp).tp_as_sequence.is_null() {
+            if let Some(sq_contains) = (*(*tp).tp_as_sequence).sq_contains {
+                return sq_contains(seq, value);
+            }
+        }
+        // Fallback: iterate
+        let iter = PyObject_GetIter(seq);
+        if iter.is_null() {
+            return -1;
+        }
+        loop {
+            let item = PyIter_Next(iter);
+            if item.is_null() {
+                (*iter).decref();
+                // Check if iteration ended normally or with error
+                if crate::runtime::error::PyErr_Occurred().is_null() {
+                    return 0; // not found
+                }
+                return -1; // error
+            }
+            let cmp = PyObject_RichCompareBool(item, value, PY_EQ);
+            (*item).decref();
+            if cmp > 0 {
+                (*iter).decref();
+                return 1; // found
+            }
+            if cmp < 0 {
+                (*iter).decref();
+                return -1; // error
+            }
+        }
+    })
+}
+
+/// PyNumber_InPlaceAdd — in-place addition (nb_inplace_add or nb_add).
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_InPlaceAdd(
+    v: *mut RawPyObject,
+    w: *mut RawPyObject,
+) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyNumber_InPlaceAdd", || unsafe {
+        if v.is_null() || w.is_null() {
+            return ptr::null_mut();
+        }
+        let tp = (*v).ob_type;
+        if !tp.is_null() && !(*tp).tp_as_number.is_null() {
+            // Try nb_inplace_add first
+            if let Some(iadd) = (*(*tp).tp_as_number).nb_inplace_add {
+                return iadd(v, w);
+            }
+            // Fall back to nb_add
+            if let Some(add) = (*(*tp).tp_as_number).nb_add {
+                return add(v, w);
+            }
+        }
+        ptr::null_mut()
+    })
+}
+
+/// PyNumber_Remainder — modulo operation (nb_remainder).
+#[no_mangle]
+pub unsafe extern "C" fn PyNumber_Remainder(
+    v: *mut RawPyObject,
+    w: *mut RawPyObject,
+) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyNumber_Remainder", || unsafe {
+        if v.is_null() || w.is_null() {
+            return ptr::null_mut();
+        }
+        let tp = (*v).ob_type;
+        if !tp.is_null() && !(*tp).tp_as_number.is_null() {
+            if let Some(rem) = (*(*tp).tp_as_number).nb_remainder {
+                return rem(v, w);
+            }
+        }
+        ptr::null_mut()
+    })
+}
+
+/// Py_EnterRecursiveCall — guard against C stack overflow.
+/// Stub: always returns 0 (success).
+#[no_mangle]
+pub unsafe extern "C" fn Py_EnterRecursiveCall(_where: *const c_char) -> c_int {
+    0
+}
+
+/// Py_LeaveRecursiveCall — leave recursion guard.
+#[no_mangle]
+pub unsafe extern "C" fn Py_LeaveRecursiveCall() {
+    // No-op
+}
+
+/// _PyObject_GenericGetAttrWithDict — GenericGetAttr with an explicit dict and suppress flag.
+/// When suppress=1, returns NULL without setting AttributeError on failure.
+/// This is used by Cython's __Pyx_PyObject_GetAttrStrNoError.
+#[no_mangle]
+pub unsafe extern "C" fn _PyObject_GenericGetAttrWithDict(
+    obj: *mut RawPyObject,
+    name: *mut RawPyObject,
+    dict: *mut RawPyObject,
+    suppress: c_int,
+) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("_PyObject_GenericGetAttrWithDict", || unsafe {
+        if obj.is_null() || name.is_null() {
+            return ptr::null_mut();
+        }
+
+        // Try the provided dict first
+        if !dict.is_null() {
+            let value = crate::types::dict::PyDict_GetItem(dict, name);
+            if !value.is_null() {
+                (*value).incref();
+                return value;
+            }
+        }
+
+        // Do the full GenericGetAttr lookup
+        let result = crate::object::typeobj::PyObject_GenericGetAttr(obj, name);
+
+        // Debug trace
+        if std::env::var("RUSTTHON_TRACE").is_ok() {
+            let name_str = crate::types::unicode::PyUnicode_AsUTF8(name);
+            let attr = if !name_str.is_null() {
+                std::ffi::CStr::from_ptr(name_str).to_string_lossy().into_owned()
+            } else { "(null)".to_string() };
+            let tp = (*obj).ob_type;
+            let tp_name = if !tp.is_null() && !(*tp).tp_name.is_null() {
+                std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy().into_owned()
+            } else { "(null)".to_string() };
+            eprintln!("[rustthon] _PyObject_GenericGetAttrWithDict: obj type='{}' attr='{}' found={} suppress={}",
+                tp_name, attr, !result.is_null(), suppress);
+        }
+
+        // If suppress=1 and lookup failed with AttributeError, clear the error
+        if result.is_null() && suppress != 0 {
+            if !crate::runtime::error::PyErr_Occurred().is_null() {
+                let exc_type = crate::runtime::error::PyErr_Occurred();
+                let attr_error = *crate::runtime::error::PyExc_AttributeError.get();
+                if exc_type == attr_error {
+                    crate::runtime::error::PyErr_Clear();
+                }
+            }
+        }
+
+        result
+    })
+}
+
+/// _PyObject_GetDictPtr — get the __dict__ pointer of an object.
+/// Returns pointer to the PyObject* dict slot inside the object.
+#[no_mangle]
+pub unsafe extern "C" fn _PyObject_GetDictPtr(
+    obj: *mut RawPyObject,
+) -> *mut *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("_PyObject_GetDictPtr", || unsafe {
+        if obj.is_null() {
+            return ptr::null_mut();
+        }
+        let tp = (*obj).ob_type;
+        if tp.is_null() {
+            return ptr::null_mut();
+        }
+        let offset = (*tp).tp_dictoffset;
+        if offset > 0 {
+            (obj as *mut u8).add(offset as usize) as *mut *mut RawPyObject
+        } else {
+            ptr::null_mut()
+        }
     })
 }
 

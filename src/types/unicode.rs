@@ -296,18 +296,7 @@ pub unsafe extern "C" fn PyUnicode_FromStringAndSize(
     })
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn PyUnicode_FromFormat(
-    format: *const c_char,
-) -> *mut RawPyObject {
-    crate::ffi::panic_guard::guard_ptr("PyUnicode_FromFormat", || unsafe {
-        if format.is_null() {
-            return create_unicode("");
-        }
-        let c_str = CStr::from_ptr(format);
-        create_unicode(&c_str.to_string_lossy())
-    })
-}
+// PyUnicode_FromFormat is implemented in csrc/varargs.c (C variadic function)
 
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_AsUTF8(obj: *mut RawPyObject) -> *const c_char {
@@ -600,7 +589,11 @@ pub unsafe extern "C" fn PyUnicode_AsUTF8String(
     obj: *mut RawPyObject,
 ) -> *mut RawPyObject {
     crate::ffi::panic_guard::guard_ptr("PyUnicode_AsUTF8String", || unsafe {
-        PyUnicode_AsEncodedString(obj, b"utf-8\0".as_ptr() as *const c_char, ptr::null())
+        let result = PyUnicode_AsEncodedString(obj, b"utf-8\0".as_ptr() as *const c_char, ptr::null());
+        if std::env::var("RUSTTHON_TRACE").is_ok() {
+            eprintln!("[rustthon] PyUnicode_AsUTF8String({:p}) -> {:p}", obj, result);
+        }
+        result
     })
 }
 
@@ -665,6 +658,83 @@ pub unsafe extern "C" fn _PyUnicode_FastCopyCharacters(
                     _ => {}
                 }
             }
+        }
+    })
+}
+
+/// PyUnicode_Decode — decode bytes to a unicode object using a named encoding.
+/// Simplified: only supports utf-8, latin-1, and ascii.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_Decode(
+    s: *const c_char,
+    size: isize,
+    encoding: *const c_char,
+    _errors: *const c_char,
+) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyUnicode_Decode", || unsafe {
+        if s.is_null() || size < 0 {
+            return ptr::null_mut();
+        }
+        // Default to UTF-8 if encoding is NULL
+        let enc = if !encoding.is_null() {
+            CStr::from_ptr(encoding).to_string_lossy().to_lowercase()
+        } else {
+            "utf-8".to_string()
+        };
+
+        match enc.as_str() {
+            "utf-8" | "utf8" => {
+                PyUnicode_DecodeUTF8(s, size, ptr::null())
+            }
+            "latin-1" | "latin1" | "iso-8859-1" | "iso8859-1" => {
+                // Latin-1: each byte is the unicode codepoint
+                let bytes = std::slice::from_raw_parts(s as *const u8, size as usize);
+                let decoded: String = bytes.iter().map(|&b| b as char).collect();
+                create_from_str(&decoded)
+            }
+            "ascii" => {
+                PyUnicode_DecodeUTF8(s, size, ptr::null())
+            }
+            _ => {
+                // Unsupported encoding — try UTF-8 as fallback
+                PyUnicode_DecodeUTF8(s, size, ptr::null())
+            }
+        }
+    })
+}
+
+/// PyUnicode_Format — Python % formatting on unicode objects.
+/// Simplified: returns the format string unmodified if substitution fails.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_Format(
+    format: *mut RawPyObject,
+    args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyUnicode_Format", || unsafe {
+        if format.is_null() {
+            return ptr::null_mut();
+        }
+        // For now, just return format string as-is
+        // Full %-formatting is complex; pyyaml mainly uses this for error messages
+        (*format).incref();
+        format
+    })
+}
+
+/// PyUnicode_FromOrdinal — create a unicode string from a single codepoint.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_FromOrdinal(ordinal: c_int) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyUnicode_FromOrdinal", || unsafe {
+        if ordinal < 0 || ordinal > 0x10FFFF {
+            return ptr::null_mut();
+        }
+        match char::from_u32(ordinal as u32) {
+            Some(ch) => {
+                let mut buf = [0u8; 4];
+                let s = ch.encode_utf8(&mut buf);
+                create_from_str(s)
+            }
+            None => ptr::null_mut(),
         }
     })
 }

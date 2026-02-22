@@ -128,6 +128,9 @@ compile test_cython/test_cython.c  test_cython_bin    "-ldl"
 # Phase 5: PyO3 bcrypt
 compile test_bcrypt/test_bcrypt.c  test_bcrypt_bin    "-ldl"
 
+# Phase 6: pyyaml (Cython)
+compile test_pyyaml/test_pyyaml.c test_pyyaml_bin    "-ldl"
+
 # Thin binary shim (for native import tests)
 compile csrc/main.c               rustthon_bin       "-ldl"
 
@@ -159,6 +162,9 @@ run_suite "Phase 4.5: Cython Extension" ./test_cython_bin
 
 # Phase 5: PyO3 bcrypt
 run_suite "Phase 5: PyO3 bcrypt" ./test_bcrypt_bin
+
+# Phase 6: pyyaml (Cython)
+run_suite "Phase 6: pyyaml (Cython)" ./test_pyyaml_bin
 
 # ═══════════════════════════════════════════════════════════
 printf "${BOLD}═══════════════════════════════════════════════════════════${RESET}\n"

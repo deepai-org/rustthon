@@ -438,6 +438,7 @@ pub static PyBaseObject_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::
 
 /// PyType_GenericAlloc — default allocator for new instances.
 /// Allocates tp_basicsize + nitems * tp_itemsize bytes via calloc.
+/// For GC types (PY_TPFLAGS_HAVE_GC), prepends a PyGC_Head (16 bytes).
 #[no_mangle]
 pub unsafe extern "C" fn PyType_GenericAlloc(
     tp: *mut RawPyTypeObject,
@@ -446,17 +447,39 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
     crate::ffi::panic_guard::guard_ptr("PyType_GenericAlloc", || unsafe {
         let basic = (*tp).tp_basicsize as usize;
         let item = (*tp).tp_itemsize as usize;
-        let total = basic + (nitems.max(0) as usize) * item;
-        let obj = libc::calloc(1, total) as *mut RawPyObject;
-        if obj.is_null() {
-            eprintln!("Fatal: out of memory in PyType_GenericAlloc");
-            std::process::abort();
-        }
+        let obj_size = basic + (nitems.max(0) as usize) * item;
+        let is_gc = (*tp).tp_flags & PY_TPFLAGS_HAVE_GC != 0;
+
+        let obj = if is_gc {
+            // GC types need a PyGC_Head prefix (16 bytes)
+            let gc_head_size = std::mem::size_of::<crate::object::pyobject::PyGCHead>();
+            let total = gc_head_size + obj_size;
+            let raw = libc::calloc(1, total) as *mut u8;
+            if raw.is_null() {
+                eprintln!("Fatal: out of memory in PyType_GenericAlloc");
+                std::process::abort();
+            }
+            // Object starts after the GC head
+            raw.add(gc_head_size) as *mut RawPyObject
+        } else {
+            let obj = libc::calloc(1, obj_size) as *mut RawPyObject;
+            if obj.is_null() {
+                eprintln!("Fatal: out of memory in PyType_GenericAlloc");
+                std::process::abort();
+            }
+            obj
+        };
+
         std::ptr::write(
             &mut (*obj).ob_refcnt,
             std::sync::atomic::AtomicIsize::new(1),
         );
         (*obj).ob_type = tp;
+
+        if is_gc {
+            crate::object::gc::PyObject_GC_Track(obj as *mut std::os::raw::c_void);
+        }
+
         obj
     })
 }
@@ -486,6 +509,67 @@ unsafe extern "C" fn default_init(
     0
 }
 
+/// type_call — called when a type object is used as a callable (e.g. CParser(...)).
+/// This is the tp_call slot for PyType_Type (the metaclass).
+/// It calls tp_new to allocate, then tp_init to initialize.
+unsafe extern "C" fn type_call(
+    callable: *mut RawPyObject,
+    args: *mut RawPyObject,
+    kwargs: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let tp = callable as *mut RawPyTypeObject;
+
+    // Call tp_new
+    let new_fn = (*tp).tp_new.unwrap_or(PyType_GenericNew);
+    let obj = new_fn(tp, args, kwargs);
+    if obj.is_null() {
+        return ptr::null_mut();
+    }
+
+    // Call tp_init if available
+    if let Some(init_fn) = (*tp).tp_init {
+        let res = init_fn(obj, args, kwargs);
+        if res < 0 {
+            (*obj).decref();
+            return ptr::null_mut();
+        }
+    }
+
+    // Clear any stale errors left by __set_name__ or other non-fatal lookups
+    // during initialization. CPython does this implicitly via exception suppression
+    // in type_new, but we need to do it explicitly.
+    if !crate::runtime::error::PyErr_Occurred().is_null() {
+        crate::runtime::error::PyErr_Clear();
+    }
+
+    obj
+}
+
+/// Check if `obj` is a type object by walking its metaclass's tp_base chain
+/// to see if it leads to PyType_Type. This correctly handles dynamically
+/// created metatypes (e.g. Cython's _common_types_metatype) that don't have
+/// PY_TPFLAGS_TYPE_SUBCLASS set.
+pub unsafe fn is_type_object(obj: *mut RawPyObject) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    let tp = (*obj).ob_type;
+    if tp.is_null() {
+        return false;
+    }
+    let type_type = PyType_Type.get();
+    // Walk the metaclass chain: tp -> tp.tp_base -> ...
+    // If any ancestor is PyType_Type, then obj is a type object.
+    let mut cur = tp;
+    while !cur.is_null() {
+        if cur == type_type {
+            return true;
+        }
+        cur = (*cur).tp_base;
+    }
+    false
+}
+
 /// PyObject_GenericGetAttr — look up attribute in type's tp_dict.
 #[no_mangle]
 pub unsafe extern "C" fn PyObject_GenericGetAttr(
@@ -493,7 +577,6 @@ pub unsafe extern "C" fn PyObject_GenericGetAttr(
     name: *mut RawPyObject,
 ) -> *mut RawPyObject {
     crate::ffi::panic_guard::guard_ptr("PyObject_GenericGetAttr", || unsafe {
-        // Walk the type's MRO/tp_dict to find the attribute
         if obj.is_null() || name.is_null() {
             return ptr::null_mut();
         }
@@ -501,33 +584,132 @@ pub unsafe extern "C" fn PyObject_GenericGetAttr(
         if tp.is_null() {
             return ptr::null_mut();
         }
-        // Check tp_dict of the type
-        let dict = (*tp).tp_dict;
-        if !dict.is_null() {
-            let result = crate::types::dict::PyDict_GetItem(dict, name);
-            if !result.is_null() {
-                (*result).incref();
-                return result;
-            }
-        }
-        // Walk tp_base chain
-        let mut base = (*tp).tp_base;
-        while !base.is_null() {
-            let bdict = (*base).tp_dict;
-            if !bdict.is_null() {
-                let result = crate::types::dict::PyDict_GetItem(bdict, name);
+
+        // If obj IS a type object, search its own tp_dict and MRO
+        if is_type_object(obj) {
+            let type_obj = obj as *mut RawPyTypeObject;
+            // Search own tp_dict
+            let dict = (*type_obj).tp_dict;
+            if !dict.is_null() {
+                let result = crate::types::dict::PyDict_GetItem(dict, name);
                 if !result.is_null() {
                     (*result).incref();
                     return result;
                 }
             }
-            base = (*base).tp_base;
+            // Walk tp_base chain of the type itself
+            let mut base = (*type_obj).tp_base;
+            while !base.is_null() {
+                let bdict = (*base).tp_dict;
+                if !bdict.is_null() {
+                    let result = crate::types::dict::PyDict_GetItem(bdict, name);
+                    if !result.is_null() {
+                        (*result).incref();
+                        return result;
+                    }
+                }
+                base = (*base).tp_base;
+            }
+            // Debug trace
+            if std::env::var("RUSTTHON_TRACE").is_ok() {
+                let name_str = crate::types::unicode::PyUnicode_AsUTF8(name);
+                let attr = if !name_str.is_null() {
+                    std::ffi::CStr::from_ptr(name_str).to_string_lossy().into_owned()
+                } else { "(null)".to_string() };
+                let self_name = if !(*type_obj).tp_name.is_null() {
+                    std::ffi::CStr::from_ptr((*type_obj).tp_name).to_string_lossy().into_owned()
+                } else { "(null)".to_string() };
+                let dict_size = if !dict.is_null() {
+                    crate::types::dict::PyDict_Size(dict)
+                } else { -1 };
+                eprintln!("[rustthon] GenericGetAttr(type): '{}' NOT FOUND on '{}' (dict_size={}, tp_base={:p})",
+                    attr, self_name, dict_size, (*type_obj).tp_base);
+            }
+            // Not found — set AttributeError with details
+            {
+                let name_str = crate::types::unicode::PyUnicode_AsUTF8(name);
+                let attr = if !name_str.is_null() {
+                    std::ffi::CStr::from_ptr(name_str).to_string_lossy().into_owned()
+                } else { "?".to_string() };
+                let self_name = if !(*type_obj).tp_name.is_null() {
+                    std::ffi::CStr::from_ptr((*type_obj).tp_name).to_string_lossy().into_owned()
+                } else { "?".to_string() };
+                let msg = format!("type object '{}' has no attribute '{}'\0", self_name, attr);
+                crate::runtime::error::PyErr_SetString(
+                    crate::runtime::error::_Rustthon_Exc_AttributeError(),
+                    msg.as_ptr() as *const c_char,
+                );
+            }
+            return ptr::null_mut();
         }
-        // Attribute not found — set AttributeError
-        crate::runtime::error::PyErr_SetString(
-            crate::runtime::error::_Rustthon_Exc_AttributeError(),
-            b"attribute not found\0".as_ptr() as *const c_char,
-        );
+
+        // For instances: check instance dict first (tp_dictoffset)
+        let offset = (*tp).tp_dictoffset;
+        if offset > 0 {
+            let dict_ptr = (obj as *mut u8).add(offset as usize) as *mut *mut RawPyObject;
+            let dict = *dict_ptr;
+            if !dict.is_null() {
+                let result = crate::types::dict::PyDict_GetItem(dict, name);
+                if !result.is_null() {
+                    (*result).incref();
+                    return result;
+                }
+            }
+        }
+
+        // Then check the type's tp_dict and base chain (with descriptor protocol)
+        let mut descr: *mut RawPyObject = ptr::null_mut();
+        let dict = (*tp).tp_dict;
+        if !dict.is_null() {
+            descr = crate::types::dict::PyDict_GetItem(dict, name);
+        }
+        if descr.is_null() {
+            let mut base = (*tp).tp_base;
+            while !base.is_null() && descr.is_null() {
+                let bdict = (*base).tp_dict;
+                if !bdict.is_null() {
+                    descr = crate::types::dict::PyDict_GetItem(bdict, name);
+                }
+                base = (*base).tp_base;
+            }
+        }
+        if !descr.is_null() {
+            // Descriptor protocol: check if the found object has tp_descr_get
+            let descr_tp = (*descr).ob_type;
+            if !descr_tp.is_null() {
+                if let Some(descr_get) = (*descr_tp).tp_descr_get {
+                    // Call __get__(descr, obj, type(obj)) to bind the descriptor
+                    let result = descr_get(descr, obj, tp as *mut RawPyObject);
+                    if !result.is_null() {
+                        return result;
+                    }
+                    // If __get__ returned NULL, fall through to return raw descriptor
+                    // (clear any spurious error)
+                    if !crate::runtime::error::PyErr_Occurred().is_null() {
+                        crate::runtime::error::PyErr_Clear();
+                    }
+                }
+            }
+            // No descriptor protocol — return the raw object
+            (*descr).incref();
+            return descr;
+        }
+
+        // Attribute not found — set AttributeError with details
+        {
+            let name_str = crate::types::unicode::PyUnicode_AsUTF8(name);
+            let attr = if !name_str.is_null() {
+                std::ffi::CStr::from_ptr(name_str).to_string_lossy().into_owned()
+            } else { "?".to_string() };
+            let tp_name = if !tp.is_null() && !(*tp).tp_name.is_null() {
+                std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy().into_owned()
+            } else { "?".to_string() };
+            let msg = format!("'{}' object has no attribute '{}'\0", tp_name, attr);
+            crate::runtime::error::PyErr_SetString(
+                crate::runtime::error::_Rustthon_Exc_AttributeError(),
+                msg.as_ptr() as *const c_char,
+            );
+        }
         ptr::null_mut()
     })
 }
@@ -540,8 +722,6 @@ pub unsafe extern "C" fn PyObject_GenericSetAttr(
     value: *mut RawPyObject,
 ) -> c_int {
     crate::ffi::panic_guard::guard_int("PyObject_GenericSetAttr", || unsafe {
-        // For now, set on the type's tp_dict (simplified — real CPython has
-        // instance dicts, data descriptors, etc.)
         if obj.is_null() || name.is_null() {
             return -1;
         }
@@ -549,6 +729,29 @@ pub unsafe extern "C" fn PyObject_GenericSetAttr(
         if tp.is_null() {
             return -1;
         }
+
+        // If obj IS a type object, set in its own tp_dict
+        if is_type_object(obj) {
+            let type_obj = obj as *mut RawPyTypeObject;
+            let dict = (*type_obj).tp_dict;
+            if !dict.is_null() {
+                return crate::types::dict::PyDict_SetItem(dict, name, value);
+            }
+        }
+
+        // For instances: check tp_dictoffset for instance dict
+        let offset = (*tp).tp_dictoffset;
+        if offset > 0 {
+            let dict_ptr = (obj as *mut u8).add(offset as usize) as *mut *mut RawPyObject;
+            let mut dict = *dict_ptr;
+            if dict.is_null() {
+                dict = crate::types::dict::PyDict_New();
+                *dict_ptr = dict;
+            }
+            return crate::types::dict::PyDict_SetItem(dict, name, value);
+        }
+
+        // Fallback: set on type's tp_dict
         let dict = (*tp).tp_dict;
         if dict.is_null() {
             return -1;
@@ -663,6 +866,64 @@ pub unsafe extern "C" fn PyType_Ready(tp: *mut RawPyTypeObject) -> c_int {
             (*tp).tp_dict = crate::types::dict::PyDict_New();
         }
 
+        // 5a. Add methods from tp_methods to tp_dict
+        if !(*tp).tp_methods.is_null() {
+            let dict = (*tp).tp_dict;
+            let mut method_ptr = (*tp).tp_methods;
+            while !(*method_ptr).ml_name.is_null() {
+                let func = crate::types::funcobject::create_cfunction(
+                    (*method_ptr).ml_name,
+                    (*method_ptr).ml_meth,
+                    (*method_ptr).ml_flags,
+                    std::ptr::null_mut(), // self is set at call time
+                );
+                crate::types::dict::PyDict_SetItemString(
+                    dict,
+                    (*method_ptr).ml_name,
+                    func,
+                );
+                (*func).decref();
+                method_ptr = method_ptr.add(1);
+            }
+        }
+
+        // 5b. Add members from tp_members to tp_dict (as descriptors)
+        // For now, store member definitions for later use by getattr
+        if !(*tp).tp_members.is_null() {
+            let dict = (*tp).tp_dict;
+            let mut member_ptr = (*tp).tp_members;
+            while !(*member_ptr).name.is_null() {
+                // Create a simple string marker for the member
+                // Real CPython creates member descriptors, but for now
+                // we just need tp_dict to have the name so _PyType_Lookup finds it
+                let value = crate::types::unicode::PyUnicode_FromString((*member_ptr).name);
+                crate::types::dict::PyDict_SetItemString(
+                    dict,
+                    (*member_ptr).name,
+                    value,
+                );
+                (*value).decref();
+                member_ptr = member_ptr.add(1);
+            }
+        }
+
+        // 5c. Add getset descriptors from tp_getset to tp_dict
+        if !(*tp).tp_getset.is_null() {
+            let dict = (*tp).tp_dict;
+            let mut gs_ptr = (*tp).tp_getset;
+            while !(*gs_ptr).name.is_null() {
+                // Create a simple marker — real CPython creates getset_descriptor objects
+                let value = crate::types::unicode::PyUnicode_FromString((*gs_ptr).name);
+                crate::types::dict::PyDict_SetItemString(
+                    dict,
+                    (*gs_ptr).name,
+                    value,
+                );
+                (*value).decref();
+                gs_ptr = gs_ptr.add(1);
+            }
+        }
+
         // 6. Create tp_bases tuple if null
         if (*tp).tp_bases.is_null() && !(*tp).tp_base.is_null() {
             let bases = crate::types::tuple::PyTuple_New(1);
@@ -695,6 +956,33 @@ pub unsafe extern "C" fn PyType_Ready(tp: *mut RawPyTypeObject) -> c_int {
     })
 }
 
+/// Stub: object.__reduce_ex__(self, protocol) — returns a tuple (type, args)
+/// for basic pickle support. Cython only checks that this exists in tp_dict.
+unsafe extern "C" fn object_reduce_ex_stub(
+    _self: *mut RawPyObject,
+    _protocol: *mut RawPyObject,
+) -> *mut RawPyObject {
+    // Return a minimal (type(self), ()) tuple for pickling
+    let tp = (*_self).ob_type as *mut RawPyObject;
+    let args = crate::types::tuple::PyTuple_New(0);
+    let result = crate::types::tuple::PyTuple_New(2);
+    (*tp).incref();
+    crate::types::tuple::PyTuple_SetItem(result, 0, tp);
+    crate::types::tuple::PyTuple_SetItem(result, 1, args);
+    result
+}
+
+/// Stub: object.__reduce__(self) — delegates to __reduce_ex__
+unsafe extern "C" fn object_reduce_stub(
+    _self: *mut RawPyObject,
+    _args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let protocol = crate::types::longobject::PyLong_FromLong(2);
+    let result = object_reduce_ex_stub(_self, protocol);
+    (*protocol).decref();
+    result
+}
+
 /// Initialize PyBaseObject_Type and PyType_Type with default slots.
 /// Must be called early in init_types(), before any other type init.
 pub fn init_base_types() {
@@ -711,8 +999,41 @@ pub fn init_base_types() {
     (*PyBaseObject_Type.get()).ob_base.ob_refcnt =
         std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
 
+    // Populate PyBaseObject_Type.tp_dict with stub methods
+    // Cython's __Pyx_setup_reduce looks up __reduce__, __reduce_ex__, __getstate__
+    // on object's tp_dict via _PyType_Lookup. These must exist.
+    {
+        let dict = crate::types::dict::PyDict_New();
+        (*PyBaseObject_Type.get()).tp_dict = dict;
+
+        // Stub __reduce_ex__(self, protocol) -> raise TypeError
+        let reduce_ex = crate::types::funcobject::create_cfunction(
+            b"__reduce_ex__\0".as_ptr() as *const c_char,
+            Some(object_reduce_ex_stub),
+            crate::object::typeobj::METH_O,
+            std::ptr::null_mut(),
+        );
+        crate::types::dict::PyDict_SetItemString(
+            dict, b"__reduce_ex__\0".as_ptr() as *const c_char, reduce_ex,
+        );
+        (*reduce_ex).decref();
+
+        // Stub __reduce__(self) -> NotImplementedError
+        let reduce = crate::types::funcobject::create_cfunction(
+            b"__reduce__\0".as_ptr() as *const c_char,
+            Some(object_reduce_stub),
+            crate::object::typeobj::METH_NOARGS,
+            std::ptr::null_mut(),
+        );
+        crate::types::dict::PyDict_SetItemString(
+            dict, b"__reduce__\0".as_ptr() as *const c_char, reduce,
+        );
+        (*reduce).decref();
+    }
+
     // PyType_Type — metaclass of all types
     (*PyType_Type.get()).tp_base = PyBaseObject_Type.get();
+    (*PyType_Type.get()).tp_call = Some(type_call);
     (*PyType_Type.get()).tp_alloc = Some(PyType_GenericAlloc);
     (*PyType_Type.get()).tp_new = Some(PyType_GenericNew);
     (*PyType_Type.get()).tp_init = Some(default_init);
@@ -1096,3 +1417,63 @@ pub unsafe extern "C" fn PyType_FromSpec(
 pub unsafe extern "C" fn PyType_Modified(_tp: *mut RawPyTypeObject) {
     // No-op: we don't have method resolution caches to invalidate
 }
+
+/// _PyType_Lookup — look up an attribute name in a type's MRO.
+/// Simplified: checks the type's tp_dict, then walks tp_base chain.
+#[no_mangle]
+pub unsafe extern "C" fn _PyType_Lookup(
+    tp: *mut RawPyTypeObject,
+    name: *mut RawPyObject,
+) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("_PyType_Lookup", || unsafe {
+        if tp.is_null() || name.is_null() {
+            return ptr::null_mut();
+        }
+        // Walk the base chain
+        let mut cur = tp;
+        while !cur.is_null() {
+            let dict = (*cur).tp_dict;
+            if !dict.is_null() {
+                let value = crate::types::dict::PyDict_GetItem(dict, name);
+                if !value.is_null() {
+                    return value; // borrowed reference
+                }
+            }
+            cur = (*cur).tp_base;
+        }
+        // Debug trace
+        if std::env::var("RUSTTHON_TRACE").is_ok() {
+            let name_str = crate::types::unicode::PyUnicode_AsUTF8(name);
+            let attr = if !name_str.is_null() {
+                std::ffi::CStr::from_ptr(name_str).to_string_lossy().into_owned()
+            } else { "(null)".to_string() };
+            let tp_name = if !(*tp).tp_name.is_null() {
+                std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy().into_owned()
+            } else { "(null)".to_string() };
+            let dict_size = if !(*tp).tp_dict.is_null() {
+                crate::types::dict::PyDict_Size((*tp).tp_dict)
+            } else { -1 };
+            eprintln!("[rustthon] _PyType_Lookup: '{}' NOT FOUND on type '{}' (dict_size={})", attr, tp_name, dict_size);
+        }
+        ptr::null_mut()
+    })
+}
+
+/// PyCFunction_Type — exported type object for PyCFunction.
+/// C extensions use `&PyCFunction_Type` for type checks.
+#[no_mangle]
+pub static PyCFunction_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
+    let mut tp = RawPyTypeObject::zeroed();
+    tp.tp_name = b"builtin_function_or_method\0".as_ptr() as *const _;
+    tp.tp_basicsize = 0;
+    tp
+});
+
+/// PyMethod_Type — exported type object for bound methods.
+#[no_mangle]
+pub static PyMethod_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
+    let mut tp = RawPyTypeObject::zeroed();
+    tp.tp_name = b"method\0".as_ptr() as *const _;
+    tp.tp_basicsize = 0;
+    tp
+});
