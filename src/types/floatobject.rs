@@ -51,31 +51,37 @@ unsafe extern "C" fn float_dealloc(obj: *mut RawPyObject) {
 // ─── C API ───
 
 #[no_mangle]
-pub unsafe extern "C" fn PyFloat_FromDouble(v: f64) -> *mut RawPyObject {
-    let ptr = libc::calloc(1, std::mem::size_of::<PyFloatObject>()) as *mut PyFloatObject;
-    if ptr.is_null() {
-        eprintln!("Fatal: out of memory in PyFloat_FromDouble");
-        std::process::abort();
-    }
-    std::ptr::write(&mut (*ptr).ob_base, RawPyObject::new(float_type()));
-    (*ptr).ob_fval = v;
-    ptr as *mut RawPyObject
+pub extern "C" fn PyFloat_FromDouble(v: f64) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyFloat_FromDouble", || unsafe {
+        let ptr = libc::calloc(1, std::mem::size_of::<PyFloatObject>()) as *mut PyFloatObject;
+        if ptr.is_null() {
+            eprintln!("Fatal: out of memory in PyFloat_FromDouble");
+            std::process::abort();
+        }
+        std::ptr::write(&mut (*ptr).ob_base, RawPyObject::new(float_type()));
+        (*ptr).ob_fval = v;
+        ptr as *mut RawPyObject
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyFloat_AsDouble(obj: *mut RawPyObject) -> f64 {
-    if obj.is_null() {
-        return -1.0;
-    }
-    float_value(obj)
+pub extern "C" fn PyFloat_AsDouble(obj: *mut RawPyObject) -> f64 {
+    crate::ffi::panic_guard::guard_f64("PyFloat_AsDouble", || unsafe {
+        if obj.is_null() {
+            return -1.0;
+        }
+        float_value(obj)
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyFloat_Check(obj: *mut RawPyObject) -> c_int {
-    if obj.is_null() {
-        return 0;
-    }
-    if (*obj).ob_type == float_type() { 1 } else { 0 }
+pub extern "C" fn PyFloat_Check(obj: *mut RawPyObject) -> c_int {
+    crate::ffi::panic_guard::guard_int("PyFloat_Check", || unsafe {
+        if obj.is_null() {
+            return 0;
+        }
+        if (*obj).ob_type == float_type() { 1 } else { 0 }
+    })
 }
 
 pub unsafe fn init_float_type() {

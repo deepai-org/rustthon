@@ -118,36 +118,38 @@ pub fn find_extension(name: &str, search_paths: &[String]) -> Option<std::path::
 /// PyImport_ImportModule
 #[no_mangle]
 pub unsafe extern "C" fn PyImport_ImportModule(name: *const c_char) -> *mut RawPyObject {
-    if name.is_null() {
-        return ptr::null_mut();
-    }
-    let name_str = CStr::from_ptr(name).to_string_lossy();
+    crate::ffi::panic_guard::guard_ptr("PyImport_ImportModule", || unsafe {
+        if name.is_null() {
+            return ptr::null_mut();
+        }
+        let name_str = CStr::from_ptr(name).to_string_lossy();
 
-    // Check if already imported (in module registry)
-    if let Some(module) = crate::module::registry::get_module(&name_str) {
-        (*module).incref();
-        return module;
-    }
+        // Check if already imported (in module registry)
+        if let Some(module) = crate::module::registry::get_module(&name_str) {
+            (*module).incref();
+            return module;
+        }
 
-    // Try to find and load C extension
-    let search_paths = crate::module::registry::get_search_paths();
-    if let Some(ext_path) = find_extension(&name_str, &search_paths) {
-        match load_extension(&ext_path, &name_str) {
-            Ok(module) => {
-                crate::module::registry::register_module(&name_str, module);
-                return module;
-            }
-            Err(e) => {
-                eprintln!("Error loading extension {}: {}", name_str, e);
-                return ptr::null_mut();
+        // Try to find and load C extension
+        let search_paths = crate::module::registry::get_search_paths();
+        if let Some(ext_path) = find_extension(&name_str, &search_paths) {
+            match load_extension(&ext_path, &name_str) {
+                Ok(module) => {
+                    crate::module::registry::register_module(&name_str, module);
+                    return module;
+                }
+                Err(e) => {
+                    eprintln!("Error loading extension {}: {}", name_str, e);
+                    return ptr::null_mut();
+                }
             }
         }
-    }
 
-    // Try to find Python source file
-    // TODO: Implement Python source importing via compiler/VM
+        // Try to find Python source file
+        // TODO: Implement Python source importing via compiler/VM
 
-    ptr::null_mut()
+        ptr::null_mut()
+    })
 }
 
 /// PyImport_ImportModuleLevel
@@ -159,7 +161,9 @@ pub unsafe extern "C" fn PyImport_ImportModuleLevel(
     _fromlist: *mut RawPyObject,
     _level: c_int,
 ) -> *mut RawPyObject {
-    PyImport_ImportModule(name)
+    crate::ffi::panic_guard::guard_ptr("PyImport_ImportModuleLevel", || unsafe {
+        PyImport_ImportModule(name)
+    })
 }
 
 /// PyImport_ImportModuleLevelObject — import with PyObject name (Cython uses this).
@@ -171,46 +175,54 @@ pub unsafe extern "C" fn PyImport_ImportModuleLevelObject(
     _fromlist: *mut RawPyObject,
     _level: c_int,
 ) -> *mut RawPyObject {
-    if name.is_null() {
-        return ptr::null_mut();
-    }
-    let name_str = crate::types::unicode::PyUnicode_AsUTF8(name);
-    PyImport_ImportModule(name_str)
+    crate::ffi::panic_guard::guard_ptr("PyImport_ImportModuleLevelObject", || unsafe {
+        if name.is_null() {
+            return ptr::null_mut();
+        }
+        let name_str = crate::types::unicode::PyUnicode_AsUTF8(name);
+        PyImport_ImportModule(name_str)
+    })
 }
 
 /// PyImport_Import
 #[no_mangle]
 pub unsafe extern "C" fn PyImport_Import(name: *mut RawPyObject) -> *mut RawPyObject {
-    if name.is_null() {
-        return ptr::null_mut();
-    }
-    let name_str = crate::types::unicode::PyUnicode_AsUTF8(name);
-    PyImport_ImportModule(name_str)
+    crate::ffi::panic_guard::guard_ptr("PyImport_Import", || unsafe {
+        if name.is_null() {
+            return ptr::null_mut();
+        }
+        let name_str = crate::types::unicode::PyUnicode_AsUTF8(name);
+        PyImport_ImportModule(name_str)
+    })
 }
 
 /// PyImport_GetModuleDict
 #[no_mangle]
 pub unsafe extern "C" fn PyImport_GetModuleDict() -> *mut RawPyObject {
-    crate::module::registry::get_modules_dict()
+    crate::ffi::panic_guard::guard_ptr("PyImport_GetModuleDict", || unsafe {
+        crate::module::registry::get_modules_dict()
+    })
 }
 
 /// PyImport_AddModule - get or create a module in sys.modules
 #[no_mangle]
 pub unsafe extern "C" fn PyImport_AddModule(name: *const c_char) -> *mut RawPyObject {
-    if name.is_null() {
-        return ptr::null_mut();
-    }
-    let name_str = CStr::from_ptr(name).to_string_lossy();
+    crate::ffi::panic_guard::guard_ptr("PyImport_AddModule", || unsafe {
+        if name.is_null() {
+            return ptr::null_mut();
+        }
+        let name_str = CStr::from_ptr(name).to_string_lossy();
 
-    // Check if exists
-    if let Some(module) = crate::module::registry::get_module(&name_str) {
-        return module; // Borrowed reference
-    }
+        // Check if exists
+        if let Some(module) = crate::module::registry::get_module(&name_str) {
+            return module; // Borrowed reference
+        }
 
-    // Create proper module object (not a dict!)
-    let name_obj = crate::types::unicode::PyUnicode_FromString(name);
-    let module = crate::types::moduleobject::PyModule_NewObject(name_obj);
-    crate::module::registry::register_module(&name_str, module);
-    (*name_obj).decref();
-    module
+        // Create proper module object (not a dict!)
+        let name_obj = crate::types::unicode::PyUnicode_FromString(name);
+        let module = crate::types::moduleobject::PyModule_NewObject(name_obj);
+        crate::module::registry::register_module(&name_str, module);
+        (*name_obj).decref();
+        module
+    })
 }

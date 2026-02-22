@@ -133,18 +133,22 @@ fn get_current_tstate() -> *mut PyThreadState {
 /// PyThreadState_Get - get current thread state (fatal if NULL)
 #[no_mangle]
 pub unsafe extern "C" fn PyThreadState_Get() -> *mut PyThreadState {
-    let tstate = get_current_tstate();
-    if tstate.is_null() {
-        eprintln!("Fatal Python error: PyThreadState_Get: the function must be called with the GIL held, but the GIL is released");
-        std::process::abort();
-    }
-    tstate
+    crate::ffi::panic_guard::guard_ptr("PyThreadState_Get", || unsafe {
+        let tstate = get_current_tstate();
+        if tstate.is_null() {
+            eprintln!("Fatal Python error: PyThreadState_Get: the function must be called with the GIL held, but the GIL is released");
+            std::process::abort();
+        }
+        tstate
+    })
 }
 
 /// _PyThreadState_UncheckedGet
 #[no_mangle]
 pub unsafe extern "C" fn _PyThreadState_UncheckedGet() -> *mut PyThreadState {
-    get_current_tstate()
+    crate::ffi::panic_guard::guard_ptr("_PyThreadState_UncheckedGet", || unsafe {
+        get_current_tstate()
+    })
 }
 
 /// PyThreadState_GetInterpreter
@@ -152,20 +156,24 @@ pub unsafe extern "C" fn _PyThreadState_UncheckedGet() -> *mut PyThreadState {
 pub unsafe extern "C" fn PyThreadState_GetInterpreter(
     tstate: *mut PyThreadState,
 ) -> *mut PyInterpreterState {
-    if tstate.is_null() {
-        return ptr::null_mut();
-    }
-    (*tstate).interp
+    crate::ffi::panic_guard::guard_ptr("PyThreadState_GetInterpreter", || unsafe {
+        if tstate.is_null() {
+            return ptr::null_mut();
+        }
+        (*tstate).interp
+    })
 }
 
 /// PyInterpreterState_Get
 #[no_mangle]
 pub unsafe extern "C" fn PyInterpreterState_Get() -> *mut PyInterpreterState {
-    let tstate = get_current_tstate();
-    if tstate.is_null() {
-        return ptr::null_mut();
-    }
-    (*tstate).interp
+    crate::ffi::panic_guard::guard_ptr("PyInterpreterState_Get", || unsafe {
+        let tstate = get_current_tstate();
+        if tstate.is_null() {
+            return ptr::null_mut();
+        }
+        (*tstate).interp
+    })
 }
 
 /// PyThreadState_Swap - swap the current thread state, return old one
@@ -173,9 +181,11 @@ pub unsafe extern "C" fn PyInterpreterState_Get() -> *mut PyInterpreterState {
 pub unsafe extern "C" fn PyThreadState_Swap(
     new_tstate: *mut PyThreadState,
 ) -> *mut PyThreadState {
-    let old = get_current_tstate();
-    set_current_tstate(new_tstate);
-    old
+    crate::ffi::panic_guard::guard_ptr("PyThreadState_Swap", || unsafe {
+        let old = get_current_tstate();
+        set_current_tstate(new_tstate);
+        old
+    })
 }
 
 /// PyThreadState_New
@@ -183,17 +193,21 @@ pub unsafe extern "C" fn PyThreadState_Swap(
 pub unsafe extern "C" fn PyThreadState_New(
     interp: *mut PyInterpreterState,
 ) -> *mut PyThreadState {
-    create_thread_state(interp)
+    crate::ffi::panic_guard::guard_ptr("PyThreadState_New", || unsafe {
+        create_thread_state(interp)
+    })
 }
 
 /// PyThreadState_Clear
 #[no_mangle]
 pub unsafe extern "C" fn PyThreadState_Clear(tstate: *mut PyThreadState) {
-    if !tstate.is_null() {
-        (*tstate).curexc_type = ptr::null_mut();
-        (*tstate).curexc_value = ptr::null_mut();
-        (*tstate).curexc_traceback = ptr::null_mut();
-    }
+    crate::ffi::panic_guard::guard_void("PyThreadState_Clear", || unsafe {
+        if !tstate.is_null() {
+            (*tstate).curexc_type = ptr::null_mut();
+            (*tstate).curexc_value = ptr::null_mut();
+            (*tstate).curexc_traceback = ptr::null_mut();
+        }
+    })
 }
 
 /// PyInterpreterState_GetID — return a unique ID for the interpreter.
@@ -201,31 +215,35 @@ pub unsafe extern "C" fn PyThreadState_Clear(tstate: *mut PyThreadState) {
 pub unsafe extern "C" fn PyInterpreterState_GetID(
     interp: *mut PyInterpreterState,
 ) -> i64 {
-    if interp.is_null() {
-        return -1;
-    }
-    // Return a stable ID based on the pointer
-    interp as i64
+    crate::ffi::panic_guard::guard_i64("PyInterpreterState_GetID", || unsafe {
+        if interp.is_null() {
+            return -1;
+        }
+        // Return a stable ID based on the pointer
+        interp as i64
+    })
 }
 
 /// PyThreadState_Delete
 #[no_mangle]
 pub unsafe extern "C" fn PyThreadState_Delete(tstate: *mut PyThreadState) {
-    if tstate.is_null() {
-        return;
-    }
-    // Unlink from interpreter's list
-    let prev = (*tstate).prev;
-    let next = (*tstate).next;
-    if !prev.is_null() {
-        (*prev).next = next;
-    }
-    if !next.is_null() {
-        (*next).prev = prev;
-    }
-    let interp = (*tstate).interp;
-    if !interp.is_null() && (*interp).tstate_head == tstate {
-        (*interp).tstate_head = next;
-    }
-    drop(Box::from_raw(tstate));
+    crate::ffi::panic_guard::guard_void("PyThreadState_Delete", || unsafe {
+        if tstate.is_null() {
+            return;
+        }
+        // Unlink from interpreter's list
+        let prev = (*tstate).prev;
+        let next = (*tstate).next;
+        if !prev.is_null() {
+            (*prev).next = next;
+        }
+        if !next.is_null() {
+            (*next).prev = prev;
+        }
+        let interp = (*tstate).interp;
+        if !interp.is_null() && (*interp).tstate_head == tstate {
+            (*interp).tstate_head = next;
+        }
+        drop(Box::from_raw(tstate));
+    })
 }

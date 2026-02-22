@@ -38,24 +38,26 @@ pub unsafe extern "C" fn PyCode_NewEmpty(
     funcname: *const c_char,
     firstlineno: c_int,
 ) -> *mut RawPyObject {
-    let code = libc::calloc(1, std::mem::size_of::<PyCodeObject>()) as *mut PyCodeObject;
-    if code.is_null() {
-        return ptr::null_mut();
-    }
-    (*code).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
-    (*code).ob_type = CODE_TYPE.get();
-    (*code).co_filename = if !filename.is_null() {
-        crate::types::unicode::PyUnicode_FromString(filename)
-    } else {
-        ptr::null_mut()
-    };
-    (*code).co_name = if !funcname.is_null() {
-        crate::types::unicode::PyUnicode_FromString(funcname)
-    } else {
-        ptr::null_mut()
-    };
-    (*code).co_firstlineno = firstlineno;
-    code as *mut RawPyObject
+    crate::ffi::panic_guard::guard_ptr("PyCode_NewEmpty", || unsafe {
+        let code = libc::calloc(1, std::mem::size_of::<PyCodeObject>()) as *mut PyCodeObject;
+        if code.is_null() {
+            return ptr::null_mut();
+        }
+        (*code).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+        (*code).ob_type = CODE_TYPE.get();
+        (*code).co_filename = if !filename.is_null() {
+            crate::types::unicode::PyUnicode_FromString(filename)
+        } else {
+            ptr::null_mut()
+        };
+        (*code).co_name = if !funcname.is_null() {
+            crate::types::unicode::PyUnicode_FromString(funcname)
+        } else {
+            ptr::null_mut()
+        };
+        (*code).co_firstlineno = firstlineno;
+        code as *mut RawPyObject
+    })
 }
 
 /// PyCode_NewWithPosOnlyArgs — Cython references this for Python 3.8+ compat.
@@ -79,18 +81,20 @@ pub unsafe extern "C" fn PyCode_NewWithPosOnlyArgs(
     firstlineno: c_int,
     _lnotab: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    // Extract filename as C string
-    let fname = if !filename.is_null() {
-        crate::types::unicode::PyUnicode_AsUTF8(filename)
-    } else {
-        b"<unknown>\0".as_ptr() as *const c_char
-    };
-    let funcname = if !name.is_null() {
-        crate::types::unicode::PyUnicode_AsUTF8(name)
-    } else {
-        b"<unknown>\0".as_ptr() as *const c_char
-    };
-    PyCode_NewEmpty(fname, funcname, firstlineno)
+    crate::ffi::panic_guard::guard_ptr("PyCode_NewWithPosOnlyArgs", || unsafe {
+        // Extract filename as C string
+        let fname = if !filename.is_null() {
+            crate::types::unicode::PyUnicode_AsUTF8(filename)
+        } else {
+            b"<unknown>\0".as_ptr() as *const c_char
+        };
+        let funcname = if !name.is_null() {
+            crate::types::unicode::PyUnicode_AsUTF8(name)
+        } else {
+            b"<unknown>\0".as_ptr() as *const c_char
+        };
+        PyCode_NewEmpty(fname, funcname, firstlineno)
+    })
 }
 
 // ─── Frame object (simplified) ───
@@ -121,19 +125,21 @@ pub unsafe extern "C" fn PyFrame_New(
     globals: *mut RawPyObject,
     locals: *mut RawPyObject,
 ) -> *mut PyFrameObject {
-    let frame = libc::calloc(1, std::mem::size_of::<PyFrameObject>()) as *mut PyFrameObject;
-    if frame.is_null() {
-        return ptr::null_mut();
-    }
-    (*frame).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
-    (*frame).ob_type = FRAME_TYPE.get();
-    (*frame).f_back = ptr::null_mut();
-    (*frame).f_code = code as *mut PyCodeObject;
-    if !code.is_null() {
-        (*(code as *mut RawPyObject)).incref();
-        (*frame).f_lineno = (*(code as *mut PyCodeObject)).co_firstlineno;
-    }
-    frame
+    crate::ffi::panic_guard::guard_ptr("PyFrame_New", || unsafe {
+        let frame = libc::calloc(1, std::mem::size_of::<PyFrameObject>()) as *mut PyFrameObject;
+        if frame.is_null() {
+            return ptr::null_mut();
+        }
+        (*frame).ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+        (*frame).ob_type = FRAME_TYPE.get();
+        (*frame).f_back = ptr::null_mut();
+        (*frame).f_code = code as *mut PyCodeObject;
+        if !code.is_null() {
+            (*(code as *mut RawPyObject)).incref();
+            (*frame).f_lineno = (*(code as *mut PyCodeObject)).co_firstlineno;
+        }
+        frame
+    })
 }
 
 // ─── Traceback (simplified) ───
@@ -144,6 +150,8 @@ pub unsafe extern "C" fn PyFrame_New(
 pub unsafe extern "C" fn PyTraceBack_Here(
     frame: *mut PyFrameObject,
 ) -> c_int {
-    // No-op: we don't maintain a real traceback chain yet
-    0
+    crate::ffi::panic_guard::guard_int("PyTraceBack_Here", || unsafe {
+        // No-op: we don't maintain a real traceback chain yet
+        0
+    })
 }

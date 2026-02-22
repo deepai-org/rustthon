@@ -269,14 +269,16 @@ pub fn unicode_value(obj: *mut RawPyObject) -> &'static str {
 
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_FromString(s: *const c_char) -> *mut RawPyObject {
-    if s.is_null() {
-        return ptr::null_mut();
-    }
-    let c_str = CStr::from_ptr(s);
-    match c_str.to_str() {
-        Ok(rust_str) => create_unicode(rust_str),
-        Err(_) => create_unicode(&c_str.to_string_lossy()),
-    }
+    crate::ffi::panic_guard::guard_ptr("PyUnicode_FromString", || unsafe {
+        if s.is_null() {
+            return ptr::null_mut();
+        }
+        let c_str = CStr::from_ptr(s);
+        match c_str.to_str() {
+            Ok(rust_str) => create_unicode(rust_str),
+            Err(_) => create_unicode(&c_str.to_string_lossy()),
+        }
+    })
 }
 
 #[no_mangle]
@@ -284,44 +286,50 @@ pub unsafe extern "C" fn PyUnicode_FromStringAndSize(
     s: *const c_char,
     size: isize,
 ) -> *mut RawPyObject {
-    if s.is_null() || size < 0 {
-        return create_unicode("");
-    }
-    let slice = std::slice::from_raw_parts(s as *const u8, size as usize);
-    let string = String::from_utf8_lossy(slice);
-    create_unicode(&string)
+    crate::ffi::panic_guard::guard_ptr("PyUnicode_FromStringAndSize", || unsafe {
+        if s.is_null() || size < 0 {
+            return create_unicode("");
+        }
+        let slice = std::slice::from_raw_parts(s as *const u8, size as usize);
+        let string = String::from_utf8_lossy(slice);
+        create_unicode(&string)
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_FromFormat(
     format: *const c_char,
 ) -> *mut RawPyObject {
-    if format.is_null() {
-        return create_unicode("");
-    }
-    let c_str = CStr::from_ptr(format);
-    create_unicode(&c_str.to_string_lossy())
+    crate::ffi::panic_guard::guard_ptr("PyUnicode_FromFormat", || unsafe {
+        if format.is_null() {
+            return create_unicode("");
+        }
+        let c_str = CStr::from_ptr(format);
+        create_unicode(&c_str.to_string_lossy())
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_AsUTF8(obj: *mut RawPyObject) -> *const c_char {
-    if obj.is_null() {
-        return ptr::null();
-    }
-    let ascii = obj as *mut PyASCIIObject;
-    let state = (*ascii).state;
-    if state_is_ascii(state) {
-        // Compact ASCII: data at offset 48, already null-terminated
-        (obj as *mut u8).add(ASCII_HEADER) as *const c_char
-    } else {
-        // Non-ASCII compact: return cached utf8
-        let compact = obj as *mut PyCompactUnicodeObject;
-        if !(*compact).utf8.is_null() {
-            (*compact).utf8 as *const c_char
-        } else {
-            ptr::null()
+    crate::ffi::panic_guard::guard_const_ptr("PyUnicode_AsUTF8", || unsafe {
+        if obj.is_null() {
+            return ptr::null();
         }
-    }
+        let ascii = obj as *mut PyASCIIObject;
+        let state = (*ascii).state;
+        if state_is_ascii(state) {
+            // Compact ASCII: data at offset 48, already null-terminated
+            (obj as *mut u8).add(ASCII_HEADER) as *const c_char
+        } else {
+            // Non-ASCII compact: return cached utf8
+            let compact = obj as *mut PyCompactUnicodeObject;
+            if !(*compact).utf8.is_null() {
+                (*compact).utf8 as *const c_char
+            } else {
+                ptr::null()
+            }
+        }
+    })
 }
 
 #[no_mangle]
@@ -329,27 +337,29 @@ pub unsafe extern "C" fn PyUnicode_AsUTF8AndSize(
     obj: *mut RawPyObject,
     size: *mut isize,
 ) -> *const c_char {
-    if obj.is_null() {
-        return ptr::null();
-    }
-    let ascii = obj as *mut PyASCIIObject;
-    let state = (*ascii).state;
-    if state_is_ascii(state) {
-        if !size.is_null() {
-            *size = (*ascii).length;
+    crate::ffi::panic_guard::guard_const_ptr("PyUnicode_AsUTF8AndSize", || unsafe {
+        if obj.is_null() {
+            return ptr::null();
         }
-        (obj as *mut u8).add(ASCII_HEADER) as *const c_char
-    } else {
-        let compact = obj as *mut PyCompactUnicodeObject;
-        if !size.is_null() {
-            *size = (*compact).utf8_length;
-        }
-        if !(*compact).utf8.is_null() {
-            (*compact).utf8 as *const c_char
+        let ascii = obj as *mut PyASCIIObject;
+        let state = (*ascii).state;
+        if state_is_ascii(state) {
+            if !size.is_null() {
+                *size = (*ascii).length;
+            }
+            (obj as *mut u8).add(ASCII_HEADER) as *const c_char
         } else {
-            ptr::null()
+            let compact = obj as *mut PyCompactUnicodeObject;
+            if !size.is_null() {
+                *size = (*compact).utf8_length;
+            }
+            if !(*compact).utf8.is_null() {
+                (*compact).utf8 as *const c_char
+            } else {
+                ptr::null()
+            }
         }
-    }
+    })
 }
 
 #[no_mangle]
@@ -358,34 +368,42 @@ pub unsafe extern "C" fn PyUnicode_AsEncodedString(
     _encoding: *const c_char,
     _errors: *const c_char,
 ) -> *mut RawPyObject {
-    if obj.is_null() {
-        return ptr::null_mut();
-    }
-    // Encode as UTF-8
-    let s = unicode_value(obj);
-    crate::types::bytes::create_bytes_from_slice(s.as_bytes())
+    crate::ffi::panic_guard::guard_ptr("PyUnicode_AsEncodedString", || unsafe {
+        if obj.is_null() {
+            return ptr::null_mut();
+        }
+        // Encode as UTF-8
+        let s = unicode_value(obj);
+        crate::types::bytes::create_bytes_from_slice(s.as_bytes())
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_GetLength(obj: *mut RawPyObject) -> isize {
-    if obj.is_null() {
-        return -1;
-    }
-    let ascii = obj as *mut PyASCIIObject;
-    (*ascii).length
+    crate::ffi::panic_guard::guard_ssize("PyUnicode_GetLength", || unsafe {
+        if obj.is_null() {
+            return -1;
+        }
+        let ascii = obj as *mut PyASCIIObject;
+        (*ascii).length
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_GET_LENGTH(obj: *mut RawPyObject) -> isize {
-    PyUnicode_GetLength(obj)
+    crate::ffi::panic_guard::guard_ssize("PyUnicode_GET_LENGTH", || unsafe {
+        PyUnicode_GetLength(obj)
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_Check(obj: *mut RawPyObject) -> c_int {
-    if obj.is_null() {
-        return 0;
-    }
-    if (*obj).ob_type == unicode_type() { 1 } else { 0 }
+    crate::ffi::panic_guard::guard_int("PyUnicode_Check", || unsafe {
+        if obj.is_null() {
+            return 0;
+        }
+        if (*obj).ob_type == unicode_type() { 1 } else { 0 }
+    })
 }
 
 #[no_mangle]
@@ -393,19 +411,21 @@ pub unsafe extern "C" fn PyUnicode_CompareWithASCIIString(
     obj: *mut RawPyObject,
     string: *const c_char,
 ) -> c_int {
-    if obj.is_null() || string.is_null() {
-        return -1;
-    }
-    let s = unicode_value(obj);
-    let c_str = CStr::from_ptr(string);
-    match c_str.to_str() {
-        Ok(other) => {
-            if s == other { 0 }
-            else if s < other { -1 }
-            else { 1 }
+    crate::ffi::panic_guard::guard_int("PyUnicode_CompareWithASCIIString", || unsafe {
+        if obj.is_null() || string.is_null() {
+            return -1;
         }
-        Err(_) => -1,
-    }
+        let s = unicode_value(obj);
+        let c_str = CStr::from_ptr(string);
+        match c_str.to_str() {
+            Ok(other) => {
+                if s == other { 0 }
+                else if s < other { -1 }
+                else { 1 }
+            }
+            Err(_) => -1,
+        }
+    })
 }
 
 #[no_mangle]
@@ -413,15 +433,17 @@ pub unsafe extern "C" fn PyUnicode_Concat(
     left: *mut RawPyObject,
     right: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    if left.is_null() || right.is_null() {
-        return ptr::null_mut();
-    }
-    let l = unicode_value(left);
-    let r = unicode_value(right);
-    let mut result = String::with_capacity(l.len() + r.len());
-    result.push_str(l);
-    result.push_str(r);
-    create_unicode(&result)
+    crate::ffi::panic_guard::guard_ptr("PyUnicode_Concat", || unsafe {
+        if left.is_null() || right.is_null() {
+            return ptr::null_mut();
+        }
+        let l = unicode_value(left);
+        let r = unicode_value(right);
+        let mut result = String::with_capacity(l.len() + r.len());
+        result.push_str(l);
+        result.push_str(r);
+        create_unicode(&result)
+    })
 }
 
 #[no_mangle]
@@ -429,8 +451,10 @@ pub unsafe extern "C" fn PyUnicode_Join(
     _separator: *mut RawPyObject,
     _seq: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    // TODO: Implement properly with sequence protocol
-    ptr::null_mut()
+    crate::ffi::panic_guard::guard_ptr("PyUnicode_Join", || unsafe {
+        // TODO: Implement properly with sequence protocol
+        ptr::null_mut()
+    })
 }
 
 #[no_mangle]
@@ -440,7 +464,9 @@ pub unsafe extern "C" fn PyUnicode_InternInPlace(_p: *mut *mut RawPyObject) {
 
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_InternFromString(s: *const c_char) -> *mut RawPyObject {
-    PyUnicode_FromString(s)
+    crate::ffi::panic_guard::guard_ptr("PyUnicode_InternFromString", || unsafe {
+        PyUnicode_FromString(s)
+    })
 }
 
 /// Helper: create a Python string from a Rust &str
@@ -453,46 +479,48 @@ pub fn create_from_str(s: &str) -> *mut RawPyObject {
 /// via PyUnicode_1BYTE_DATA / PyUnicode_2BYTE_DATA / PyUnicode_4BYTE_DATA macros.
 #[no_mangle]
 pub unsafe extern "C" fn PyUnicode_New(size: isize, maxchar: u32) -> *mut RawPyObject {
-    if size < 0 {
-        return ptr::null_mut();
-    }
-    let len = size as usize;
+    crate::ffi::panic_guard::guard_ptr("PyUnicode_New", || unsafe {
+        if size < 0 {
+            return ptr::null_mut();
+        }
+        let len = size as usize;
 
-    if maxchar < 128 {
-        // ASCII compact: header=48, data=len+1
-        let total = ASCII_HEADER + len + 1;
-        let raw = libc::calloc(1, total) as *mut PyASCIIObject;
-        if raw.is_null() { std::process::abort(); }
-        (*raw).ob_refcnt = AtomicIsize::new(1);
-        (*raw).ob_type = unicode_type();
-        (*raw).length = size;
-        (*raw).hash = -1;
-        (*raw).state = make_state(PYUNICODE_1BYTE_KIND, true, true);
-        (*raw).wstr = ptr::null_mut();
-        raw as *mut RawPyObject
-    } else {
-        // Non-ASCII compact: header=72
-        let (kind, kind_size) = if maxchar < 256 {
-            (PYUNICODE_1BYTE_KIND, 1usize)
-        } else if maxchar < 65536 {
-            (PYUNICODE_2BYTE_KIND, 2usize)
+        if maxchar < 128 {
+            // ASCII compact: header=48, data=len+1
+            let total = ASCII_HEADER + len + 1;
+            let raw = libc::calloc(1, total) as *mut PyASCIIObject;
+            if raw.is_null() { std::process::abort(); }
+            (*raw).ob_refcnt = AtomicIsize::new(1);
+            (*raw).ob_type = unicode_type();
+            (*raw).length = size;
+            (*raw).hash = -1;
+            (*raw).state = make_state(PYUNICODE_1BYTE_KIND, true, true);
+            (*raw).wstr = ptr::null_mut();
+            raw as *mut RawPyObject
         } else {
-            (PYUNICODE_4BYTE_KIND, 4usize)
-        };
-        let total = COMPACT_HEADER + len * kind_size + kind_size; // +kind_size for null terminator
-        let raw = libc::calloc(1, total) as *mut PyCompactUnicodeObject;
-        if raw.is_null() { std::process::abort(); }
-        (*raw)._base.ob_refcnt = AtomicIsize::new(1);
-        (*raw)._base.ob_type = unicode_type();
-        (*raw)._base.length = size;
-        (*raw)._base.hash = -1;
-        (*raw)._base.state = make_state(kind, true, false);
-        (*raw)._base.wstr = ptr::null_mut();
-        (*raw).utf8 = ptr::null_mut();
-        (*raw).utf8_length = 0;
-        (*raw).wstr_length = 0;
-        raw as *mut RawPyObject
-    }
+            // Non-ASCII compact: header=72
+            let (kind, kind_size) = if maxchar < 256 {
+                (PYUNICODE_1BYTE_KIND, 1usize)
+            } else if maxchar < 65536 {
+                (PYUNICODE_2BYTE_KIND, 2usize)
+            } else {
+                (PYUNICODE_4BYTE_KIND, 4usize)
+            };
+            let total = COMPACT_HEADER + len * kind_size + kind_size; // +kind_size for null terminator
+            let raw = libc::calloc(1, total) as *mut PyCompactUnicodeObject;
+            if raw.is_null() { std::process::abort(); }
+            (*raw)._base.ob_refcnt = AtomicIsize::new(1);
+            (*raw)._base.ob_type = unicode_type();
+            (*raw)._base.length = size;
+            (*raw)._base.hash = -1;
+            (*raw)._base.state = make_state(kind, true, false);
+            (*raw)._base.wstr = ptr::null_mut();
+            (*raw).utf8 = ptr::null_mut();
+            (*raw).utf8_length = 0;
+            (*raw).wstr_length = 0;
+            raw as *mut RawPyObject
+        }
+    })
 }
 
 /// PyUnicode_FromKindAndData — create a unicode string from a buffer of
@@ -503,40 +531,42 @@ pub unsafe extern "C" fn PyUnicode_FromKindAndData(
     buffer: *const std::os::raw::c_void,
     size: isize,
 ) -> *mut RawPyObject {
-    if buffer.is_null() || size < 0 {
-        return ptr::null_mut();
-    }
-    let len = size as usize;
-    if len == 0 {
-        return create_ascii("");
-    }
+    crate::ffi::panic_guard::guard_ptr("PyUnicode_FromKindAndData", || unsafe {
+        if buffer.is_null() || size < 0 {
+            return ptr::null_mut();
+        }
+        let len = size as usize;
+        if len == 0 {
+            return create_ascii("");
+        }
 
-    match kind as u32 {
-        PYUNICODE_1BYTE_KIND => {
-            let data = std::slice::from_raw_parts(buffer as *const u8, len);
-            // Check if all ASCII
-            let all_ascii = data.iter().all(|&b| b < 128);
-            if all_ascii {
-                let s = std::str::from_utf8_unchecked(data);
-                create_ascii(s)
-            } else {
-                // Latin-1: convert each byte to char
-                let s: String = data.iter().map(|&b| b as char).collect();
-                create_non_ascii(&s)
+        match kind as u32 {
+            PYUNICODE_1BYTE_KIND => {
+                let data = std::slice::from_raw_parts(buffer as *const u8, len);
+                // Check if all ASCII
+                let all_ascii = data.iter().all(|&b| b < 128);
+                if all_ascii {
+                    let s = std::str::from_utf8_unchecked(data);
+                    create_ascii(s)
+                } else {
+                    // Latin-1: convert each byte to char
+                    let s: String = data.iter().map(|&b| b as char).collect();
+                    create_non_ascii(&s)
+                }
             }
+            PYUNICODE_2BYTE_KIND => {
+                let data = std::slice::from_raw_parts(buffer as *const u16, len);
+                let s: String = data.iter().filter_map(|&cp| char::from_u32(cp as u32)).collect();
+                create_unicode(&s)
+            }
+            PYUNICODE_4BYTE_KIND => {
+                let data = std::slice::from_raw_parts(buffer as *const u32, len);
+                let s: String = data.iter().filter_map(|&cp| char::from_u32(cp)).collect();
+                create_unicode(&s)
+            }
+            _ => ptr::null_mut(),
         }
-        PYUNICODE_2BYTE_KIND => {
-            let data = std::slice::from_raw_parts(buffer as *const u16, len);
-            let s: String = data.iter().filter_map(|&cp| char::from_u32(cp as u32)).collect();
-            create_unicode(&s)
-        }
-        PYUNICODE_4BYTE_KIND => {
-            let data = std::slice::from_raw_parts(buffer as *const u32, len);
-            let s: String = data.iter().filter_map(|&cp| char::from_u32(cp)).collect();
-            create_unicode(&s)
-        }
-        _ => ptr::null_mut(),
-    }
+    })
 }
 
 /// PyUnicode_DecodeUTF8 — decode a UTF-8 byte string to a Python unicode object.
@@ -546,12 +576,14 @@ pub unsafe extern "C" fn PyUnicode_DecodeUTF8(
     size: isize,
     _errors: *const c_char,
 ) -> *mut RawPyObject {
-    if s.is_null() || size < 0 {
-        return ptr::null_mut();
-    }
-    let slice = std::slice::from_raw_parts(s as *const u8, size as usize);
-    let string = String::from_utf8_lossy(slice);
-    create_unicode(&string)
+    crate::ffi::panic_guard::guard_ptr("PyUnicode_DecodeUTF8", || unsafe {
+        if s.is_null() || size < 0 {
+            return ptr::null_mut();
+        }
+        let slice = std::slice::from_raw_parts(s as *const u8, size as usize);
+        let string = String::from_utf8_lossy(slice);
+        create_unicode(&string)
+    })
 }
 
 /// _PyUnicode_Ready — ensure a unicode object is in canonical form.
@@ -567,7 +599,9 @@ pub unsafe extern "C" fn _PyUnicode_Ready(_obj: *mut RawPyObject) -> std::os::ra
 pub unsafe extern "C" fn PyUnicode_AsUTF8String(
     obj: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    PyUnicode_AsEncodedString(obj, b"utf-8\0".as_ptr() as *const c_char, ptr::null())
+    crate::ffi::panic_guard::guard_ptr("PyUnicode_AsUTF8String", || unsafe {
+        PyUnicode_AsEncodedString(obj, b"utf-8\0".as_ptr() as *const c_char, ptr::null())
+    })
 }
 
 /// _PyUnicode_FastCopyCharacters — copy characters between unicode objects.
@@ -580,57 +614,59 @@ pub unsafe extern "C" fn _PyUnicode_FastCopyCharacters(
     from_start: isize,
     how_many: isize,
 ) {
-    if to.is_null() || from.is_null() || how_many <= 0 {
-        return;
-    }
-    // Get the kind (bytes per character) of each string
-    let to_ascii = to as *mut PyASCIIObject;
-    let from_ascii = from as *mut PyASCIIObject;
-    let to_kind = ((*to_ascii).state >> 2) & 0x7;
-    let from_kind = ((*from_ascii).state >> 2) & 0x7;
+    crate::ffi::panic_guard::guard_void("_PyUnicode_FastCopyCharacters", || unsafe {
+        if to.is_null() || from.is_null() || how_many <= 0 {
+            return;
+        }
+        // Get the kind (bytes per character) of each string
+        let to_ascii = to as *mut PyASCIIObject;
+        let from_ascii = from as *mut PyASCIIObject;
+        let to_kind = ((*to_ascii).state >> 2) & 0x7;
+        let from_kind = ((*from_ascii).state >> 2) & 0x7;
 
-    // Determine data pointers
-    let to_is_ascii = ((*to_ascii).state >> 6) & 1 != 0;
-    let from_is_ascii = ((*from_ascii).state >> 6) & 1 != 0;
-    let to_data = if to_is_ascii {
-        (to as *mut u8).add(48) // ASCII: data at offset 48
-    } else {
-        (to as *mut u8).add(72) // Compact: data at offset 72
-    };
-    let from_data = if from_is_ascii {
-        (from as *mut u8).add(48)
-    } else {
-        (from as *mut u8).add(72)
-    };
+        // Determine data pointers
+        let to_is_ascii = ((*to_ascii).state >> 6) & 1 != 0;
+        let from_is_ascii = ((*from_ascii).state >> 6) & 1 != 0;
+        let to_data = if to_is_ascii {
+            (to as *mut u8).add(48) // ASCII: data at offset 48
+        } else {
+            (to as *mut u8).add(72) // Compact: data at offset 72
+        };
+        let from_data = if from_is_ascii {
+            (from as *mut u8).add(48)
+        } else {
+            (from as *mut u8).add(72)
+        };
 
-    let to_char_size = to_kind.max(1) as usize;
-    let from_char_size = from_kind.max(1) as usize;
+        let to_char_size = to_kind.max(1) as usize;
+        let from_char_size = from_kind.max(1) as usize;
 
-    if to_char_size == from_char_size {
-        // Same kind — direct memcpy
-        let nbytes = how_many as usize * to_char_size;
-        std::ptr::copy_nonoverlapping(
-            from_data.add(from_start as usize * from_char_size),
-            to_data.add(to_start as usize * to_char_size),
-            nbytes,
-        );
-    } else {
-        // Different kinds — character-by-character copy
-        for i in 0..how_many as usize {
-            let ch = match from_char_size {
-                1 => *from_data.add(from_start as usize + i) as u32,
-                2 => *(from_data.add((from_start as usize + i) * 2) as *const u16) as u32,
-                4 => *(from_data.add((from_start as usize + i) * 4) as *const u32),
-                _ => 0,
-            };
-            match to_char_size {
-                1 => *to_data.add(to_start as usize + i) = ch as u8,
-                2 => *(to_data.add((to_start as usize + i) * 2) as *mut u16) = ch as u16,
-                4 => *(to_data.add((to_start as usize + i) * 4) as *mut u32) = ch,
-                _ => {}
+        if to_char_size == from_char_size {
+            // Same kind — direct memcpy
+            let nbytes = how_many as usize * to_char_size;
+            std::ptr::copy_nonoverlapping(
+                from_data.add(from_start as usize * from_char_size),
+                to_data.add(to_start as usize * to_char_size),
+                nbytes,
+            );
+        } else {
+            // Different kinds — character-by-character copy
+            for i in 0..how_many as usize {
+                let ch = match from_char_size {
+                    1 => *from_data.add(from_start as usize + i) as u32,
+                    2 => *(from_data.add((from_start as usize + i) * 2) as *const u16) as u32,
+                    4 => *(from_data.add((from_start as usize + i) * 4) as *const u32),
+                    _ => 0,
+                };
+                match to_char_size {
+                    1 => *to_data.add(to_start as usize + i) = ch as u8,
+                    2 => *(to_data.add((to_start as usize + i) * 2) as *mut u16) = ch as u16,
+                    4 => *(to_data.add((to_start as usize + i) * 4) as *mut u32) = ch,
+                    _ => {}
+                }
             }
         }
-    }
+    })
 }
 
 pub unsafe fn init_unicode_type() {

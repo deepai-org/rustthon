@@ -145,7 +145,9 @@ pub unsafe extern "C" fn PyErr_NormalizeException(
     _val: *mut *mut RawPyObject,
     _tb: *mut *mut RawPyObject,
 ) {
-    // TODO: Full normalization (instantiate exception if needed)
+    crate::ffi::panic_guard::guard_void("PyErr_NormalizeException", || unsafe {
+        // TODO: Full normalization (instantiate exception if needed)
+    })
 }
 
 /// PyErr_SetNone - set an error with no value.
@@ -162,23 +164,25 @@ pub unsafe extern "C" fn PyErr_SetNone(exc_type: *mut RawPyObject) {
 /// Walks the tp_base chain to check subclass relationships.
 #[no_mangle]
 pub unsafe extern "C" fn PyErr_ExceptionMatches(exc: *mut RawPyObject) -> i32 {
-    with_error(|state| {
-        if state.exc_type.is_null() || exc.is_null() {
-            return 0;
-        }
-        if state.exc_type == exc {
-            return 1;
-        }
-        // Walk tp_base chain of the current exception type
-        let exc_tp = exc as *mut RawPyTypeObject;
-        let mut cur = state.exc_type as *mut RawPyTypeObject;
-        while !cur.is_null() {
-            if cur as *mut RawPyObject == exc || cur == exc_tp {
+    crate::ffi::panic_guard::guard_i32("PyErr_ExceptionMatches", || unsafe {
+        with_error(|state| {
+            if state.exc_type.is_null() || exc.is_null() {
+                return 0;
+            }
+            if state.exc_type == exc {
                 return 1;
             }
-            cur = (*cur).tp_base;
-        }
-        0
+            // Walk tp_base chain of the current exception type
+            let exc_tp = exc as *mut RawPyTypeObject;
+            let mut cur = state.exc_type as *mut RawPyTypeObject;
+            while !cur.is_null() {
+                if cur as *mut RawPyObject == exc || cur == exc_tp {
+                    return 1;
+                }
+                cur = (*cur).tp_base;
+            }
+            0
+        })
     })
 }
 
@@ -188,22 +192,24 @@ pub unsafe extern "C" fn PyErr_GivenExceptionMatches(
     err: *mut RawPyObject,
     exc: *mut RawPyObject,
 ) -> i32 {
-    if err.is_null() || exc.is_null() {
-        return 0;
-    }
-    if err == exc {
-        return 1;
-    }
-    // Walk tp_base chain
-    let exc_tp = exc as *mut RawPyTypeObject;
-    let mut cur = err as *mut RawPyTypeObject;
-    while !cur.is_null() {
-        if cur == exc_tp {
+    crate::ffi::panic_guard::guard_i32("PyErr_GivenExceptionMatches", || unsafe {
+        if err.is_null() || exc.is_null() {
+            return 0;
+        }
+        if err == exc {
             return 1;
         }
-        cur = (*cur).tp_base;
-    }
-    0
+        // Walk tp_base chain
+        let exc_tp = exc as *mut RawPyTypeObject;
+        let mut cur = err as *mut RawPyTypeObject;
+        while !cur.is_null() {
+            if cur == exc_tp {
+                return 1;
+            }
+            cur = (*cur).tp_base;
+        }
+        0
+    })
 }
 
 /// PyErr_Format - set error with a formatted string.
@@ -215,22 +221,28 @@ pub unsafe extern "C" fn PyErr_Format(
     // varargs not supported in Rust extern "C" easily,
     // but we can handle the common case
 ) -> *mut RawPyObject {
-    PyErr_SetString(exc_type, format);
-    ptr::null_mut()
+    crate::ffi::panic_guard::guard_ptr("PyErr_Format", || unsafe {
+        PyErr_SetString(exc_type, format);
+        ptr::null_mut()
+    })
 }
 
 /// PyErr_BadArgument
 #[no_mangle]
 pub unsafe extern "C" fn PyErr_BadArgument() -> i32 {
-    // TODO: Set TypeError with "bad argument type for built-in operation"
-    0
+    crate::ffi::panic_guard::guard_i32("PyErr_BadArgument", || unsafe {
+        // TODO: Set TypeError with "bad argument type for built-in operation"
+        0
+    })
 }
 
 /// PyErr_NoMemory - convenience for setting MemoryError
 #[no_mangle]
 pub unsafe extern "C" fn PyErr_NoMemory() -> *mut RawPyObject {
-    // TODO: Set MemoryError
-    ptr::null_mut()
+    crate::ffi::panic_guard::guard_ptr("PyErr_NoMemory", || unsafe {
+        // TODO: Set MemoryError
+        ptr::null_mut()
+    })
 }
 
 /// PyErr_NewException — create a new exception class.
@@ -242,61 +254,63 @@ pub unsafe extern "C" fn PyErr_NewException(
     base: *mut RawPyObject,
     _dict: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    if name.is_null() {
-        return ptr::null_mut();
-    }
+    crate::ffi::panic_guard::guard_ptr("PyErr_NewException", || unsafe {
+        if name.is_null() {
+            return ptr::null_mut();
+        }
 
-    // Determine the base exception type
-    let base_tp = if !base.is_null() {
-        base as *mut RawPyTypeObject
-    } else {
-        *PyExc_Exception.get() as *mut RawPyTypeObject
-    };
+        // Determine the base exception type
+        let base_tp = if !base.is_null() {
+            base as *mut RawPyTypeObject
+        } else {
+            *PyExc_Exception.get() as *mut RawPyTypeObject
+        };
 
-    // We need a stable name pointer — heap-allocate a copy of the name string
-    let name_cstr = std::ffi::CStr::from_ptr(name);
-    let name_bytes = name_cstr.to_bytes_with_nul();
-    let name_copy = libc::malloc(name_bytes.len()) as *mut u8;
-    if name_copy.is_null() {
-        return ptr::null_mut();
-    }
-    std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_copy, name_bytes.len());
+        // We need a stable name pointer — heap-allocate a copy of the name string
+        let name_cstr = std::ffi::CStr::from_ptr(name);
+        let name_bytes = name_cstr.to_bytes_with_nul();
+        let name_copy = libc::malloc(name_bytes.len()) as *mut u8;
+        if name_copy.is_null() {
+            return ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), name_copy, name_bytes.len());
 
-    // Allocate a real PyTypeObject with proper base chain
-    let tp = libc::calloc(1, std::mem::size_of::<RawPyTypeObject>()) as *mut RawPyTypeObject;
-    if tp.is_null() {
-        return ptr::null_mut();
-    }
-    std::ptr::write(tp, RawPyTypeObject::zeroed());
+        // Allocate a real PyTypeObject with proper base chain
+        let tp = libc::calloc(1, std::mem::size_of::<RawPyTypeObject>()) as *mut RawPyTypeObject;
+        if tp.is_null() {
+            return ptr::null_mut();
+        }
+        std::ptr::write(tp, RawPyTypeObject::zeroed());
 
-    (*tp).tp_name = name_copy as *const c_char;
-    (*tp).ob_base.ob_type = crate::object::typeobj::PyType_Type.get();
-    (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
-    (*tp).tp_basicsize = std::mem::size_of::<RawPyObject>() as isize;
-    (*tp).tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
-        | crate::object::typeobj::PY_TPFLAGS_READY;
+        (*tp).tp_name = name_copy as *const c_char;
+        (*tp).ob_base.ob_type = crate::object::typeobj::PyType_Type.get();
+        (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+        (*tp).tp_basicsize = std::mem::size_of::<RawPyObject>() as isize;
+        (*tp).tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
+            | crate::object::typeobj::PY_TPFLAGS_READY;
 
-    // Set base type for PyType_IsSubtype to work
-    if !base_tp.is_null() {
-        (*tp).tp_base = base_tp;
-        let bases = crate::types::tuple::PyTuple_New(1);
-        let base_obj = base_tp as *mut RawPyObject;
-        (*base_obj).incref();
-        crate::types::tuple::PyTuple_SetItem(bases, 0, base_obj);
-        (*tp).tp_bases = bases;
-    }
+        // Set base type for PyType_IsSubtype to work
+        if !base_tp.is_null() {
+            (*tp).tp_base = base_tp;
+            let bases = crate::types::tuple::PyTuple_New(1);
+            let base_obj = base_tp as *mut RawPyObject;
+            (*base_obj).incref();
+            crate::types::tuple::PyTuple_SetItem(bases, 0, base_obj);
+            (*tp).tp_bases = bases;
+        }
 
-    // Inherit slots from base
-    if !base_tp.is_null() {
-        if (*tp).tp_alloc.is_none() { (*tp).tp_alloc = (*base_tp).tp_alloc; }
-        if (*tp).tp_new.is_none() { (*tp).tp_new = (*base_tp).tp_new; }
-        if (*tp).tp_init.is_none() { (*tp).tp_init = (*base_tp).tp_init; }
-        if (*tp).tp_free.is_none() { (*tp).tp_free = (*base_tp).tp_free; }
-        if (*tp).tp_dealloc.is_none() { (*tp).tp_dealloc = (*base_tp).tp_dealloc; }
-        if (*tp).tp_getattro.is_none() { (*tp).tp_getattro = (*base_tp).tp_getattro; }
-    }
+        // Inherit slots from base
+        if !base_tp.is_null() {
+            if (*tp).tp_alloc.is_none() { (*tp).tp_alloc = (*base_tp).tp_alloc; }
+            if (*tp).tp_new.is_none() { (*tp).tp_new = (*base_tp).tp_new; }
+            if (*tp).tp_init.is_none() { (*tp).tp_init = (*base_tp).tp_init; }
+            if (*tp).tp_free.is_none() { (*tp).tp_free = (*base_tp).tp_free; }
+            if (*tp).tp_dealloc.is_none() { (*tp).tp_dealloc = (*base_tp).tp_dealloc; }
+            if (*tp).tp_getattro.is_none() { (*tp).tp_getattro = (*base_tp).tp_getattro; }
+        }
 
-    tp as *mut RawPyObject
+        tp as *mut RawPyObject
+    })
 }
 
 // ─── Exception type singletons ───
@@ -483,11 +497,13 @@ pub unsafe extern "C" fn PyErr_WarnEx(
     message: *const c_char,
     _stacklevel: isize,
 ) -> c_int {
-    if !message.is_null() {
-        let msg = std::ffi::CStr::from_ptr(message).to_string_lossy();
-        eprintln!("Warning: {}", msg);
-    }
-    0 // success
+    crate::ffi::panic_guard::guard_int("PyErr_WarnEx", || unsafe {
+        if !message.is_null() {
+            let msg = std::ffi::CStr::from_ptr(message).to_string_lossy();
+            eprintln!("Warning: {}", msg);
+        }
+        0 // success
+    })
 }
 
 /// PyErr_WarnFormat — issue a warning with printf-style formatting.
@@ -498,53 +514,61 @@ pub unsafe extern "C" fn PyErr_WarnFormat(
     _stacklevel: isize,
     format: *const c_char,
 ) -> c_int {
-    PyErr_WarnEx(category, format, _stacklevel)
+    crate::ffi::panic_guard::guard_int("PyErr_WarnFormat", || unsafe {
+        PyErr_WarnEx(category, format, _stacklevel)
+    })
 }
 
 /// PyErr_Print — print the current exception to stderr and clear it.
 #[no_mangle]
 pub unsafe extern "C" fn PyErr_Print() {
-    PyErr_PrintEx(1)
+    crate::ffi::panic_guard::guard_void("PyErr_Print", || unsafe {
+        PyErr_PrintEx(1)
+    })
 }
 
 /// PyErr_PrintEx — print the current exception. set_sys_last_vars is ignored.
 #[no_mangle]
 pub unsafe extern "C" fn PyErr_PrintEx(_set_sys_last_vars: c_int) {
-    let mut ptype: *mut RawPyObject = ptr::null_mut();
-    let mut pvalue: *mut RawPyObject = ptr::null_mut();
-    let mut ptb: *mut RawPyObject = ptr::null_mut();
-    PyErr_Fetch(&mut ptype, &mut pvalue, &mut ptb);
-    if !ptype.is_null() {
-        let tp = ptype as *mut RawPyTypeObject;
-        let name = if !(*tp).tp_name.is_null() {
-            std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy().into_owned()
-        } else {
-            "Exception".to_string()
-        };
-        if !pvalue.is_null() {
-            let val_str = crate::ffi::object_api::PyObject_Str(pvalue);
-            if !val_str.is_null() {
-                let msg = crate::types::unicode::PyUnicode_AsUTF8(val_str);
-                if !msg.is_null() {
-                    let s = std::ffi::CStr::from_ptr(msg).to_string_lossy();
-                    eprintln!("{}: {}", name, s);
+    crate::ffi::panic_guard::guard_void("PyErr_PrintEx", || unsafe {
+        let mut ptype: *mut RawPyObject = ptr::null_mut();
+        let mut pvalue: *mut RawPyObject = ptr::null_mut();
+        let mut ptb: *mut RawPyObject = ptr::null_mut();
+        PyErr_Fetch(&mut ptype, &mut pvalue, &mut ptb);
+        if !ptype.is_null() {
+            let tp = ptype as *mut RawPyTypeObject;
+            let name = if !(*tp).tp_name.is_null() {
+                std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy().into_owned()
+            } else {
+                "Exception".to_string()
+            };
+            if !pvalue.is_null() {
+                let val_str = crate::ffi::object_api::PyObject_Str(pvalue);
+                if !val_str.is_null() {
+                    let msg = crate::types::unicode::PyUnicode_AsUTF8(val_str);
+                    if !msg.is_null() {
+                        let s = std::ffi::CStr::from_ptr(msg).to_string_lossy();
+                        eprintln!("{}: {}", name, s);
+                    } else {
+                        eprintln!("{}", name);
+                    }
                 } else {
                     eprintln!("{}", name);
                 }
             } else {
                 eprintln!("{}", name);
             }
-        } else {
-            eprintln!("{}", name);
         }
-    }
+    })
 }
 
 /// PyErr_WriteUnraisable — print a warning about an exception that can't be raised.
 #[no_mangle]
 pub unsafe extern "C" fn PyErr_WriteUnraisable(obj: *mut RawPyObject) {
-    eprintln!("Exception ignored in: {:p}", obj);
-    PyErr_Clear();
+    crate::ffi::panic_guard::guard_void("PyErr_WriteUnraisable", || unsafe {
+        eprintln!("Exception ignored in: {:p}", obj);
+        PyErr_Clear();
+    })
 }
 
 /// PyErr_NewExceptionWithDoc — like PyErr_NewException but with a docstring.
@@ -555,12 +579,14 @@ pub unsafe extern "C" fn PyErr_NewExceptionWithDoc(
     base: *mut RawPyObject,
     dict: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    let result = PyErr_NewException(name, base, dict);
-    if !result.is_null() && !doc.is_null() {
-        let tp = result as *mut RawPyTypeObject;
-        (*tp).tp_doc = doc;
-    }
-    result
+    crate::ffi::panic_guard::guard_ptr("PyErr_NewExceptionWithDoc", || unsafe {
+        let result = PyErr_NewException(name, base, dict);
+        if !result.is_null() && !doc.is_null() {
+            let tp = result as *mut RawPyTypeObject;
+            (*tp).tp_doc = doc;
+        }
+        result
+    })
 }
 
 // ─── Exception object APIs (needed by PyO3) ───
@@ -570,8 +596,10 @@ pub unsafe extern "C" fn PyErr_NewExceptionWithDoc(
 pub unsafe extern "C" fn PyException_GetTraceback(
     _exc: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    // Simplified: no traceback support yet
-    ptr::null_mut()
+    crate::ffi::panic_guard::guard_ptr("PyException_GetTraceback", || unsafe {
+        // Simplified: no traceback support yet
+        ptr::null_mut()
+    })
 }
 
 /// PyException_SetTraceback — set the traceback on an exception instance.
@@ -580,7 +608,9 @@ pub unsafe extern "C" fn PyException_SetTraceback(
     _exc: *mut RawPyObject,
     _tb: *mut RawPyObject,
 ) -> c_int {
-    0 // success (no-op)
+    crate::ffi::panic_guard::guard_int("PyException_SetTraceback", || unsafe {
+        0 // success (no-op)
+    })
 }
 
 /// PyException_GetCause — get the __cause__ of an exception.
@@ -588,7 +618,9 @@ pub unsafe extern "C" fn PyException_SetTraceback(
 pub unsafe extern "C" fn PyException_GetCause(
     _exc: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    ptr::null_mut()
+    crate::ffi::panic_guard::guard_ptr("PyException_GetCause", || unsafe {
+        ptr::null_mut()
+    })
 }
 
 /// PyException_SetCause — set the __cause__ of an exception.
@@ -597,7 +629,9 @@ pub unsafe extern "C" fn PyException_SetCause(
     _exc: *mut RawPyObject,
     _cause: *mut RawPyObject,
 ) {
-    // No-op for now
+    crate::ffi::panic_guard::guard_void("PyException_SetCause", || unsafe {
+        // No-op for now
+    })
 }
 
 #[no_mangle]

@@ -300,12 +300,14 @@ unsafe fn dict_resize(d: *mut PyDictObject, min_used: isize) {
 
 #[no_mangle]
 pub unsafe extern "C" fn PyDict_New() -> *mut RawPyObject {
-    let obj = crate::object::gc::_PyObject_GC_New(dict_type()) as *mut PyDictObject;
-    (*obj).ma_used = 0;
-    (*obj).ma_version_tag = next_dict_version();
-    (*obj).ma_keys = alloc_keys(DK_LOG2_MIN);
-    (*obj).ma_values = ptr::null_mut();
-    obj as *mut RawPyObject
+    crate::ffi::panic_guard::guard_ptr("PyDict_New", || unsafe {
+        let obj = crate::object::gc::_PyObject_GC_New(dict_type()) as *mut PyDictObject;
+        (*obj).ma_used = 0;
+        (*obj).ma_version_tag = next_dict_version();
+        (*obj).ma_keys = alloc_keys(DK_LOG2_MIN);
+        (*obj).ma_values = ptr::null_mut();
+        obj as *mut RawPyObject
+    })
 }
 
 #[no_mangle]
@@ -314,59 +316,61 @@ pub unsafe extern "C" fn PyDict_SetItem(
     key: *mut RawPyObject,
     value: *mut RawPyObject,
 ) -> c_int {
-    if dict.is_null() || key.is_null() { return -1; }
-    let d = dict as *mut PyDictObject;
-    let hash = hash_object(key);
+    crate::ffi::panic_guard::guard_int("PyDict_SetItem", || unsafe {
+        if dict.is_null() || key.is_null() { return -1; }
+        let d = dict as *mut PyDictObject;
+        let hash = hash_object(key);
 
-    let (slot, entry_ix) = find_slot((*d).ma_keys, hash, key);
+        let (slot, entry_ix) = find_slot((*d).ma_keys, hash, key);
 
-    if entry_ix >= 0 {
-        // Key already exists — replace value
-        let entries = dk_entries((*d).ma_keys);
-        let entry = &mut *entries.add(entry_ix as usize);
-        let old_val = entry.me_value;
-        if !value.is_null() { (*value).incref(); }
-        entry.me_value = value;
-        if !old_val.is_null() { (*old_val).decref(); }
-    } else {
-        // New key
-        if (*(*d).ma_keys).dk_usable <= 0 {
-            // Resize needed
-            dict_resize(d, (*d).ma_used + 1);
-            // Re-find slot in new table
-            let (new_slot, _) = find_slot((*d).ma_keys, hash, key);
-            let keys = (*d).ma_keys;
-            let entries = dk_entries(keys);
-            let indices = dk_indices(keys);
-            let n = (*keys).dk_nentries;
-            *indices.add(new_slot) = n;
-            let entry = &mut *entries.add(n as usize);
-            entry.me_hash = hash;
-            (*key).incref();
-            entry.me_key = key;
+        if entry_ix >= 0 {
+            // Key already exists — replace value
+            let entries = dk_entries((*d).ma_keys);
+            let entry = &mut *entries.add(entry_ix as usize);
+            let old_val = entry.me_value;
             if !value.is_null() { (*value).incref(); }
             entry.me_value = value;
-            (*keys).dk_nentries = n + 1;
-            (*keys).dk_usable -= 1;
+            if !old_val.is_null() { (*old_val).decref(); }
         } else {
-            let keys = (*d).ma_keys;
-            let entries = dk_entries(keys);
-            let indices = dk_indices(keys);
-            let n = (*keys).dk_nentries;
-            *indices.add(slot) = n;
-            let entry = &mut *entries.add(n as usize);
-            entry.me_hash = hash;
-            (*key).incref();
-            entry.me_key = key;
-            if !value.is_null() { (*value).incref(); }
-            entry.me_value = value;
-            (*keys).dk_nentries = n + 1;
-            (*keys).dk_usable -= 1;
+            // New key
+            if (*(*d).ma_keys).dk_usable <= 0 {
+                // Resize needed
+                dict_resize(d, (*d).ma_used + 1);
+                // Re-find slot in new table
+                let (new_slot, _) = find_slot((*d).ma_keys, hash, key);
+                let keys = (*d).ma_keys;
+                let entries = dk_entries(keys);
+                let indices = dk_indices(keys);
+                let n = (*keys).dk_nentries;
+                *indices.add(new_slot) = n;
+                let entry = &mut *entries.add(n as usize);
+                entry.me_hash = hash;
+                (*key).incref();
+                entry.me_key = key;
+                if !value.is_null() { (*value).incref(); }
+                entry.me_value = value;
+                (*keys).dk_nentries = n + 1;
+                (*keys).dk_usable -= 1;
+            } else {
+                let keys = (*d).ma_keys;
+                let entries = dk_entries(keys);
+                let indices = dk_indices(keys);
+                let n = (*keys).dk_nentries;
+                *indices.add(slot) = n;
+                let entry = &mut *entries.add(n as usize);
+                entry.me_hash = hash;
+                (*key).incref();
+                entry.me_key = key;
+                if !value.is_null() { (*value).incref(); }
+                entry.me_value = value;
+                (*keys).dk_nentries = n + 1;
+                (*keys).dk_usable -= 1;
+            }
+            (*d).ma_used += 1;
         }
-        (*d).ma_used += 1;
-    }
-    (*d).ma_version_tag = next_dict_version();
-    0
+        (*d).ma_version_tag = next_dict_version();
+        0
+    })
 }
 
 #[no_mangle]
@@ -375,11 +379,13 @@ pub unsafe extern "C" fn PyDict_SetItemString(
     key: *const std::os::raw::c_char,
     value: *mut RawPyObject,
 ) -> c_int {
-    if key.is_null() { return -1; }
-    let key_obj = crate::types::unicode::PyUnicode_FromString(key);
-    let result = PyDict_SetItem(dict, key_obj, value);
-    (*key_obj).decref();
-    result
+    crate::ffi::panic_guard::guard_int("PyDict_SetItemString", || unsafe {
+        if key.is_null() { return -1; }
+        let key_obj = crate::types::unicode::PyUnicode_FromString(key);
+        let result = PyDict_SetItem(dict, key_obj, value);
+        (*key_obj).decref();
+        result
+    })
 }
 
 #[no_mangle]
@@ -387,16 +393,18 @@ pub unsafe extern "C" fn PyDict_GetItem(
     dict: *mut RawPyObject,
     key: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    if dict.is_null() || key.is_null() { return ptr::null_mut(); }
-    let d = dict as *mut PyDictObject;
-    let hash = hash_object(key);
-    let entry_ix = lookup_key((*d).ma_keys, hash, key);
-    if entry_ix >= 0 {
-        let entries = dk_entries((*d).ma_keys);
-        (*entries.add(entry_ix as usize)).me_value
-    } else {
-        ptr::null_mut()
-    }
+    crate::ffi::panic_guard::guard_ptr("PyDict_GetItem", || unsafe {
+        if dict.is_null() || key.is_null() { return ptr::null_mut(); }
+        let d = dict as *mut PyDictObject;
+        let hash = hash_object(key);
+        let entry_ix = lookup_key((*d).ma_keys, hash, key);
+        if entry_ix >= 0 {
+            let entries = dk_entries((*d).ma_keys);
+            (*entries.add(entry_ix as usize)).me_value
+        } else {
+            ptr::null_mut()
+        }
+    })
 }
 
 #[no_mangle]
@@ -404,12 +412,14 @@ pub unsafe extern "C" fn PyDict_GetItemString(
     dict: *mut RawPyObject,
     key: *const std::os::raw::c_char,
 ) -> *mut RawPyObject {
-    if dict.is_null() || key.is_null() { return ptr::null_mut(); }
-    // Create a temp key, look up by value
-    let key_obj = crate::types::unicode::PyUnicode_FromString(key);
-    let result = PyDict_GetItem(dict, key_obj);
-    (*key_obj).decref();
-    result
+    crate::ffi::panic_guard::guard_ptr("PyDict_GetItemString", || unsafe {
+        if dict.is_null() || key.is_null() { return ptr::null_mut(); }
+        // Create a temp key, look up by value
+        let key_obj = crate::types::unicode::PyUnicode_FromString(key);
+        let result = PyDict_GetItem(dict, key_obj);
+        (*key_obj).decref();
+        result
+    })
 }
 
 #[no_mangle]
@@ -417,7 +427,9 @@ pub unsafe extern "C" fn PyDict_GetItemWithError(
     dict: *mut RawPyObject,
     key: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    PyDict_GetItem(dict, key)
+    crate::ffi::panic_guard::guard_ptr("PyDict_GetItemWithError", || unsafe {
+        PyDict_GetItem(dict, key)
+    })
 }
 
 #[no_mangle]
@@ -425,25 +437,27 @@ pub unsafe extern "C" fn PyDict_DelItem(
     dict: *mut RawPyObject,
     key: *mut RawPyObject,
 ) -> c_int {
-    if dict.is_null() || key.is_null() { return -1; }
-    let d = dict as *mut PyDictObject;
-    let hash = hash_object(key);
-    let (slot, entry_ix) = find_slot((*d).ma_keys, hash, key);
-    if entry_ix < 0 { return -1; }
+    crate::ffi::panic_guard::guard_int("PyDict_DelItem", || unsafe {
+        if dict.is_null() || key.is_null() { return -1; }
+        let d = dict as *mut PyDictObject;
+        let hash = hash_object(key);
+        let (slot, entry_ix) = find_slot((*d).ma_keys, hash, key);
+        if entry_ix < 0 { return -1; }
 
-    let keys = (*d).ma_keys;
-    let indices = dk_indices(keys);
-    let entries = dk_entries(keys);
-    *indices.add(slot) = DKIX_DUMMY;
-    let entry = &mut *entries.add(entry_ix as usize);
-    if !entry.me_key.is_null() { (*entry.me_key).decref(); }
-    if !entry.me_value.is_null() { (*entry.me_value).decref(); }
-    entry.me_key = ptr::null_mut();
-    entry.me_value = ptr::null_mut();
-    entry.me_hash = 0;
-    (*d).ma_used -= 1;
-    (*d).ma_version_tag = next_dict_version();
-    0
+        let keys = (*d).ma_keys;
+        let indices = dk_indices(keys);
+        let entries = dk_entries(keys);
+        *indices.add(slot) = DKIX_DUMMY;
+        let entry = &mut *entries.add(entry_ix as usize);
+        if !entry.me_key.is_null() { (*entry.me_key).decref(); }
+        if !entry.me_value.is_null() { (*entry.me_value).decref(); }
+        entry.me_key = ptr::null_mut();
+        entry.me_value = ptr::null_mut();
+        entry.me_hash = 0;
+        (*d).ma_used -= 1;
+        (*d).ma_version_tag = next_dict_version();
+        0
+    })
 }
 
 #[no_mangle]
@@ -451,11 +465,13 @@ pub unsafe extern "C" fn PyDict_DelItemString(
     dict: *mut RawPyObject,
     key: *const std::os::raw::c_char,
 ) -> c_int {
-    if key.is_null() { return -1; }
-    let key_obj = crate::types::unicode::PyUnicode_FromString(key);
-    let result = PyDict_DelItem(dict, key_obj);
-    (*key_obj).decref();
-    result
+    crate::ffi::panic_guard::guard_int("PyDict_DelItemString", || unsafe {
+        if key.is_null() { return -1; }
+        let key_obj = crate::types::unicode::PyUnicode_FromString(key);
+        let result = PyDict_DelItem(dict, key_obj);
+        (*key_obj).decref();
+        result
+    })
 }
 
 #[no_mangle]
@@ -463,78 +479,88 @@ pub unsafe extern "C" fn PyDict_Contains(
     dict: *mut RawPyObject,
     key: *mut RawPyObject,
 ) -> c_int {
-    if dict.is_null() || key.is_null() { return -1; }
-    let d = dict as *mut PyDictObject;
-    let hash = hash_object(key);
-    if lookup_key((*d).ma_keys, hash, key) >= 0 { 1 } else { 0 }
+    crate::ffi::panic_guard::guard_int("PyDict_Contains", || unsafe {
+        if dict.is_null() || key.is_null() { return -1; }
+        let d = dict as *mut PyDictObject;
+        let hash = hash_object(key);
+        if lookup_key((*d).ma_keys, hash, key) >= 0 { 1 } else { 0 }
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyDict_Size(dict: *mut RawPyObject) -> isize {
-    if dict.is_null() { return -1; }
-    let d = dict as *mut PyDictObject;
-    (*d).ma_used
+    crate::ffi::panic_guard::guard_ssize("PyDict_Size", || unsafe {
+        if dict.is_null() { return -1; }
+        let d = dict as *mut PyDictObject;
+        (*d).ma_used
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyDict_Keys(dict: *mut RawPyObject) -> *mut RawPyObject {
-    if dict.is_null() { return ptr::null_mut(); }
-    let d = dict as *mut PyDictObject;
-    let list = crate::types::list::PyList_New((*d).ma_used);
-    let entries = dk_entries((*d).ma_keys);
-    let n = (*(*d).ma_keys).dk_nentries;
-    let mut j: isize = 0;
-    for i in 0..n as usize {
-        let entry = &*entries.add(i);
-        if !entry.me_key.is_null() && !entry.me_value.is_null() {
-            (*entry.me_key).incref();
-            crate::types::list::PyList_SET_ITEM(list, j, entry.me_key);
-            j += 1;
+    crate::ffi::panic_guard::guard_ptr("PyDict_Keys", || unsafe {
+        if dict.is_null() { return ptr::null_mut(); }
+        let d = dict as *mut PyDictObject;
+        let list = crate::types::list::PyList_New((*d).ma_used);
+        let entries = dk_entries((*d).ma_keys);
+        let n = (*(*d).ma_keys).dk_nentries;
+        let mut j: isize = 0;
+        for i in 0..n as usize {
+            let entry = &*entries.add(i);
+            if !entry.me_key.is_null() && !entry.me_value.is_null() {
+                (*entry.me_key).incref();
+                crate::types::list::PyList_SET_ITEM(list, j, entry.me_key);
+                j += 1;
+            }
         }
-    }
-    list
+        list
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyDict_Values(dict: *mut RawPyObject) -> *mut RawPyObject {
-    if dict.is_null() { return ptr::null_mut(); }
-    let d = dict as *mut PyDictObject;
-    let list = crate::types::list::PyList_New((*d).ma_used);
-    let entries = dk_entries((*d).ma_keys);
-    let n = (*(*d).ma_keys).dk_nentries;
-    let mut j: isize = 0;
-    for i in 0..n as usize {
-        let entry = &*entries.add(i);
-        if !entry.me_key.is_null() && !entry.me_value.is_null() {
-            (*entry.me_value).incref();
-            crate::types::list::PyList_SET_ITEM(list, j, entry.me_value);
-            j += 1;
+    crate::ffi::panic_guard::guard_ptr("PyDict_Values", || unsafe {
+        if dict.is_null() { return ptr::null_mut(); }
+        let d = dict as *mut PyDictObject;
+        let list = crate::types::list::PyList_New((*d).ma_used);
+        let entries = dk_entries((*d).ma_keys);
+        let n = (*(*d).ma_keys).dk_nentries;
+        let mut j: isize = 0;
+        for i in 0..n as usize {
+            let entry = &*entries.add(i);
+            if !entry.me_key.is_null() && !entry.me_value.is_null() {
+                (*entry.me_value).incref();
+                crate::types::list::PyList_SET_ITEM(list, j, entry.me_value);
+                j += 1;
+            }
         }
-    }
-    list
+        list
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyDict_Items(dict: *mut RawPyObject) -> *mut RawPyObject {
-    if dict.is_null() { return ptr::null_mut(); }
-    let d = dict as *mut PyDictObject;
-    let list = crate::types::list::PyList_New((*d).ma_used);
-    let entries = dk_entries((*d).ma_keys);
-    let n = (*(*d).ma_keys).dk_nentries;
-    let mut j: isize = 0;
-    for i in 0..n as usize {
-        let entry = &*entries.add(i);
-        if !entry.me_key.is_null() && !entry.me_value.is_null() {
-            let tuple = crate::types::tuple::PyTuple_New(2);
-            (*entry.me_key).incref();
-            crate::types::tuple::PyTuple_SET_ITEM(tuple, 0, entry.me_key);
-            (*entry.me_value).incref();
-            crate::types::tuple::PyTuple_SET_ITEM(tuple, 1, entry.me_value);
-            crate::types::list::PyList_SET_ITEM(list, j, tuple);
-            j += 1;
+    crate::ffi::panic_guard::guard_ptr("PyDict_Items", || unsafe {
+        if dict.is_null() { return ptr::null_mut(); }
+        let d = dict as *mut PyDictObject;
+        let list = crate::types::list::PyList_New((*d).ma_used);
+        let entries = dk_entries((*d).ma_keys);
+        let n = (*(*d).ma_keys).dk_nentries;
+        let mut j: isize = 0;
+        for i in 0..n as usize {
+            let entry = &*entries.add(i);
+            if !entry.me_key.is_null() && !entry.me_value.is_null() {
+                let tuple = crate::types::tuple::PyTuple_New(2);
+                (*entry.me_key).incref();
+                crate::types::tuple::PyTuple_SET_ITEM(tuple, 0, entry.me_key);
+                (*entry.me_value).incref();
+                crate::types::tuple::PyTuple_SET_ITEM(tuple, 1, entry.me_value);
+                crate::types::list::PyList_SET_ITEM(list, j, tuple);
+                j += 1;
+            }
         }
-    }
-    list
+        list
+    })
 }
 
 #[no_mangle]
@@ -544,61 +570,67 @@ pub unsafe extern "C" fn PyDict_Next(
     key: *mut *mut RawPyObject,
     value: *mut *mut RawPyObject,
 ) -> c_int {
-    if dict.is_null() || pos.is_null() { return 0; }
-    let d = dict as *mut PyDictObject;
-    let keys = (*d).ma_keys;
-    let entries = dk_entries(keys);
-    let n = (*keys).dk_nentries;
-    let mut idx = *pos;
+    crate::ffi::panic_guard::guard_int("PyDict_Next", || unsafe {
+        if dict.is_null() || pos.is_null() { return 0; }
+        let d = dict as *mut PyDictObject;
+        let keys = (*d).ma_keys;
+        let entries = dk_entries(keys);
+        let n = (*keys).dk_nentries;
+        let mut idx = *pos;
 
-    // Skip deleted entries
-    while idx < n {
-        let entry = &*entries.add(idx as usize);
-        if !entry.me_key.is_null() && !entry.me_value.is_null() {
-            if !key.is_null() { *key = entry.me_key; }
-            if !value.is_null() { *value = entry.me_value; }
-            *pos = idx + 1;
-            return 1;
+        // Skip deleted entries
+        while idx < n {
+            let entry = &*entries.add(idx as usize);
+            if !entry.me_key.is_null() && !entry.me_value.is_null() {
+                if !key.is_null() { *key = entry.me_key; }
+                if !value.is_null() { *value = entry.me_value; }
+                *pos = idx + 1;
+                return 1;
+            }
+            idx += 1;
         }
-        idx += 1;
-    }
-    0
+        0
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyDict_Clear(dict: *mut RawPyObject) {
-    if dict.is_null() { return; }
-    let d = dict as *mut PyDictObject;
-    let keys = (*d).ma_keys;
-    if !keys.is_null() {
-        let entries = dk_entries(keys);
-        let n = (*keys).dk_nentries;
-        for i in 0..n as usize {
-            let entry = &mut *entries.add(i);
-            if !entry.me_key.is_null() { (*entry.me_key).decref(); }
-            if !entry.me_value.is_null() { (*entry.me_value).decref(); }
+    crate::ffi::panic_guard::guard_void("PyDict_Clear", || unsafe {
+        if dict.is_null() { return; }
+        let d = dict as *mut PyDictObject;
+        let keys = (*d).ma_keys;
+        if !keys.is_null() {
+            let entries = dk_entries(keys);
+            let n = (*keys).dk_nentries;
+            for i in 0..n as usize {
+                let entry = &mut *entries.add(i);
+                if !entry.me_key.is_null() { (*entry.me_key).decref(); }
+                if !entry.me_value.is_null() { (*entry.me_value).decref(); }
+            }
+            free_keys(keys);
         }
-        free_keys(keys);
-    }
-    (*d).ma_keys = alloc_keys(DK_LOG2_MIN);
-    (*d).ma_used = 0;
-    (*d).ma_version_tag = next_dict_version();
+        (*d).ma_keys = alloc_keys(DK_LOG2_MIN);
+        (*d).ma_used = 0;
+        (*d).ma_version_tag = next_dict_version();
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyDict_Copy(dict: *mut RawPyObject) -> *mut RawPyObject {
-    if dict.is_null() { return ptr::null_mut(); }
-    let d = dict as *mut PyDictObject;
-    let new_dict = PyDict_New();
-    let entries = dk_entries((*d).ma_keys);
-    let n = (*(*d).ma_keys).dk_nentries;
-    for i in 0..n as usize {
-        let entry = &*entries.add(i);
-        if !entry.me_key.is_null() && !entry.me_value.is_null() {
-            PyDict_SetItem(new_dict, entry.me_key, entry.me_value);
+    crate::ffi::panic_guard::guard_ptr("PyDict_Copy", || unsafe {
+        if dict.is_null() { return ptr::null_mut(); }
+        let d = dict as *mut PyDictObject;
+        let new_dict = PyDict_New();
+        let entries = dk_entries((*d).ma_keys);
+        let n = (*(*d).ma_keys).dk_nentries;
+        for i in 0..n as usize {
+            let entry = &*entries.add(i);
+            if !entry.me_key.is_null() && !entry.me_value.is_null() {
+                PyDict_SetItem(new_dict, entry.me_key, entry.me_value);
+            }
         }
-    }
-    new_dict
+        new_dict
+    })
 }
 
 #[no_mangle]
@@ -606,17 +638,19 @@ pub unsafe extern "C" fn PyDict_Update(
     dict: *mut RawPyObject,
     other: *mut RawPyObject,
 ) -> c_int {
-    if dict.is_null() || other.is_null() { return -1; }
-    let o = other as *mut PyDictObject;
-    let entries = dk_entries((*o).ma_keys);
-    let n = (*(*o).ma_keys).dk_nentries;
-    for i in 0..n as usize {
-        let entry = &*entries.add(i);
-        if !entry.me_key.is_null() && !entry.me_value.is_null() {
-            PyDict_SetItem(dict, entry.me_key, entry.me_value);
+    crate::ffi::panic_guard::guard_int("PyDict_Update", || unsafe {
+        if dict.is_null() || other.is_null() { return -1; }
+        let o = other as *mut PyDictObject;
+        let entries = dk_entries((*o).ma_keys);
+        let n = (*(*o).ma_keys).dk_nentries;
+        for i in 0..n as usize {
+            let entry = &*entries.add(i);
+            if !entry.me_key.is_null() && !entry.me_value.is_null() {
+                PyDict_SetItem(dict, entry.me_key, entry.me_value);
+            }
         }
-    }
-    0
+        0
+    })
 }
 
 #[no_mangle]
@@ -625,7 +659,9 @@ pub unsafe extern "C" fn PyDict_Merge(
     other: *mut RawPyObject,
     _override_: c_int,
 ) -> c_int {
-    PyDict_Update(dict, other)
+    crate::ffi::panic_guard::guard_int("PyDict_Merge", || unsafe {
+        PyDict_Update(dict, other)
+    })
 }
 
 /// PyDict_SetDefault — get or set a default value for a key.
@@ -636,22 +672,26 @@ pub unsafe extern "C" fn PyDict_SetDefault(
     key: *mut RawPyObject,
     defaultobj: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    if dict.is_null() || key.is_null() {
-        return ptr::null_mut();
-    }
-    let existing = PyDict_GetItem(dict, key);
-    if !existing.is_null() {
-        return existing;
-    }
-    // Key not found — insert the default
-    PyDict_SetItem(dict, key, defaultobj);
-    defaultobj
+    crate::ffi::panic_guard::guard_ptr("PyDict_SetDefault", || unsafe {
+        if dict.is_null() || key.is_null() {
+            return ptr::null_mut();
+        }
+        let existing = PyDict_GetItem(dict, key);
+        if !existing.is_null() {
+            return existing;
+        }
+        // Key not found — insert the default
+        PyDict_SetItem(dict, key, defaultobj);
+        defaultobj
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyDict_Check(obj: *mut RawPyObject) -> c_int {
-    if obj.is_null() { return 0; }
-    if (*obj).ob_type == dict_type() { 1 } else { 0 }
+    crate::ffi::panic_guard::guard_int("PyDict_Check", || unsafe {
+        if obj.is_null() { return 0; }
+        if (*obj).ob_type == dict_type() { 1 } else { 0 }
+    })
 }
 
 pub unsafe fn init_dict_type() {

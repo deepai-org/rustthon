@@ -40,57 +40,61 @@ pub unsafe extern "C" fn PyObject_GetBuffer(
     view: *mut PyBufferRaw,
     flags: c_int,
 ) -> c_int {
-    if obj.is_null() || view.is_null() {
-        return -1;
-    }
-
-    // Zero out the view
-    ptr::write_bytes(view, 0, 1);
-
-    let tp = (*obj).ob_type;
-    if tp.is_null() {
-        return -1;
-    }
-
-    let as_buffer = (*tp).tp_as_buffer;
-    if as_buffer.is_null() {
-        // Type doesn't support buffer protocol
-        return -1;
-    }
-
-    if let Some(bf_getbuffer) = (*as_buffer).bf_getbuffer {
-        let result = bf_getbuffer(obj, view, flags);
-        if result == 0 {
-            (*view).obj = obj;
-            (*obj).incref();
+    crate::ffi::panic_guard::guard_int("PyObject_GetBuffer", || unsafe {
+        if obj.is_null() || view.is_null() {
+            return -1;
         }
-        result
-    } else {
-        -1
-    }
+
+        // Zero out the view
+        ptr::write_bytes(view, 0, 1);
+
+        let tp = (*obj).ob_type;
+        if tp.is_null() {
+            return -1;
+        }
+
+        let as_buffer = (*tp).tp_as_buffer;
+        if as_buffer.is_null() {
+            // Type doesn't support buffer protocol
+            return -1;
+        }
+
+        if let Some(bf_getbuffer) = (*as_buffer).bf_getbuffer {
+            let result = bf_getbuffer(obj, view, flags);
+            if result == 0 {
+                (*view).obj = obj;
+                (*obj).incref();
+            }
+            result
+        } else {
+            -1
+        }
+    })
 }
 
 /// PyBuffer_Release - release a buffer view
 #[no_mangle]
 pub unsafe extern "C" fn PyBuffer_Release(view: *mut PyBufferRaw) {
-    if view.is_null() {
-        return;
-    }
-
-    let obj = (*view).obj;
-    if !obj.is_null() {
-        let tp = (*obj).ob_type;
-        if !tp.is_null() && !(*tp).tp_as_buffer.is_null() {
-            if let Some(bf_releasebuffer) = (*(*tp).tp_as_buffer).bf_releasebuffer {
-                bf_releasebuffer(obj, view);
-            }
+    crate::ffi::panic_guard::guard_void("PyBuffer_Release", || unsafe {
+        if view.is_null() {
+            return;
         }
-        (*obj).decref();
-    }
 
-    // Clear the view
-    (*view).obj = ptr::null_mut();
-    (*view).buf = ptr::null_mut();
+        let obj = (*view).obj;
+        if !obj.is_null() {
+            let tp = (*obj).ob_type;
+            if !tp.is_null() && !(*tp).tp_as_buffer.is_null() {
+                if let Some(bf_releasebuffer) = (*(*tp).tp_as_buffer).bf_releasebuffer {
+                    bf_releasebuffer(obj, view);
+                }
+            }
+            (*obj).decref();
+        }
+
+        // Clear the view
+        (*view).obj = ptr::null_mut();
+        (*view).buf = ptr::null_mut();
+    })
 }
 
 /// PyBuffer_IsContiguous
@@ -99,15 +103,17 @@ pub unsafe extern "C" fn PyBuffer_IsContiguous(
     view: *const PyBufferRaw,
     order: c_char,
 ) -> c_int {
-    if view.is_null() {
-        return 0;
-    }
-    // Simple check: if no strides or suboffsets, it's contiguous
-    if (*view).strides.is_null() && (*view).suboffsets.is_null() {
-        return 1;
-    }
-    // TODO: Full contiguity check for C/Fortran order
-    1
+    crate::ffi::panic_guard::guard_int("PyBuffer_IsContiguous", || unsafe {
+        if view.is_null() {
+            return 0;
+        }
+        // Simple check: if no strides or suboffsets, it's contiguous
+        if (*view).strides.is_null() && (*view).suboffsets.is_null() {
+            return 1;
+        }
+        // TODO: Full contiguity check for C/Fortran order
+        1
+    })
 }
 
 /// PyBuffer_GetPointer
@@ -116,23 +122,25 @@ pub unsafe extern "C" fn PyBuffer_GetPointer(
     view: *const PyBufferRaw,
     indices: *const PySsizeT,
 ) -> *mut c_void {
-    if view.is_null() || (*view).buf.is_null() {
-        return ptr::null_mut();
-    }
-    if indices.is_null() || (*view).ndim == 0 {
-        return (*view).buf;
-    }
-
-    let mut pointer = (*view).buf as *mut u8;
-    for i in 0..(*view).ndim as usize {
-        let idx = *indices.add(i);
-        if !(*view).strides.is_null() {
-            pointer = pointer.offset(idx * *(*view).strides.add(i));
-        } else {
-            pointer = pointer.offset(idx * (*view).itemsize);
+    crate::ffi::panic_guard::guard_ptr("PyBuffer_GetPointer", || unsafe {
+        if view.is_null() || (*view).buf.is_null() {
+            return ptr::null_mut();
         }
-    }
-    pointer as *mut c_void
+        if indices.is_null() || (*view).ndim == 0 {
+            return (*view).buf;
+        }
+
+        let mut pointer = (*view).buf as *mut u8;
+        for i in 0..(*view).ndim as usize {
+            let idx = *indices.add(i);
+            if !(*view).strides.is_null() {
+                pointer = pointer.offset(idx * *(*view).strides.add(i));
+            } else {
+                pointer = pointer.offset(idx * (*view).itemsize);
+            }
+        }
+        pointer as *mut c_void
+    })
 }
 
 /// PyBuffer_FillInfo - helper to fill a simple buffer view
@@ -145,35 +153,37 @@ pub unsafe extern "C" fn PyBuffer_FillInfo(
     readonly: c_int,
     flags: c_int,
 ) -> c_int {
-    if view.is_null() {
-        return -1;
-    }
+    crate::ffi::panic_guard::guard_int("PyBuffer_FillInfo", || unsafe {
+        if view.is_null() {
+            return -1;
+        }
 
-    if (flags & PyBUF_WRITABLE) != 0 && readonly != 0 {
-        // Requested writable buffer but data is readonly
-        return -1;
-    }
+        if (flags & PyBUF_WRITABLE) != 0 && readonly != 0 {
+            // Requested writable buffer but data is readonly
+            return -1;
+        }
 
-    (*view).buf = buf;
-    (*view).obj = obj;
-    if !obj.is_null() {
-        (*obj).incref();
-    }
-    (*view).len = len;
-    (*view).itemsize = 1;
-    (*view).readonly = readonly;
-    (*view).ndim = 1;
-    (*view).format = if (flags & PyBUF_FORMAT) != 0 {
-        b"B\0".as_ptr() as *mut c_char // unsigned byte
-    } else {
-        ptr::null_mut()
-    };
-    (*view).shape = ptr::null_mut();
-    (*view).strides = ptr::null_mut();
-    (*view).suboffsets = ptr::null_mut();
-    (*view).internal = ptr::null_mut();
+        (*view).buf = buf;
+        (*view).obj = obj;
+        if !obj.is_null() {
+            (*obj).incref();
+        }
+        (*view).len = len;
+        (*view).itemsize = 1;
+        (*view).readonly = readonly;
+        (*view).ndim = 1;
+        (*view).format = if (flags & PyBUF_FORMAT) != 0 {
+            b"B\0".as_ptr() as *mut c_char // unsigned byte
+        } else {
+            ptr::null_mut()
+        };
+        (*view).shape = ptr::null_mut();
+        (*view).strides = ptr::null_mut();
+        (*view).suboffsets = ptr::null_mut();
+        (*view).internal = ptr::null_mut();
 
-    0
+        0
+    })
 }
 
 /// PyMemoryView_FromObject
@@ -181,8 +191,10 @@ pub unsafe extern "C" fn PyBuffer_FillInfo(
 pub unsafe extern "C" fn PyMemoryView_FromObject(
     obj: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    // TODO: Create a memoryview object wrapping the buffer
-    ptr::null_mut()
+    crate::ffi::panic_guard::guard_ptr("PyMemoryView_FromObject", || unsafe {
+        // TODO: Create a memoryview object wrapping the buffer
+        ptr::null_mut()
+    })
 }
 
 /// PyMemoryView_FromBuffer
@@ -190,6 +202,8 @@ pub unsafe extern "C" fn PyMemoryView_FromObject(
 pub unsafe extern "C" fn PyMemoryView_FromBuffer(
     view: *const PyBufferRaw,
 ) -> *mut RawPyObject {
-    // TODO: Create memoryview from buffer info
-    ptr::null_mut()
+    crate::ffi::panic_guard::guard_ptr("PyMemoryView_FromBuffer", || unsafe {
+        // TODO: Create memoryview from buffer info
+        ptr::null_mut()
+    })
 }

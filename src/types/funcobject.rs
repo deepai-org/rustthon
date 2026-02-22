@@ -191,22 +191,26 @@ pub unsafe fn call_cfunction(
 
 /// PyCFunction_NewEx
 #[no_mangle]
-pub unsafe extern "C" fn PyCFunction_NewEx(
+pub extern "C" fn PyCFunction_NewEx(
     ml: *mut PyMethodDef,
     self_obj: *mut RawPyObject,
     module: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    if ml.is_null() {
-        return ptr::null_mut();
-    }
-    create_cfunction_full((*ml).ml_name, (*ml).ml_meth, (*ml).ml_flags, self_obj, module, ml)
+    crate::ffi::panic_guard::guard_ptr("PyCFunction_NewEx", || unsafe {
+        if ml.is_null() {
+            return ptr::null_mut();
+        }
+        create_cfunction_full((*ml).ml_name, (*ml).ml_meth, (*ml).ml_flags, self_obj, module, ml)
+    })
 }
 
 /// PyCFunction_New
 #[no_mangle]
-pub unsafe extern "C" fn PyCFunction_New(
+pub extern "C" fn PyCFunction_New(
     ml: *mut PyMethodDef,
     self_obj: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    PyCFunction_NewEx(ml, self_obj, ptr::null_mut())
+    crate::ffi::panic_guard::guard_ptr("PyCFunction_New", || unsafe {
+        PyCFunction_NewEx(ml, self_obj, ptr::null_mut())
+    })
 }

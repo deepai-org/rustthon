@@ -1,3 +1,4 @@
+pub mod panic_guard;
 pub mod object_api;
 pub mod buffer;
 pub mod import;

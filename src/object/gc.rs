@@ -70,40 +70,42 @@ unsafe fn obj_from_gc_head(gc: *mut PyGCHead) -> *mut RawPyObject {
 pub unsafe extern "C" fn _PyObject_GC_New(
     tp: *mut RawPyTypeObject,
 ) -> *mut RawPyObject {
-    if tp.is_null() {
-        eprintln!("[rustthon] FATAL: _PyObject_GC_New called with NULL type pointer!");
-        eprintln!("  This usually means a C extension failed to create a type (PyType_FromSpec* returned NULL)");
-        eprintln!("  but the extension continued to use the NULL type pointer.");
-        // Don't abort — return null so the caller can handle the error
-        return std::ptr::null_mut();
-    }
-    let obj_size = (*tp).tp_basicsize as usize;
+    crate::ffi::panic_guard::guard_ptr("_PyObject_GC_New", || unsafe {
+        if tp.is_null() {
+            eprintln!("[rustthon] FATAL: _PyObject_GC_New called with NULL type pointer!");
+            eprintln!("  This usually means a C extension failed to create a type (PyType_FromSpec* returned NULL)");
+            eprintln!("  but the extension continued to use the NULL type pointer.");
+            // Don't abort — return null so the caller can handle the error
+            return std::ptr::null_mut();
+        }
+        let obj_size = (*tp).tp_basicsize as usize;
 
-    let total = GC_HEAD_SIZE + obj_size;
-    let raw = libc::calloc(1, total) as *mut u8;
-    if raw.is_null() {
-        eprintln!("Fatal: out of memory in _PyObject_GC_New");
-        std::process::abort();
-    }
+        let total = GC_HEAD_SIZE + obj_size;
+        let raw = libc::calloc(1, total) as *mut u8;
+        if raw.is_null() {
+            eprintln!("Fatal: out of memory in _PyObject_GC_New");
+            std::process::abort();
+        }
 
-    // GC head is at `raw`, object starts at `raw + GC_HEAD_SIZE`
-    let obj = raw.add(GC_HEAD_SIZE) as *mut RawPyObject;
-    std::ptr::write(&mut (*obj).ob_refcnt, AtomicIsize::new(1));
-    (*obj).ob_type = tp;
+        // GC head is at `raw`, object starts at `raw + GC_HEAD_SIZE`
+        let obj = raw.add(GC_HEAD_SIZE) as *mut RawPyObject;
+        std::ptr::write(&mut (*obj).ob_refcnt, AtomicIsize::new(1));
+        (*obj).ob_type = tp;
 
-    // Debug: trace large object allocations (CyFunction etc.)
-    if obj_size > 100 {
-        let tp_name = if !tp.is_null() && !(*tp).tp_name.is_null() {
-            std::ffi::CStr::from_ptr((*tp).tp_name).to_str().unwrap_or("???")
-        } else { "(null tp)" };
-        eprintln!("[rustthon] _PyObject_GC_New: tp={:p} name={} basicsize={} -> obj={:p}, ob_type={:p}",
-            tp, tp_name, obj_size, obj, (*obj).ob_type);
-    }
+        // Debug: trace large object allocations (CyFunction etc.)
+        if obj_size > 100 {
+            let tp_name = if !tp.is_null() && !(*tp).tp_name.is_null() {
+                std::ffi::CStr::from_ptr((*tp).tp_name).to_str().unwrap_or("???")
+            } else { "(null tp)" };
+            eprintln!("[rustthon] _PyObject_GC_New: tp={:p} name={} basicsize={} -> obj={:p}, ob_type={:p}",
+                tp, tp_name, obj_size, obj, (*obj).ob_type);
+        }
 
-    // Track the object
-    PyObject_GC_Track(obj as *mut c_void);
+        // Track the object
+        PyObject_GC_Track(obj as *mut c_void);
 
-    obj
+        obj
+    })
 }
 
 /// _PyObject_GC_NewVar — allocate a variable-size GC-tracked object.
@@ -113,34 +115,36 @@ pub unsafe extern "C" fn _PyObject_GC_NewVar(
     tp: *mut RawPyTypeObject,
     nitems: isize,
 ) -> *mut RawPyVarObject {
-    let basicsize = if !tp.is_null() {
-        (*tp).tp_basicsize as usize
-    } else {
-        std::mem::size_of::<RawPyVarObject>()
-    };
-    let itemsize = if !tp.is_null() {
-        (*tp).tp_itemsize as usize
-    } else {
-        0
-    };
+    crate::ffi::panic_guard::guard_ptr("_PyObject_GC_NewVar", || unsafe {
+        let basicsize = if !tp.is_null() {
+            (*tp).tp_basicsize as usize
+        } else {
+            std::mem::size_of::<RawPyVarObject>()
+        };
+        let itemsize = if !tp.is_null() {
+            (*tp).tp_itemsize as usize
+        } else {
+            0
+        };
 
-    let obj_size = basicsize + (nitems.max(0) as usize) * itemsize;
-    let total = GC_HEAD_SIZE + obj_size;
-    let raw = libc::calloc(1, total) as *mut u8;
-    if raw.is_null() {
-        eprintln!("Fatal: out of memory in _PyObject_GC_NewVar");
-        std::process::abort();
-    }
+        let obj_size = basicsize + (nitems.max(0) as usize) * itemsize;
+        let total = GC_HEAD_SIZE + obj_size;
+        let raw = libc::calloc(1, total) as *mut u8;
+        if raw.is_null() {
+            eprintln!("Fatal: out of memory in _PyObject_GC_NewVar");
+            std::process::abort();
+        }
 
-    let obj = raw.add(GC_HEAD_SIZE) as *mut RawPyVarObject;
-    std::ptr::write(&mut (*obj).ob_base.ob_refcnt, AtomicIsize::new(1));
-    (*obj).ob_base.ob_type = tp;
-    (*obj).ob_size = nitems;
+        let obj = raw.add(GC_HEAD_SIZE) as *mut RawPyVarObject;
+        std::ptr::write(&mut (*obj).ob_base.ob_refcnt, AtomicIsize::new(1));
+        (*obj).ob_base.ob_type = tp;
+        (*obj).ob_size = nitems;
 
-    // Track the object
-    PyObject_GC_Track(obj as *mut c_void);
+        // Track the object
+        PyObject_GC_Track(obj as *mut c_void);
 
-    obj
+        obj
+    })
 }
 
 // ─── GC Tracking ───
@@ -150,34 +154,40 @@ pub unsafe extern "C" fn _PyObject_GC_NewVar(
 /// (i.e., it has a PyGC_Head before it).
 #[no_mangle]
 pub unsafe extern "C" fn PyObject_GC_Track(op: *mut c_void) {
-    if !op.is_null() {
-        let gc = gc_head_from_obj(op);
-        with_gc(|state| {
-            state.tracked.insert(gc as usize);
-            state.gen0_count += 1;
-        });
-    }
+    crate::ffi::panic_guard::guard_void("PyObject_GC_Track", || unsafe {
+        if !op.is_null() {
+            let gc = gc_head_from_obj(op);
+            with_gc(|state| {
+                state.tracked.insert(gc as usize);
+                state.gen0_count += 1;
+            });
+        }
+    })
 }
 
 /// PyObject_GC_UnTrack — remove an object from GC tracking.
 #[no_mangle]
 pub unsafe extern "C" fn PyObject_GC_UnTrack(op: *mut c_void) {
-    if !op.is_null() {
-        let gc = gc_head_from_obj(op);
-        with_gc(|state| {
-            state.tracked.remove(&(gc as usize));
-        });
-    }
+    crate::ffi::panic_guard::guard_void("PyObject_GC_UnTrack", || unsafe {
+        if !op.is_null() {
+            let gc = gc_head_from_obj(op);
+            with_gc(|state| {
+                state.tracked.remove(&(gc as usize));
+            });
+        }
+    })
 }
 
 /// _PyObject_GC_IS_TRACKED
 #[no_mangle]
 pub unsafe extern "C" fn _PyObject_GC_IS_TRACKED(op: *mut RawPyObject) -> i32 {
-    if op.is_null() {
-        return 0;
-    }
-    let gc = gc_head_from_obj(op as *mut c_void);
-    with_gc(|state| if state.tracked.contains(&(gc as usize)) { 1 } else { 0 })
+    crate::ffi::panic_guard::guard_i32("_PyObject_GC_IS_TRACKED", || unsafe {
+        if op.is_null() {
+            return 0;
+        }
+        let gc = gc_head_from_obj(op as *mut c_void);
+        with_gc(|state| if state.tracked.contains(&(gc as usize)) { 1 } else { 0 })
+    })
 }
 
 // ─── GC Deallocation ───
@@ -186,30 +196,38 @@ pub unsafe extern "C" fn _PyObject_GC_IS_TRACKED(op: *mut RawPyObject) -> i32 {
 /// Frees starting from the GC head (before the object pointer).
 #[no_mangle]
 pub unsafe extern "C" fn PyObject_GC_Del(op: *mut c_void) {
-    if !op.is_null() {
-        PyObject_GC_UnTrack(op);
-        // Free from the GC head, which is before the object
-        let gc = gc_head_from_obj(op);
-        libc::free(gc as *mut c_void);
-    }
+    crate::ffi::panic_guard::guard_void("PyObject_GC_Del", || unsafe {
+        if !op.is_null() {
+            PyObject_GC_UnTrack(op);
+            // Free from the GC head, which is before the object
+            let gc = gc_head_from_obj(op);
+            libc::free(gc as *mut c_void);
+        }
+    })
 }
 
 /// PyGC_Collect — run a full GC collection. Returns number of freed objects.
 #[no_mangle]
 pub unsafe extern "C" fn PyGC_Collect() -> isize {
-    // Stub: rely on reference counting for now.
-    // A full cycle detector would walk tp_traverse callbacks.
-    0
+    crate::ffi::panic_guard::guard_ssize("PyGC_Collect", || unsafe {
+        // Stub: rely on reference counting for now.
+        // A full cycle detector would walk tp_traverse callbacks.
+        0
+    })
 }
 
 /// _PyObject_GC_TRACK (internal)
 #[no_mangle]
 pub unsafe extern "C" fn _PyObject_GC_TRACK(op: *mut c_void) {
-    PyObject_GC_Track(op);
+    crate::ffi::panic_guard::guard_void("_PyObject_GC_TRACK", || unsafe {
+        PyObject_GC_Track(op);
+    })
 }
 
 /// _PyObject_GC_UNTRACK (internal)
 #[no_mangle]
 pub unsafe extern "C" fn _PyObject_GC_UNTRACK(op: *mut c_void) {
-    PyObject_GC_UnTrack(op);
+    crate::ffi::panic_guard::guard_void("_PyObject_GC_UNTRACK", || unsafe {
+        PyObject_GC_UnTrack(op);
+    })
 }

@@ -330,121 +330,151 @@ unsafe fn create_long(value: i64) -> *mut RawPyObject {
 
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_FromLong(v: c_long) -> *mut RawPyObject {
-    create_long(v as i64)
+    crate::ffi::panic_guard::guard_ptr("PyLong_FromLong", || unsafe {
+        create_long(v as i64)
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_FromUnsignedLong(v: c_ulong) -> *mut RawPyObject {
-    // For values > i64::MAX, create directly without cache
-    if v as u64 > i64::MAX as u64 {
-        return create_long_from_i64(v as i64); // wraps, but preserves bits
-    }
-    create_long(v as i64)
+    crate::ffi::panic_guard::guard_ptr("PyLong_FromUnsignedLong", || unsafe {
+        // For values > i64::MAX, create directly without cache
+        if v as u64 > i64::MAX as u64 {
+            return create_long_from_i64(v as i64); // wraps, but preserves bits
+        }
+        create_long(v as i64)
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_FromLongLong(v: c_longlong) -> *mut RawPyObject {
-    create_long(v as i64)
+    crate::ffi::panic_guard::guard_ptr("PyLong_FromLongLong", || unsafe {
+        create_long(v as i64)
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_FromUnsignedLongLong(v: c_ulonglong) -> *mut RawPyObject {
-    if v > i64::MAX as u64 {
-        // Large unsigned: allocate directly with digit math
-        let mut abs_val = v;
-        let mut ndigits = 0usize;
-        let mut tmp = abs_val;
-        while tmp > 0 {
-            ndigits += 1;
-            tmp >>= PYLONG_SHIFT;
+    crate::ffi::panic_guard::guard_ptr("PyLong_FromUnsignedLongLong", || unsafe {
+        if v > i64::MAX as u64 {
+            // Large unsigned: allocate directly with digit math
+            let mut abs_val = v;
+            let mut ndigits = 0usize;
+            let mut tmp = abs_val;
+            while tmp > 0 {
+                ndigits += 1;
+                tmp >>= PYLONG_SHIFT;
+            }
+            let obj = alloc_long(ndigits);
+            (*obj).ob_base.ob_size = ndigits as isize;
+            let digits = ob_digit(obj);
+            for i in 0..ndigits {
+                *digits.add(i) = (abs_val & PYLONG_MASK as u64) as Digit;
+                abs_val >>= PYLONG_SHIFT;
+            }
+            return obj as *mut RawPyObject;
         }
-        let obj = alloc_long(ndigits);
-        (*obj).ob_base.ob_size = ndigits as isize;
-        let digits = ob_digit(obj);
-        for i in 0..ndigits {
-            *digits.add(i) = (abs_val & PYLONG_MASK as u64) as Digit;
-            abs_val >>= PYLONG_SHIFT;
-        }
-        return obj as *mut RawPyObject;
-    }
-    create_long(v as i64)
+        create_long(v as i64)
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_FromDouble(v: f64) -> *mut RawPyObject {
-    create_long(v as i64)
+    crate::ffi::panic_guard::guard_ptr("PyLong_FromDouble", || unsafe {
+        create_long(v as i64)
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_FromSsize_t(v: isize) -> *mut RawPyObject {
-    create_long(v as i64)
+    crate::ffi::panic_guard::guard_ptr("PyLong_FromSsize_t", || unsafe {
+        create_long(v as i64)
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_FromSize_t(v: usize) -> *mut RawPyObject {
-    if v > i64::MAX as u64 as usize {
-        return PyLong_FromUnsignedLongLong(v as c_ulonglong);
-    }
-    create_long(v as i64)
+    crate::ffi::panic_guard::guard_ptr("PyLong_FromSize_t", || unsafe {
+        if v > i64::MAX as u64 as usize {
+            return PyLong_FromUnsignedLongLong(v as c_ulonglong);
+        }
+        create_long(v as i64)
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_AsLong(obj: *mut RawPyObject) -> c_long {
-    if obj.is_null() { return -1; }
-    pylong_to_i64(obj as *mut PyLongObject).unwrap_or(-1) as c_long
+    crate::ffi::panic_guard::guard_i64("PyLong_AsLong", || unsafe {
+        if obj.is_null() { return -1; }
+        pylong_to_i64(obj as *mut PyLongObject).unwrap_or(-1)
+    }) as c_long
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_AsUnsignedLong(obj: *mut RawPyObject) -> c_ulong {
-    if obj.is_null() { return 0; }
-    let v = pylong_to_i64(obj as *mut PyLongObject).unwrap_or(0);
-    if v < 0 { 0 } else { v as c_ulong }
+    crate::ffi::panic_guard::guard_u64("PyLong_AsUnsignedLong", || unsafe {
+        if obj.is_null() { return 0; }
+        let v = pylong_to_i64(obj as *mut PyLongObject).unwrap_or(0);
+        if v < 0 { 0 } else { v as u64 }
+    }) as c_ulong
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_AsLongLong(obj: *mut RawPyObject) -> c_longlong {
-    if obj.is_null() { return -1; }
-    pylong_to_i64(obj as *mut PyLongObject).unwrap_or(-1) as c_longlong
+    crate::ffi::panic_guard::guard_i64("PyLong_AsLongLong", || unsafe {
+        if obj.is_null() { return -1; }
+        pylong_to_i64(obj as *mut PyLongObject).unwrap_or(-1)
+    }) as c_longlong
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_AsUnsignedLongLong(obj: *mut RawPyObject) -> c_ulonglong {
-    if obj.is_null() { return 0; }
-    let v = pylong_to_i64(obj as *mut PyLongObject).unwrap_or(0);
-    if v < 0 { 0 } else { v as c_ulonglong }
+    crate::ffi::panic_guard::guard_u64("PyLong_AsUnsignedLongLong", || unsafe {
+        if obj.is_null() { return 0; }
+        let v = pylong_to_i64(obj as *mut PyLongObject).unwrap_or(0);
+        if v < 0 { 0 } else { v as u64 }
+    }) as c_ulonglong
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_AsDouble(obj: *mut RawPyObject) -> f64 {
-    if obj.is_null() { return -1.0; }
-    pylong_to_f64(obj as *mut PyLongObject)
+    crate::ffi::panic_guard::guard_f64("PyLong_AsDouble", || unsafe {
+        if obj.is_null() { return -1.0; }
+        pylong_to_f64(obj as *mut PyLongObject)
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_AsSsize_t(obj: *mut RawPyObject) -> isize {
-    if obj.is_null() { return -1; }
-    pylong_to_i64(obj as *mut PyLongObject).unwrap_or(-1) as isize
+    crate::ffi::panic_guard::guard_ssize("PyLong_AsSsize_t", || unsafe {
+        if obj.is_null() { return -1; }
+        pylong_to_i64(obj as *mut PyLongObject).unwrap_or(-1) as isize
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_AsSize_t(obj: *mut RawPyObject) -> usize {
-    if obj.is_null() { return 0; }
-    let v = pylong_to_i64(obj as *mut PyLongObject).unwrap_or(0);
-    if v < 0 { 0 } else { v as usize }
+    crate::ffi::panic_guard::guard_usize("PyLong_AsSize_t", || unsafe {
+        if obj.is_null() { return 0; }
+        let v = pylong_to_i64(obj as *mut PyLongObject).unwrap_or(0);
+        if v < 0 { 0 } else { v as usize }
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn PyLong_Check(obj: *mut RawPyObject) -> c_int {
-    if obj.is_null() { return 0; }
-    let tp = (*obj).ob_type;
-    // Accept both int and bool (bool subclasses int)
-    if tp == long_type()
-        || tp == crate::types::boolobject::bool_type()
-    {
-        1
-    } else {
-        0
-    }
+    crate::ffi::panic_guard::guard_int("PyLong_Check", || unsafe {
+        if obj.is_null() { return 0; }
+        let tp = (*obj).ob_type;
+        // Accept both int and bool (bool subclasses int)
+        if tp == long_type()
+            || tp == crate::types::boolobject::bool_type()
+        {
+            1
+        } else {
+            0
+        }
+    })
 }
 
 /// PyLong_FromString — parse a C string as an integer in the given base.
@@ -454,45 +484,47 @@ pub unsafe extern "C" fn PyLong_FromString(
     pend: *mut *mut std::os::raw::c_char,
     base: c_int,
 ) -> *mut RawPyObject {
-    if str_ptr.is_null() {
-        return std::ptr::null_mut();
-    }
-    let c_str = std::ffi::CStr::from_ptr(str_ptr);
-    let s = c_str.to_string_lossy();
-    let s = s.trim();
-
-    // Parse using the specified base
-    let result: Result<i64, _> = if base == 0 {
-        // Auto-detect base from prefix
-        if s.starts_with("0x") || s.starts_with("0X") {
-            i64::from_str_radix(&s[2..], 16)
-        } else if s.starts_with("0o") || s.starts_with("0O") {
-            i64::from_str_radix(&s[2..], 8)
-        } else if s.starts_with("0b") || s.starts_with("0B") {
-            i64::from_str_radix(&s[2..], 2)
-        } else {
-            s.parse()
+    crate::ffi::panic_guard::guard_ptr("PyLong_FromString", || unsafe {
+        if str_ptr.is_null() {
+            return std::ptr::null_mut();
         }
-    } else {
-        i64::from_str_radix(s, base as u32)
-    };
+        let c_str = std::ffi::CStr::from_ptr(str_ptr);
+        let s = c_str.to_string_lossy();
+        let s = s.trim();
 
-    // Set pend to end of string if requested
-    if !pend.is_null() {
-        *pend = str_ptr.add(c_str.to_bytes().len()) as *mut _;
-    }
-
-    match result {
-        Ok(v) => create_long(v),
-        Err(_) => {
-            // Try BigInt for very large numbers
-            if let Ok(big) = s.parse::<BigInt>() {
-                let obj = create_long_from_bigint(&big);
-                return obj;
+        // Parse using the specified base
+        let result: Result<i64, _> = if base == 0 {
+            // Auto-detect base from prefix
+            if s.starts_with("0x") || s.starts_with("0X") {
+                i64::from_str_radix(&s[2..], 16)
+            } else if s.starts_with("0o") || s.starts_with("0O") {
+                i64::from_str_radix(&s[2..], 8)
+            } else if s.starts_with("0b") || s.starts_with("0B") {
+                i64::from_str_radix(&s[2..], 2)
+            } else {
+                s.parse()
             }
-            std::ptr::null_mut()
+        } else {
+            i64::from_str_radix(s, base as u32)
+        };
+
+        // Set pend to end of string if requested
+        if !pend.is_null() {
+            *pend = str_ptr.add(c_str.to_bytes().len()) as *mut _;
         }
-    }
+
+        match result {
+            Ok(v) => create_long(v),
+            Err(_) => {
+                // Try BigInt for very large numbers
+                if let Ok(big) = s.parse::<BigInt>() {
+                    let obj = create_long_from_bigint(&big);
+                    return obj;
+                }
+                std::ptr::null_mut()
+            }
+        }
+    })
 }
 
 /// Create a PyLongObject from a BigInt.
@@ -544,18 +576,20 @@ pub unsafe extern "C" fn PyNumber_ToBase(
     obj: *mut RawPyObject,
     base: c_int,
 ) -> *mut RawPyObject {
-    if obj.is_null() {
-        return std::ptr::null_mut();
-    }
-    let big = pylong_to_bigint(obj as *mut PyLongObject);
-    let s = match base {
-        2 => format!("{}", big.to_str_radix(2)),
-        8 => format!("{}", big.to_str_radix(8)),
-        10 => format!("{}", big.to_str_radix(10)),
-        16 => format!("{}", big.to_str_radix(16)),
-        _ => format!("{}", big),
-    };
-    crate::types::unicode::create_from_str(&s)
+    crate::ffi::panic_guard::guard_ptr("PyNumber_ToBase", || unsafe {
+        if obj.is_null() {
+            return std::ptr::null_mut();
+        }
+        let big = pylong_to_bigint(obj as *mut PyLongObject);
+        let s = match base {
+            2 => format!("{}", big.to_str_radix(2)),
+            8 => format!("{}", big.to_str_radix(8)),
+            10 => format!("{}", big.to_str_radix(10)),
+            16 => format!("{}", big.to_str_radix(16)),
+            _ => format!("{}", big),
+        };
+        crate::types::unicode::create_from_str(&s)
+    })
 }
 
 pub unsafe fn init_long_type() {

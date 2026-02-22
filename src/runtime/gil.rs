@@ -149,85 +149,105 @@ pub const PYGIL_STATE_UNLOCKED: c_int = 1;
 /// This is how C extensions (e.g., called from C threads) safely enter Python.
 #[no_mangle]
 pub unsafe extern "C" fn PyGILState_Ensure() -> c_int {
-    let already_held = gil_held();
-    acquire_gil();
+    crate::ffi::panic_guard::guard_int("PyGILState_Ensure", || unsafe {
+        let already_held = gil_held();
+        acquire_gil();
 
-    // If this thread doesn't have a thread state yet, create one
-    let tstate = crate::runtime::thread_state::_PyThreadState_UncheckedGet();
-    if tstate.is_null() {
-        let interp = crate::runtime::thread_state::INTERP_STATE.lock().0;
-        if let Some(interp) = interp {
-            let new_tstate = crate::runtime::thread_state::create_thread_state(interp);
-            crate::runtime::thread_state::PyThreadState_Swap(new_tstate);
+        // If this thread doesn't have a thread state yet, create one
+        let tstate = crate::runtime::thread_state::_PyThreadState_UncheckedGet();
+        if tstate.is_null() {
+            let interp = crate::runtime::thread_state::INTERP_STATE.lock().0;
+            if let Some(interp) = interp {
+                let new_tstate = crate::runtime::thread_state::create_thread_state(interp);
+                crate::runtime::thread_state::PyThreadState_Swap(new_tstate);
+            }
         }
-    }
 
-    if already_held {
-        PYGIL_STATE_LOCKED
-    } else {
-        PYGIL_STATE_UNLOCKED
-    }
+        if already_held {
+            PYGIL_STATE_LOCKED
+        } else {
+            PYGIL_STATE_UNLOCKED
+        }
+    })
 }
 
 /// PyGILState_Release - release the GIL if we acquired it.
 #[no_mangle]
 pub unsafe extern "C" fn PyGILState_Release(oldstate: c_int) {
-    release_gil();
+    crate::ffi::panic_guard::guard_void("PyGILState_Release", || unsafe {
+        release_gil();
+    })
 }
 
 /// PyGILState_Check - check if GIL is held by current thread
 #[no_mangle]
 pub unsafe extern "C" fn PyGILState_Check() -> c_int {
-    if gil_held() { 1 } else { 0 }
+    crate::ffi::panic_guard::guard_int("PyGILState_Check", || unsafe {
+        if gil_held() { 1 } else { 0 }
+    })
 }
 
 /// PyEval_InitThreads - initialize threading (no-op for us, GIL exists from start)
 #[no_mangle]
 pub unsafe extern "C" fn PyEval_InitThreads() {
-    // Ensure the GIL is initialized
-    get_gil();
+    crate::ffi::panic_guard::guard_void("PyEval_InitThreads", || unsafe {
+        // Ensure the GIL is initialized
+        get_gil();
+    })
 }
 
 /// PyEval_SaveThread - release GIL and return thread state (for Py_BEGIN_ALLOW_THREADS)
 #[no_mangle]
 pub unsafe extern "C" fn PyEval_SaveThread() -> *mut PyThreadState {
-    let tstate = crate::runtime::thread_state::PyThreadState_Get();
-    release_gil();
-    tstate
+    crate::ffi::panic_guard::guard_ptr("PyEval_SaveThread", || unsafe {
+        let tstate = crate::runtime::thread_state::PyThreadState_Get();
+        release_gil();
+        tstate
+    })
 }
 
 /// PyEval_RestoreThread - acquire GIL and set thread state (for Py_END_ALLOW_THREADS)
 #[no_mangle]
 pub unsafe extern "C" fn PyEval_RestoreThread(tstate: *mut PyThreadState) {
-    acquire_gil();
-    if !tstate.is_null() {
-        crate::runtime::thread_state::PyThreadState_Swap(tstate);
-    }
+    crate::ffi::panic_guard::guard_void("PyEval_RestoreThread", || unsafe {
+        acquire_gil();
+        if !tstate.is_null() {
+            crate::runtime::thread_state::PyThreadState_Swap(tstate);
+        }
+    })
 }
 
 /// PyEval_AcquireThread
 #[no_mangle]
 pub unsafe extern "C" fn PyEval_AcquireThread(tstate: *mut PyThreadState) {
-    acquire_gil();
-    if !tstate.is_null() {
-        crate::runtime::thread_state::PyThreadState_Swap(tstate);
-    }
+    crate::ffi::panic_guard::guard_void("PyEval_AcquireThread", || unsafe {
+        acquire_gil();
+        if !tstate.is_null() {
+            crate::runtime::thread_state::PyThreadState_Swap(tstate);
+        }
+    })
 }
 
 /// PyEval_ReleaseThread
 #[no_mangle]
 pub unsafe extern "C" fn PyEval_ReleaseThread(_tstate: *mut PyThreadState) {
-    release_gil();
+    crate::ffi::panic_guard::guard_void("PyEval_ReleaseThread", || unsafe {
+        release_gil();
+    })
 }
 
 /// Py_BEGIN_ALLOW_THREADS / Py_END_ALLOW_THREADS are macros in CPython.
 /// Extensions that use them as functions (rare) would call these.
 #[no_mangle]
 pub unsafe extern "C" fn _PyEval_SaveThread() -> *mut PyThreadState {
-    PyEval_SaveThread()
+    crate::ffi::panic_guard::guard_ptr("_PyEval_SaveThread", || unsafe {
+        PyEval_SaveThread()
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn _PyEval_RestoreThread(tstate: *mut PyThreadState) {
-    PyEval_RestoreThread(tstate)
+    crate::ffi::panic_guard::guard_void("_PyEval_RestoreThread", || unsafe {
+        PyEval_RestoreThread(tstate)
+    })
 }

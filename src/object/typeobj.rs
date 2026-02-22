@@ -439,20 +439,22 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
     tp: *mut RawPyTypeObject,
     nitems: PySsizeT,
 ) -> *mut RawPyObject {
-    let basic = (*tp).tp_basicsize as usize;
-    let item = (*tp).tp_itemsize as usize;
-    let total = basic + (nitems.max(0) as usize) * item;
-    let obj = libc::calloc(1, total) as *mut RawPyObject;
-    if obj.is_null() {
-        eprintln!("Fatal: out of memory in PyType_GenericAlloc");
-        std::process::abort();
-    }
-    std::ptr::write(
-        &mut (*obj).ob_refcnt,
-        std::sync::atomic::AtomicIsize::new(1),
-    );
-    (*obj).ob_type = tp;
-    obj
+    crate::ffi::panic_guard::guard_ptr("PyType_GenericAlloc", || unsafe {
+        let basic = (*tp).tp_basicsize as usize;
+        let item = (*tp).tp_itemsize as usize;
+        let total = basic + (nitems.max(0) as usize) * item;
+        let obj = libc::calloc(1, total) as *mut RawPyObject;
+        if obj.is_null() {
+            eprintln!("Fatal: out of memory in PyType_GenericAlloc");
+            std::process::abort();
+        }
+        std::ptr::write(
+            &mut (*obj).ob_refcnt,
+            std::sync::atomic::AtomicIsize::new(1),
+        );
+        (*obj).ob_type = tp;
+        obj
+    })
 }
 
 /// PyType_GenericNew — default __new__ that calls tp_alloc.
@@ -462,11 +464,13 @@ pub unsafe extern "C" fn PyType_GenericNew(
     _args: *mut RawPyObject,
     _kwds: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    if let Some(alloc) = (*tp).tp_alloc {
-        alloc(tp, 0)
-    } else {
-        PyType_GenericAlloc(tp, 0)
-    }
+    crate::ffi::panic_guard::guard_ptr("PyType_GenericNew", || unsafe {
+        if let Some(alloc) = (*tp).tp_alloc {
+            alloc(tp, 0)
+        } else {
+            PyType_GenericAlloc(tp, 0)
+        }
+    })
 }
 
 /// Default __init__ — no-op.
@@ -484,42 +488,44 @@ pub unsafe extern "C" fn PyObject_GenericGetAttr(
     obj: *mut RawPyObject,
     name: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    // Walk the type's MRO/tp_dict to find the attribute
-    if obj.is_null() || name.is_null() {
-        return ptr::null_mut();
-    }
-    let tp = (*obj).ob_type;
-    if tp.is_null() {
-        return ptr::null_mut();
-    }
-    // Check tp_dict of the type
-    let dict = (*tp).tp_dict;
-    if !dict.is_null() {
-        let result = crate::types::dict::PyDict_GetItem(dict, name);
-        if !result.is_null() {
-            (*result).incref();
-            return result;
+    crate::ffi::panic_guard::guard_ptr("PyObject_GenericGetAttr", || unsafe {
+        // Walk the type's MRO/tp_dict to find the attribute
+        if obj.is_null() || name.is_null() {
+            return ptr::null_mut();
         }
-    }
-    // Walk tp_base chain
-    let mut base = (*tp).tp_base;
-    while !base.is_null() {
-        let bdict = (*base).tp_dict;
-        if !bdict.is_null() {
-            let result = crate::types::dict::PyDict_GetItem(bdict, name);
+        let tp = (*obj).ob_type;
+        if tp.is_null() {
+            return ptr::null_mut();
+        }
+        // Check tp_dict of the type
+        let dict = (*tp).tp_dict;
+        if !dict.is_null() {
+            let result = crate::types::dict::PyDict_GetItem(dict, name);
             if !result.is_null() {
                 (*result).incref();
                 return result;
             }
         }
-        base = (*base).tp_base;
-    }
-    // Attribute not found — set AttributeError
-    crate::runtime::error::PyErr_SetString(
-        crate::runtime::error::_Rustthon_Exc_AttributeError(),
-        b"attribute not found\0".as_ptr() as *const c_char,
-    );
-    ptr::null_mut()
+        // Walk tp_base chain
+        let mut base = (*tp).tp_base;
+        while !base.is_null() {
+            let bdict = (*base).tp_dict;
+            if !bdict.is_null() {
+                let result = crate::types::dict::PyDict_GetItem(bdict, name);
+                if !result.is_null() {
+                    (*result).incref();
+                    return result;
+                }
+            }
+            base = (*base).tp_base;
+        }
+        // Attribute not found — set AttributeError
+        crate::runtime::error::PyErr_SetString(
+            crate::runtime::error::_Rustthon_Exc_AttributeError(),
+            b"attribute not found\0".as_ptr() as *const c_char,
+        );
+        ptr::null_mut()
+    })
 }
 
 /// PyObject_GenericSetAttr — set attribute in instance or type dict.
@@ -529,20 +535,22 @@ pub unsafe extern "C" fn PyObject_GenericSetAttr(
     name: *mut RawPyObject,
     value: *mut RawPyObject,
 ) -> c_int {
-    // For now, set on the type's tp_dict (simplified — real CPython has
-    // instance dicts, data descriptors, etc.)
-    if obj.is_null() || name.is_null() {
-        return -1;
-    }
-    let tp = (*obj).ob_type;
-    if tp.is_null() {
-        return -1;
-    }
-    let dict = (*tp).tp_dict;
-    if dict.is_null() {
-        return -1;
-    }
-    crate::types::dict::PyDict_SetItem(dict, name, value)
+    crate::ffi::panic_guard::guard_int("PyObject_GenericSetAttr", || unsafe {
+        // For now, set on the type's tp_dict (simplified — real CPython has
+        // instance dicts, data descriptors, etc.)
+        if obj.is_null() || name.is_null() {
+            return -1;
+        }
+        let tp = (*obj).ob_type;
+        if tp.is_null() {
+            return -1;
+        }
+        let dict = (*tp).tp_dict;
+        if dict.is_null() {
+            return -1;
+        }
+        crate::types::dict::PyDict_SetItem(dict, name, value)
+    })
 }
 
 // PyObject_Free is in runtime/memory.rs
@@ -556,129 +564,131 @@ pub const PY_TPFLAGS_READY: u64 = 1 << 12;
 /// Inherits slots from the base type, sets metaclass, creates tp_dict.
 #[no_mangle]
 pub unsafe extern "C" fn PyType_Ready(tp: *mut RawPyTypeObject) -> c_int {
-    if tp.is_null() {
-        return -1;
-    }
+    crate::ffi::panic_guard::guard_int("PyType_Ready", || unsafe {
+        if tp.is_null() {
+            return -1;
+        }
 
-    // Already initialized?
-    if (*tp).tp_flags & PY_TPFLAGS_READY != 0 {
-        return 0;
-    }
+        // Already initialized?
+        if (*tp).tp_flags & PY_TPFLAGS_READY != 0 {
+            return 0;
+        }
 
-    // 1. Set base type if not set
-    if (*tp).tp_base.is_null() {
-        (*tp).tp_base = PyBaseObject_Type.get();
-    }
-
-    // 2. Set metaclass if not set
-    if (*tp).ob_base.ob_type.is_null() {
-        (*tp).ob_base.ob_type = PyType_Type.get();
-    }
-
-    // 3. Ensure base is ready first
-    let base = (*tp).tp_base;
-    if !base.is_null() {
-        // Check alignment before dereferencing
-        let base_addr = base as usize;
-        if base_addr % std::mem::align_of::<RawPyTypeObject>() != 0 {
-            // Misaligned tp_base — fall back to PyBaseObject_Type
+        // 1. Set base type if not set
+        if (*tp).tp_base.is_null() {
             (*tp).tp_base = PyBaseObject_Type.get();
         }
-    }
-    let base = (*tp).tp_base;
-    if !base.is_null() && (*base).tp_flags & PY_TPFLAGS_READY == 0 {
-        let ret = PyType_Ready(base);
-        if ret < 0 {
-            return ret;
-        }
-    }
 
-    // 4. Inherit slots from base
-    let base = (*tp).tp_base;
-    if !base.is_null() {
-        // Inherit basicsize if not set
-        if (*tp).tp_basicsize == 0 {
-            (*tp).tp_basicsize = (*base).tp_basicsize;
+        // 2. Set metaclass if not set
+        if (*tp).ob_base.ob_type.is_null() {
+            (*tp).ob_base.ob_type = PyType_Type.get();
         }
 
-        // Inherit function slots if null
-        macro_rules! inherit_slot {
-            ($slot:ident) => {
-                if (*tp).$slot.is_none() && (*base).$slot.is_some() {
-                    (*tp).$slot = (*base).$slot;
-                }
-            };
+        // 3. Ensure base is ready first
+        let base = (*tp).tp_base;
+        if !base.is_null() {
+            // Check alignment before dereferencing
+            let base_addr = base as usize;
+            if base_addr % std::mem::align_of::<RawPyTypeObject>() != 0 {
+                // Misaligned tp_base — fall back to PyBaseObject_Type
+                (*tp).tp_base = PyBaseObject_Type.get();
+            }
+        }
+        let base = (*tp).tp_base;
+        if !base.is_null() && (*base).tp_flags & PY_TPFLAGS_READY == 0 {
+            let ret = PyType_Ready(base);
+            if ret < 0 {
+                return ret;
+            }
         }
 
-        inherit_slot!(tp_dealloc);
-        inherit_slot!(tp_repr);
-        inherit_slot!(tp_hash);
-        inherit_slot!(tp_call);
-        inherit_slot!(tp_str);
-        inherit_slot!(tp_getattro);
-        inherit_slot!(tp_setattro);
-        inherit_slot!(tp_richcompare);
-        inherit_slot!(tp_iter);
-        inherit_slot!(tp_iternext);
-        inherit_slot!(tp_init);
-        inherit_slot!(tp_alloc);
-        inherit_slot!(tp_new);
-        inherit_slot!(tp_free);
-        inherit_slot!(tp_is_gc);
-        inherit_slot!(tp_del);
-        inherit_slot!(tp_finalize);
-        inherit_slot!(tp_traverse);
-        inherit_slot!(tp_clear);
+        // 4. Inherit slots from base
+        let base = (*tp).tp_base;
+        if !base.is_null() {
+            // Inherit basicsize if not set
+            if (*tp).tp_basicsize == 0 {
+                (*tp).tp_basicsize = (*base).tp_basicsize;
+            }
 
-        // Inherit pointer-based slots (null check)
-        macro_rules! inherit_ptr_slot {
-            ($slot:ident) => {
-                if (*tp).$slot.is_null() && !(*base).$slot.is_null() {
-                    (*tp).$slot = (*base).$slot;
-                }
-            };
+            // Inherit function slots if null
+            macro_rules! inherit_slot {
+                ($slot:ident) => {
+                    if (*tp).$slot.is_none() && (*base).$slot.is_some() {
+                        (*tp).$slot = (*base).$slot;
+                    }
+                };
+            }
+
+            inherit_slot!(tp_dealloc);
+            inherit_slot!(tp_repr);
+            inherit_slot!(tp_hash);
+            inherit_slot!(tp_call);
+            inherit_slot!(tp_str);
+            inherit_slot!(tp_getattro);
+            inherit_slot!(tp_setattro);
+            inherit_slot!(tp_richcompare);
+            inherit_slot!(tp_iter);
+            inherit_slot!(tp_iternext);
+            inherit_slot!(tp_init);
+            inherit_slot!(tp_alloc);
+            inherit_slot!(tp_new);
+            inherit_slot!(tp_free);
+            inherit_slot!(tp_is_gc);
+            inherit_slot!(tp_del);
+            inherit_slot!(tp_finalize);
+            inherit_slot!(tp_traverse);
+            inherit_slot!(tp_clear);
+
+            // Inherit pointer-based slots (null check)
+            macro_rules! inherit_ptr_slot {
+                ($slot:ident) => {
+                    if (*tp).$slot.is_null() && !(*base).$slot.is_null() {
+                        (*tp).$slot = (*base).$slot;
+                    }
+                };
+            }
+
+            inherit_ptr_slot!(tp_as_number);
+            inherit_ptr_slot!(tp_as_sequence);
+            inherit_ptr_slot!(tp_as_mapping);
+            inherit_ptr_slot!(tp_as_buffer);
         }
 
-        inherit_ptr_slot!(tp_as_number);
-        inherit_ptr_slot!(tp_as_sequence);
-        inherit_ptr_slot!(tp_as_mapping);
-        inherit_ptr_slot!(tp_as_buffer);
-    }
+        // 5. Initialize tp_dict if null
+        if (*tp).tp_dict.is_null() {
+            (*tp).tp_dict = crate::types::dict::PyDict_New();
+        }
 
-    // 5. Initialize tp_dict if null
-    if (*tp).tp_dict.is_null() {
-        (*tp).tp_dict = crate::types::dict::PyDict_New();
-    }
+        // 6. Create tp_bases tuple if null
+        if (*tp).tp_bases.is_null() && !(*tp).tp_base.is_null() {
+            let bases = crate::types::tuple::PyTuple_New(1);
+            let base_obj = (*tp).tp_base as *mut RawPyObject;
+            (*base_obj).incref();
+            crate::types::tuple::PyTuple_SetItem(bases, 0, base_obj);
+            (*tp).tp_bases = bases;
+        }
 
-    // 6. Create tp_bases tuple if null
-    if (*tp).tp_bases.is_null() && !(*tp).tp_base.is_null() {
-        let bases = crate::types::tuple::PyTuple_New(1);
-        let base_obj = (*tp).tp_base as *mut RawPyObject;
-        (*base_obj).incref();
-        crate::types::tuple::PyTuple_SetItem(bases, 0, base_obj);
-        (*tp).tp_bases = bases;
-    }
+        // 7. Merge base flags (subtype bits)
+        if !base.is_null() {
+            (*tp).tp_flags |= (*base).tp_flags & (
+                PY_TPFLAGS_LONG_SUBCLASS
+                | PY_TPFLAGS_LIST_SUBCLASS
+                | PY_TPFLAGS_TUPLE_SUBCLASS
+                | PY_TPFLAGS_BYTES_SUBCLASS
+                | PY_TPFLAGS_UNICODE_SUBCLASS
+                | PY_TPFLAGS_DICT_SUBCLASS
+                | PY_TPFLAGS_TYPE_SUBCLASS
+            );
+        }
 
-    // 7. Merge base flags (subtype bits)
-    if !base.is_null() {
-        (*tp).tp_flags |= (*base).tp_flags & (
-            PY_TPFLAGS_LONG_SUBCLASS
-            | PY_TPFLAGS_LIST_SUBCLASS
-            | PY_TPFLAGS_TUPLE_SUBCLASS
-            | PY_TPFLAGS_BYTES_SUBCLASS
-            | PY_TPFLAGS_UNICODE_SUBCLASS
-            | PY_TPFLAGS_DICT_SUBCLASS
-            | PY_TPFLAGS_TYPE_SUBCLASS
-        );
-    }
+        // 8. Set default flags
+        (*tp).tp_flags |= PY_TPFLAGS_DEFAULT | PY_TPFLAGS_READY;
 
-    // 8. Set default flags
-    (*tp).tp_flags |= PY_TPFLAGS_DEFAULT | PY_TPFLAGS_READY;
+        // 9. Set immortal refcount on type object
+        (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
 
-    // 9. Set immortal refcount on type object
-    (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
-
-    0
+        0
+    })
 }
 
 /// Initialize PyBaseObject_Type and PyType_Type with default slots.
@@ -718,26 +728,30 @@ pub unsafe extern "C" fn PyType_IsSubtype(
     a: *mut RawPyTypeObject,
     b: *mut RawPyTypeObject,
 ) -> c_int {
-    if a.is_null() || b.is_null() {
-        return 0;
-    }
-    let mut tp = a;
-    while !tp.is_null() {
-        if tp == b {
-            return 1;
+    crate::ffi::panic_guard::guard_int("PyType_IsSubtype", || unsafe {
+        if a.is_null() || b.is_null() {
+            return 0;
         }
-        tp = (*tp).tp_base;
-    }
-    0
+        let mut tp = a;
+        while !tp.is_null() {
+            if tp == b {
+                return 1;
+            }
+            tp = (*tp).tp_base;
+        }
+        0
+    })
 }
 
 /// PyType_GetFlags — return tp_flags of a type (stable ABI).
 #[no_mangle]
 pub unsafe extern "C" fn PyType_GetFlags(tp: *mut RawPyTypeObject) -> u64 {
-    if tp.is_null() {
-        return 0;
-    }
-    (*tp).tp_flags
+    crate::ffi::panic_guard::guard_u64("PyType_GetFlags", || unsafe {
+        if tp.is_null() {
+            return 0;
+        }
+        (*tp).tp_flags
+    })
 }
 
 /// Slot IDs for PyType_GetSlot / PyType_FromSpec.
@@ -792,34 +806,36 @@ pub unsafe extern "C" fn PyType_GetSlot(
     tp: *mut RawPyTypeObject,
     slot: c_int,
 ) -> *mut c_void {
-    if tp.is_null() {
-        return ptr::null_mut();
-    }
-    match slot {
-        PY_TP_DEALLOC => (*tp).tp_dealloc.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_REPR => (*tp).tp_repr.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_HASH => (*tp).tp_hash.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_CALL => (*tp).tp_call.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_STR => (*tp).tp_str.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_GETATTRO => (*tp).tp_getattro.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_SETATTRO => (*tp).tp_setattro.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_TRAVERSE => (*tp).tp_traverse.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_CLEAR => (*tp).tp_clear.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_RICHCOMPARE => (*tp).tp_richcompare.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_ITER => (*tp).tp_iter.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_ITERNEXT => (*tp).tp_iternext.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_METHODS => (*tp).tp_methods as *mut c_void,
-        PY_TP_MEMBERS => (*tp).tp_members as *mut c_void,
-        PY_TP_GETSET => (*tp).tp_getset as *mut c_void,
-        PY_TP_BASE => (*tp).tp_base as *mut c_void,
-        PY_TP_INIT => (*tp).tp_init.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_ALLOC => (*tp).tp_alloc.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_NEW => (*tp).tp_new.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_FREE => (*tp).tp_free.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_FINALIZE => (*tp).tp_finalize.map_or(ptr::null_mut(), |f| f as *mut c_void),
-        PY_TP_DOC => (*tp).tp_doc as *mut c_void,
-        _ => ptr::null_mut(),
-    }
+    crate::ffi::panic_guard::guard_ptr("PyType_GetSlot", || unsafe {
+        if tp.is_null() {
+            return ptr::null_mut();
+        }
+        match slot {
+            PY_TP_DEALLOC => (*tp).tp_dealloc.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_REPR => (*tp).tp_repr.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_HASH => (*tp).tp_hash.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_CALL => (*tp).tp_call.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_STR => (*tp).tp_str.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_GETATTRO => (*tp).tp_getattro.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_SETATTRO => (*tp).tp_setattro.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_TRAVERSE => (*tp).tp_traverse.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_CLEAR => (*tp).tp_clear.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_RICHCOMPARE => (*tp).tp_richcompare.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_ITER => (*tp).tp_iter.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_ITERNEXT => (*tp).tp_iternext.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_METHODS => (*tp).tp_methods as *mut c_void,
+            PY_TP_MEMBERS => (*tp).tp_members as *mut c_void,
+            PY_TP_GETSET => (*tp).tp_getset as *mut c_void,
+            PY_TP_BASE => (*tp).tp_base as *mut c_void,
+            PY_TP_INIT => (*tp).tp_init.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_ALLOC => (*tp).tp_alloc.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_NEW => (*tp).tp_new.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_FREE => (*tp).tp_free.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_FINALIZE => (*tp).tp_finalize.map_or(ptr::null_mut(), |f| f as *mut c_void),
+            PY_TP_DOC => (*tp).tp_doc as *mut c_void,
+            _ => ptr::null_mut(),
+        }
+    })
 }
 
 /// PyType_Spec slot entry, matching CPython.
@@ -847,107 +863,109 @@ pub unsafe extern "C" fn PyType_FromModuleAndSpec(
     spec: *mut PyType_Spec,
     bases: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    if spec.is_null() {
-        return ptr::null_mut();
-    }
-
-    // Allocate a new type object
-    let tp = libc::calloc(1, std::mem::size_of::<RawPyTypeObject>()) as *mut RawPyTypeObject;
-    if tp.is_null() {
-        return ptr::null_mut();
-    }
-    std::ptr::write(tp, RawPyTypeObject::zeroed());
-
-    (*tp).tp_name = (*spec).name;
-    (*tp).tp_basicsize = (*spec).basicsize as PySsizeT;
-    (*tp).tp_itemsize = (*spec).itemsize as PySsizeT;
-    (*tp).tp_flags = (*spec).flags as u64;
-    (*tp).ob_base.ob_type = PyType_Type.get();
-    (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
-
-    // Process slots
-    if !(*spec).slots.is_null() {
-        let mut slot_ptr = (*spec).slots;
-        while (*slot_ptr).slot != 0 || !(*slot_ptr).pfunc.is_null() {
-            let slot_id = (*slot_ptr).slot;
-            let pfunc = (*slot_ptr).pfunc;
-            if slot_id == 0 && pfunc.is_null() {
-                break;
-            }
-            match slot_id {
-                PY_TP_DEALLOC => (*tp).tp_dealloc = Some(std::mem::transmute(pfunc)),
-                PY_TP_REPR => (*tp).tp_repr = Some(std::mem::transmute(pfunc)),
-                PY_TP_HASH => (*tp).tp_hash = Some(std::mem::transmute(pfunc)),
-                PY_TP_CALL => (*tp).tp_call = Some(std::mem::transmute(pfunc)),
-                PY_TP_STR => (*tp).tp_str = Some(std::mem::transmute(pfunc)),
-                PY_TP_GETATTRO => (*tp).tp_getattro = Some(std::mem::transmute(pfunc)),
-                PY_TP_SETATTRO => (*tp).tp_setattro = Some(std::mem::transmute(pfunc)),
-                PY_TP_DOC => (*tp).tp_doc = pfunc as *const c_char,
-                PY_TP_TRAVERSE => (*tp).tp_traverse = Some(std::mem::transmute(pfunc)),
-                PY_TP_CLEAR => (*tp).tp_clear = Some(std::mem::transmute(pfunc)),
-                PY_TP_RICHCOMPARE => (*tp).tp_richcompare = Some(std::mem::transmute(pfunc)),
-                PY_TP_ITER => (*tp).tp_iter = Some(std::mem::transmute(pfunc)),
-                PY_TP_ITERNEXT => (*tp).tp_iternext = Some(std::mem::transmute(pfunc)),
-                PY_TP_METHODS => (*tp).tp_methods = pfunc as *mut PyMethodDef,
-                PY_TP_MEMBERS => (*tp).tp_members = pfunc as *mut PyMemberDef,
-                PY_TP_GETSET => (*tp).tp_getset = pfunc as *mut PyGetSetDef,
-                PY_TP_INIT => (*tp).tp_init = Some(std::mem::transmute(pfunc)),
-                PY_TP_ALLOC => (*tp).tp_alloc = Some(std::mem::transmute(pfunc)),
-                PY_TP_NEW => (*tp).tp_new = Some(std::mem::transmute(pfunc)),
-                PY_TP_FREE => (*tp).tp_free = Some(std::mem::transmute(pfunc)),
-                PY_TP_FINALIZE => (*tp).tp_finalize = Some(std::mem::transmute(pfunc)),
-                PY_TP_DESCR_GET => (*tp).tp_descr_get = Some(std::mem::transmute(pfunc)),
-                PY_TP_BASE => { /* handled separately below */ },
-                _ => {} // Unknown slot, ignore
-            }
-            slot_ptr = slot_ptr.add(1);
+    crate::ffi::panic_guard::guard_ptr("PyType_FromModuleAndSpec", || unsafe {
+        if spec.is_null() {
+            return ptr::null_mut();
         }
-    }
 
-    // Handle Py_tp_base from slots (if specified)
-    if !(*spec).slots.is_null() {
-        let mut slot_ptr2 = (*spec).slots;
-        while (*slot_ptr2).slot != 0 || !(*slot_ptr2).pfunc.is_null() {
-            if (*slot_ptr2).slot == PY_TP_BASE && !(*slot_ptr2).pfunc.is_null() {
-                (*tp).tp_base = (*slot_ptr2).pfunc as *mut RawPyTypeObject;
-            }
-            if (*slot_ptr2).slot == 0 && (*slot_ptr2).pfunc.is_null() {
-                break;
-            }
-            slot_ptr2 = slot_ptr2.add(1);
+        // Allocate a new type object
+        let tp = libc::calloc(1, std::mem::size_of::<RawPyTypeObject>()) as *mut RawPyTypeObject;
+        if tp.is_null() {
+            return ptr::null_mut();
         }
-    }
+        std::ptr::write(tp, RawPyTypeObject::zeroed());
 
-    // Handle bases argument — extract primary base from tuple
-    if (*tp).tp_base.is_null() && !bases.is_null() {
-        if crate::types::tuple::PyTuple_Check(bases) != 0 {
-            let size = crate::types::tuple::PyTuple_Size(bases);
-            if size > 0 {
-                let first = crate::types::tuple::PyTuple_GetItem(bases, 0);
-                if !first.is_null() {
-                    (*tp).tp_base = first as *mut RawPyTypeObject;
+        (*tp).tp_name = (*spec).name;
+        (*tp).tp_basicsize = (*spec).basicsize as PySsizeT;
+        (*tp).tp_itemsize = (*spec).itemsize as PySsizeT;
+        (*tp).tp_flags = (*spec).flags as u64;
+        (*tp).ob_base.ob_type = PyType_Type.get();
+        (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
+
+        // Process slots
+        if !(*spec).slots.is_null() {
+            let mut slot_ptr = (*spec).slots;
+            while (*slot_ptr).slot != 0 || !(*slot_ptr).pfunc.is_null() {
+                let slot_id = (*slot_ptr).slot;
+                let pfunc = (*slot_ptr).pfunc;
+                if slot_id == 0 && pfunc.is_null() {
+                    break;
                 }
+                match slot_id {
+                    PY_TP_DEALLOC => (*tp).tp_dealloc = Some(std::mem::transmute(pfunc)),
+                    PY_TP_REPR => (*tp).tp_repr = Some(std::mem::transmute(pfunc)),
+                    PY_TP_HASH => (*tp).tp_hash = Some(std::mem::transmute(pfunc)),
+                    PY_TP_CALL => (*tp).tp_call = Some(std::mem::transmute(pfunc)),
+                    PY_TP_STR => (*tp).tp_str = Some(std::mem::transmute(pfunc)),
+                    PY_TP_GETATTRO => (*tp).tp_getattro = Some(std::mem::transmute(pfunc)),
+                    PY_TP_SETATTRO => (*tp).tp_setattro = Some(std::mem::transmute(pfunc)),
+                    PY_TP_DOC => (*tp).tp_doc = pfunc as *const c_char,
+                    PY_TP_TRAVERSE => (*tp).tp_traverse = Some(std::mem::transmute(pfunc)),
+                    PY_TP_CLEAR => (*tp).tp_clear = Some(std::mem::transmute(pfunc)),
+                    PY_TP_RICHCOMPARE => (*tp).tp_richcompare = Some(std::mem::transmute(pfunc)),
+                    PY_TP_ITER => (*tp).tp_iter = Some(std::mem::transmute(pfunc)),
+                    PY_TP_ITERNEXT => (*tp).tp_iternext = Some(std::mem::transmute(pfunc)),
+                    PY_TP_METHODS => (*tp).tp_methods = pfunc as *mut PyMethodDef,
+                    PY_TP_MEMBERS => (*tp).tp_members = pfunc as *mut PyMemberDef,
+                    PY_TP_GETSET => (*tp).tp_getset = pfunc as *mut PyGetSetDef,
+                    PY_TP_INIT => (*tp).tp_init = Some(std::mem::transmute(pfunc)),
+                    PY_TP_ALLOC => (*tp).tp_alloc = Some(std::mem::transmute(pfunc)),
+                    PY_TP_NEW => (*tp).tp_new = Some(std::mem::transmute(pfunc)),
+                    PY_TP_FREE => (*tp).tp_free = Some(std::mem::transmute(pfunc)),
+                    PY_TP_FINALIZE => (*tp).tp_finalize = Some(std::mem::transmute(pfunc)),
+                    PY_TP_DESCR_GET => (*tp).tp_descr_get = Some(std::mem::transmute(pfunc)),
+                    PY_TP_BASE => { /* handled separately below */ },
+                    _ => {} // Unknown slot, ignore
+                }
+                slot_ptr = slot_ptr.add(1);
             }
-        } else {
-            // Single type object passed directly
-            (*tp).tp_base = bases as *mut RawPyTypeObject;
         }
-    }
 
-    // Store bases tuple on the type
-    if !bases.is_null() && (*tp).tp_bases.is_null() {
-        (*bases).incref();
-        (*tp).tp_bases = bases;
-    }
+        // Handle Py_tp_base from slots (if specified)
+        if !(*spec).slots.is_null() {
+            let mut slot_ptr2 = (*spec).slots;
+            while (*slot_ptr2).slot != 0 || !(*slot_ptr2).pfunc.is_null() {
+                if (*slot_ptr2).slot == PY_TP_BASE && !(*slot_ptr2).pfunc.is_null() {
+                    (*tp).tp_base = (*slot_ptr2).pfunc as *mut RawPyTypeObject;
+                }
+                if (*slot_ptr2).slot == 0 && (*slot_ptr2).pfunc.is_null() {
+                    break;
+                }
+                slot_ptr2 = slot_ptr2.add(1);
+            }
+        }
 
-    // Call PyType_Ready to finalize
-    let ret = PyType_Ready(tp);
-    if ret < 0 {
-        libc::free(tp as *mut c_void);
-        return ptr::null_mut();
-    }
+        // Handle bases argument — extract primary base from tuple
+        if (*tp).tp_base.is_null() && !bases.is_null() {
+            if crate::types::tuple::PyTuple_Check(bases) != 0 {
+                let size = crate::types::tuple::PyTuple_Size(bases);
+                if size > 0 {
+                    let first = crate::types::tuple::PyTuple_GetItem(bases, 0);
+                    if !first.is_null() {
+                        (*tp).tp_base = first as *mut RawPyTypeObject;
+                    }
+                }
+            } else {
+                // Single type object passed directly
+                (*tp).tp_base = bases as *mut RawPyTypeObject;
+            }
+        }
 
-    tp as *mut RawPyObject
+        // Store bases tuple on the type
+        if !bases.is_null() && (*tp).tp_bases.is_null() {
+            (*bases).incref();
+            (*tp).tp_bases = bases;
+        }
+
+        // Call PyType_Ready to finalize
+        let ret = PyType_Ready(tp);
+        if ret < 0 {
+            libc::free(tp as *mut c_void);
+            return ptr::null_mut();
+        }
+
+        tp as *mut RawPyObject
+    })
 }
 
 /// PyType_FromSpecWithBases — create a type from a spec with explicit bases.
@@ -957,103 +975,105 @@ pub unsafe extern "C" fn PyType_FromSpecWithBases(
     spec: *mut PyType_Spec,
     bases: *mut RawPyObject,
 ) -> *mut RawPyObject {
-    if spec.is_null() {
-        return ptr::null_mut();
-    }
+    crate::ffi::panic_guard::guard_ptr("PyType_FromSpecWithBases", || unsafe {
+        if spec.is_null() {
+            return ptr::null_mut();
+        }
 
-    // Extract the primary base type from bases
-    let mut base_type: *mut RawPyTypeObject = ptr::null_mut();
-    if !bases.is_null() {
-        // bases can be a tuple of types, or a single type
-        if crate::types::tuple::PyTuple_Check(bases) != 0 {
-            let size = crate::types::tuple::PyTuple_Size(bases);
-            if size > 0 {
-                let first = crate::types::tuple::PyTuple_GetItem(bases, 0);
-                if !first.is_null() {
-                    base_type = first as *mut RawPyTypeObject;
+        // Extract the primary base type from bases
+        let mut base_type: *mut RawPyTypeObject = ptr::null_mut();
+        if !bases.is_null() {
+            // bases can be a tuple of types, or a single type
+            if crate::types::tuple::PyTuple_Check(bases) != 0 {
+                let size = crate::types::tuple::PyTuple_Size(bases);
+                if size > 0 {
+                    let first = crate::types::tuple::PyTuple_GetItem(bases, 0);
+                    if !first.is_null() {
+                        base_type = first as *mut RawPyTypeObject;
+                    }
                 }
+            } else {
+                // Single type object passed directly
+                base_type = bases as *mut RawPyTypeObject;
             }
-        } else {
-            // Single type object passed directly
-            base_type = bases as *mut RawPyTypeObject;
         }
-    }
 
-    // Allocate a new type object
-    let tp = libc::calloc(1, std::mem::size_of::<RawPyTypeObject>()) as *mut RawPyTypeObject;
-    if tp.is_null() {
-        return ptr::null_mut();
-    }
-    std::ptr::write(tp, RawPyTypeObject::zeroed());
-
-    (*tp).tp_name = (*spec).name;
-    (*tp).tp_basicsize = (*spec).basicsize as PySsizeT;
-    (*tp).tp_itemsize = (*spec).itemsize as PySsizeT;
-    (*tp).tp_flags = (*spec).flags as u64;
-    (*tp).ob_base.ob_type = PyType_Type.get();
-    (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
-
-    // Set base type if extracted from bases
-    if !base_type.is_null() {
-        (*tp).tp_base = base_type;
-    }
-
-    // Process slots
-    if !(*spec).slots.is_null() {
-        let mut slot_ptr = (*spec).slots;
-        while (*slot_ptr).slot != 0 || !(*slot_ptr).pfunc.is_null() {
-            let slot_id = (*slot_ptr).slot;
-            let pfunc = (*slot_ptr).pfunc;
-            if slot_id == 0 && pfunc.is_null() {
-                break;
-            }
-            match slot_id {
-                PY_TP_DEALLOC => (*tp).tp_dealloc = Some(std::mem::transmute(pfunc)),
-                PY_TP_REPR => (*tp).tp_repr = Some(std::mem::transmute(pfunc)),
-                PY_TP_HASH => (*tp).tp_hash = Some(std::mem::transmute(pfunc)),
-                PY_TP_CALL => (*tp).tp_call = Some(std::mem::transmute(pfunc)),
-                PY_TP_STR => (*tp).tp_str = Some(std::mem::transmute(pfunc)),
-                PY_TP_GETATTRO => (*tp).tp_getattro = Some(std::mem::transmute(pfunc)),
-                PY_TP_SETATTRO => (*tp).tp_setattro = Some(std::mem::transmute(pfunc)),
-                PY_TP_DOC => (*tp).tp_doc = pfunc as *const c_char,
-                PY_TP_TRAVERSE => (*tp).tp_traverse = Some(std::mem::transmute(pfunc)),
-                PY_TP_CLEAR => (*tp).tp_clear = Some(std::mem::transmute(pfunc)),
-                PY_TP_RICHCOMPARE => (*tp).tp_richcompare = Some(std::mem::transmute(pfunc)),
-                PY_TP_ITER => (*tp).tp_iter = Some(std::mem::transmute(pfunc)),
-                PY_TP_ITERNEXT => (*tp).tp_iternext = Some(std::mem::transmute(pfunc)),
-                PY_TP_METHODS => (*tp).tp_methods = pfunc as *mut PyMethodDef,
-                PY_TP_MEMBERS => (*tp).tp_members = pfunc as *mut PyMemberDef,
-                PY_TP_GETSET => (*tp).tp_getset = pfunc as *mut PyGetSetDef,
-                PY_TP_INIT => (*tp).tp_init = Some(std::mem::transmute(pfunc)),
-                PY_TP_ALLOC => (*tp).tp_alloc = Some(std::mem::transmute(pfunc)),
-                PY_TP_NEW => (*tp).tp_new = Some(std::mem::transmute(pfunc)),
-                PY_TP_FREE => (*tp).tp_free = Some(std::mem::transmute(pfunc)),
-                PY_TP_FINALIZE => (*tp).tp_finalize = Some(std::mem::transmute(pfunc)),
-                PY_TP_DESCR_GET => (*tp).tp_descr_get = Some(std::mem::transmute(pfunc)),
-                PY_TP_BASE => {
-                    // Override base type from slot
-                    (*tp).tp_base = pfunc as *mut RawPyTypeObject;
-                },
-                _ => {} // Unknown slot, ignore
-            }
-            slot_ptr = slot_ptr.add(1);
+        // Allocate a new type object
+        let tp = libc::calloc(1, std::mem::size_of::<RawPyTypeObject>()) as *mut RawPyTypeObject;
+        if tp.is_null() {
+            return ptr::null_mut();
         }
-    }
+        std::ptr::write(tp, RawPyTypeObject::zeroed());
 
-    // Store bases tuple on the type
-    if !bases.is_null() {
-        (*bases).incref();
-        (*tp).tp_bases = bases;
-    }
+        (*tp).tp_name = (*spec).name;
+        (*tp).tp_basicsize = (*spec).basicsize as PySsizeT;
+        (*tp).tp_itemsize = (*spec).itemsize as PySsizeT;
+        (*tp).tp_flags = (*spec).flags as u64;
+        (*tp).ob_base.ob_type = PyType_Type.get();
+        (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(1);
 
-    // Call PyType_Ready to finalize
-    let ret = PyType_Ready(tp);
-    if ret < 0 {
-        libc::free(tp as *mut c_void);
-        return ptr::null_mut();
-    }
+        // Set base type if extracted from bases
+        if !base_type.is_null() {
+            (*tp).tp_base = base_type;
+        }
 
-    tp as *mut RawPyObject
+        // Process slots
+        if !(*spec).slots.is_null() {
+            let mut slot_ptr = (*spec).slots;
+            while (*slot_ptr).slot != 0 || !(*slot_ptr).pfunc.is_null() {
+                let slot_id = (*slot_ptr).slot;
+                let pfunc = (*slot_ptr).pfunc;
+                if slot_id == 0 && pfunc.is_null() {
+                    break;
+                }
+                match slot_id {
+                    PY_TP_DEALLOC => (*tp).tp_dealloc = Some(std::mem::transmute(pfunc)),
+                    PY_TP_REPR => (*tp).tp_repr = Some(std::mem::transmute(pfunc)),
+                    PY_TP_HASH => (*tp).tp_hash = Some(std::mem::transmute(pfunc)),
+                    PY_TP_CALL => (*tp).tp_call = Some(std::mem::transmute(pfunc)),
+                    PY_TP_STR => (*tp).tp_str = Some(std::mem::transmute(pfunc)),
+                    PY_TP_GETATTRO => (*tp).tp_getattro = Some(std::mem::transmute(pfunc)),
+                    PY_TP_SETATTRO => (*tp).tp_setattro = Some(std::mem::transmute(pfunc)),
+                    PY_TP_DOC => (*tp).tp_doc = pfunc as *const c_char,
+                    PY_TP_TRAVERSE => (*tp).tp_traverse = Some(std::mem::transmute(pfunc)),
+                    PY_TP_CLEAR => (*tp).tp_clear = Some(std::mem::transmute(pfunc)),
+                    PY_TP_RICHCOMPARE => (*tp).tp_richcompare = Some(std::mem::transmute(pfunc)),
+                    PY_TP_ITER => (*tp).tp_iter = Some(std::mem::transmute(pfunc)),
+                    PY_TP_ITERNEXT => (*tp).tp_iternext = Some(std::mem::transmute(pfunc)),
+                    PY_TP_METHODS => (*tp).tp_methods = pfunc as *mut PyMethodDef,
+                    PY_TP_MEMBERS => (*tp).tp_members = pfunc as *mut PyMemberDef,
+                    PY_TP_GETSET => (*tp).tp_getset = pfunc as *mut PyGetSetDef,
+                    PY_TP_INIT => (*tp).tp_init = Some(std::mem::transmute(pfunc)),
+                    PY_TP_ALLOC => (*tp).tp_alloc = Some(std::mem::transmute(pfunc)),
+                    PY_TP_NEW => (*tp).tp_new = Some(std::mem::transmute(pfunc)),
+                    PY_TP_FREE => (*tp).tp_free = Some(std::mem::transmute(pfunc)),
+                    PY_TP_FINALIZE => (*tp).tp_finalize = Some(std::mem::transmute(pfunc)),
+                    PY_TP_DESCR_GET => (*tp).tp_descr_get = Some(std::mem::transmute(pfunc)),
+                    PY_TP_BASE => {
+                        // Override base type from slot
+                        (*tp).tp_base = pfunc as *mut RawPyTypeObject;
+                    },
+                    _ => {} // Unknown slot, ignore
+                }
+                slot_ptr = slot_ptr.add(1);
+            }
+        }
+
+        // Store bases tuple on the type
+        if !bases.is_null() {
+            (*bases).incref();
+            (*tp).tp_bases = bases;
+        }
+
+        // Call PyType_Ready to finalize
+        let ret = PyType_Ready(tp);
+        if ret < 0 {
+            libc::free(tp as *mut c_void);
+            return ptr::null_mut();
+        }
+
+        tp as *mut RawPyObject
+    })
 }
 
 /// PyType_FromSpec — create a type from a spec (no bases).
@@ -1061,7 +1081,9 @@ pub unsafe extern "C" fn PyType_FromSpecWithBases(
 pub unsafe extern "C" fn PyType_FromSpec(
     spec: *mut PyType_Spec,
 ) -> *mut RawPyObject {
-    PyType_FromSpecWithBases(spec, ptr::null_mut())
+    crate::ffi::panic_guard::guard_ptr("PyType_FromSpec", || unsafe {
+        PyType_FromSpecWithBases(spec, ptr::null_mut())
+    })
 }
 
 /// PyType_Modified — notify that a type's dict has been modified.

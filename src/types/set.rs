@@ -250,114 +250,130 @@ unsafe extern "C" fn set_dealloc(obj: *mut RawPyObject) {
 // ─── C API ───
 
 #[no_mangle]
-pub unsafe extern "C" fn PySet_New(_iterable: *mut RawPyObject) -> *mut RawPyObject {
-    let obj = crate::object::gc::_PyObject_GC_New(set_type()) as *mut PySetObject;
-    set_init(obj);
-    obj as *mut RawPyObject
+pub extern "C" fn PySet_New(_iterable: *mut RawPyObject) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PySet_New", || unsafe {
+        let obj = crate::object::gc::_PyObject_GC_New(set_type()) as *mut PySetObject;
+        set_init(obj);
+        obj as *mut RawPyObject
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyFrozenSet_New(iterable: *mut RawPyObject) -> *mut RawPyObject {
-    // TODO: separate frozenset type
-    PySet_New(iterable)
+pub extern "C" fn PyFrozenSet_New(iterable: *mut RawPyObject) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyFrozenSet_New", || unsafe {
+        // TODO: separate frozenset type
+        PySet_New(iterable)
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PySet_Add(
+pub extern "C" fn PySet_Add(
     set: *mut RawPyObject,
     key: *mut RawPyObject,
 ) -> c_int {
-    if set.is_null() || key.is_null() { return -1; }
-    let s = set as *mut PySetObject;
-    let hash = hash_object(key);
+    crate::ffi::panic_guard::guard_int("PySet_Add", || unsafe {
+        if set.is_null() || key.is_null() { return -1; }
+        let s = set as *mut PySetObject;
+        let hash = hash_object(key);
 
-    // Check if we need to resize (fill > 2/3 of table)
-    let table_size = ((*s).mask + 1) as isize;
-    if (*s).fill * 3 >= table_size * 2 {
-        set_resize(s, (*s).used + 1);
-    }
-
-    let entry = set_lookup(s, key, hash);
-    if is_active(&*entry) {
-        // Already present
-        return 0;
-    }
-
-    let was_dummy = (*entry).key == dummy_key();
-    (*key).incref();
-    (*entry).key = key;
-    (*entry).hash = hash;
-    (*s).used += 1;
-    if !was_dummy {
-        (*s).fill += 1;
-    }
-    0
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn PySet_Discard(
-    set: *mut RawPyObject,
-    key: *mut RawPyObject,
-) -> c_int {
-    if set.is_null() || key.is_null() { return -1; }
-    let s = set as *mut PySetObject;
-    let hash = hash_object(key);
-    let entry = set_lookup(s, key, hash);
-    if !is_active(&*entry) {
-        return 0; // not found
-    }
-    (*(*entry).key).decref();
-    (*entry).key = dummy_key();
-    (*entry).hash = -1;
-    (*s).used -= 1;
-    1
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn PySet_Contains(
-    set: *mut RawPyObject,
-    key: *mut RawPyObject,
-) -> c_int {
-    if set.is_null() || key.is_null() { return -1; }
-    let s = set as *mut PySetObject;
-    let hash = hash_object(key);
-    let entry = set_lookup(s, key, hash);
-    if is_active(&*entry) { 1 } else { 0 }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn PySet_Size(set: *mut RawPyObject) -> isize {
-    if set.is_null() { return -1; }
-    let s = set as *mut PySetObject;
-    (*s).used
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn PySet_Clear(set: *mut RawPyObject) -> c_int {
-    if set.is_null() { return -1; }
-    let s = set as *mut PySetObject;
-    let table = (*s).table;
-    let mask = (*s).mask as usize;
-    for i in 0..=mask {
-        let entry = &mut *table.add(i);
-        if is_active(entry) {
-            (*entry.key).decref();
+        // Check if we need to resize (fill > 2/3 of table)
+        let table_size = ((*s).mask + 1) as isize;
+        if (*s).fill * 3 >= table_size * 2 {
+            set_resize(s, (*s).used + 1);
         }
-        entry.key = ptr::null_mut();
-        entry.hash = 0;
-    }
-    // Free table if heap-allocated
-    if table != smalltable_ptr(s) && !table.is_null() {
-        libc::free(table as *mut libc::c_void);
-    }
-    set_init(s);
-    0
+
+        let entry = set_lookup(s, key, hash);
+        if is_active(&*entry) {
+            // Already present
+            return 0;
+        }
+
+        let was_dummy = (*entry).key == dummy_key();
+        (*key).incref();
+        (*entry).key = key;
+        (*entry).hash = hash;
+        (*s).used += 1;
+        if !was_dummy {
+            (*s).fill += 1;
+        }
+        0
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PySet_Check(obj: *mut RawPyObject) -> c_int {
-    if obj.is_null() { return 0; }
-    if (*obj).ob_type == set_type() { 1 } else { 0 }
+pub extern "C" fn PySet_Discard(
+    set: *mut RawPyObject,
+    key: *mut RawPyObject,
+) -> c_int {
+    crate::ffi::panic_guard::guard_int("PySet_Discard", || unsafe {
+        if set.is_null() || key.is_null() { return -1; }
+        let s = set as *mut PySetObject;
+        let hash = hash_object(key);
+        let entry = set_lookup(s, key, hash);
+        if !is_active(&*entry) {
+            return 0; // not found
+        }
+        (*(*entry).key).decref();
+        (*entry).key = dummy_key();
+        (*entry).hash = -1;
+        (*s).used -= 1;
+        1
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn PySet_Contains(
+    set: *mut RawPyObject,
+    key: *mut RawPyObject,
+) -> c_int {
+    crate::ffi::panic_guard::guard_int("PySet_Contains", || unsafe {
+        if set.is_null() || key.is_null() { return -1; }
+        let s = set as *mut PySetObject;
+        let hash = hash_object(key);
+        let entry = set_lookup(s, key, hash);
+        if is_active(&*entry) { 1 } else { 0 }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn PySet_Size(set: *mut RawPyObject) -> isize {
+    crate::ffi::panic_guard::guard_ssize("PySet_Size", || unsafe {
+        if set.is_null() { return -1; }
+        let s = set as *mut PySetObject;
+        (*s).used
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn PySet_Clear(set: *mut RawPyObject) -> c_int {
+    crate::ffi::panic_guard::guard_int("PySet_Clear", || unsafe {
+        if set.is_null() { return -1; }
+        let s = set as *mut PySetObject;
+        let table = (*s).table;
+        let mask = (*s).mask as usize;
+        for i in 0..=mask {
+            let entry = &mut *table.add(i);
+            if is_active(entry) {
+                (*entry.key).decref();
+            }
+            entry.key = ptr::null_mut();
+            entry.hash = 0;
+        }
+        // Free table if heap-allocated
+        if table != smalltable_ptr(s) && !table.is_null() {
+            libc::free(table as *mut libc::c_void);
+        }
+        set_init(s);
+        0
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn PySet_Check(obj: *mut RawPyObject) -> c_int {
+    crate::ffi::panic_guard::guard_int("PySet_Check", || unsafe {
+        if obj.is_null() { return 0; }
+        if (*obj).ob_type == set_type() { 1 } else { 0 }
+    })
 }
 
 pub unsafe fn init_set_type() {

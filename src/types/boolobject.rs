@@ -84,26 +84,32 @@ pub static PY_FALSE: Lazy<SendPtr<RawPyObject>> = Lazy::new(|| {
 // ─── C API ───
 
 #[no_mangle]
-pub unsafe extern "C" fn PyBool_FromLong(v: std::os::raw::c_long) -> *mut RawPyObject {
-    if v != 0 {
-        let t = PY_TRUE.get();
-        (*t).incref();
-        t
-    } else {
-        let f = PY_FALSE.get();
-        (*f).incref();
-        f
-    }
+pub extern "C" fn PyBool_FromLong(v: std::os::raw::c_long) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyBool_FromLong", || unsafe {
+        if v != 0 {
+            let t = PY_TRUE.get();
+            (*t).incref();
+            t
+        } else {
+            let f = PY_FALSE.get();
+            (*f).incref();
+            f
+        }
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn _Py_True() -> *mut RawPyObject {
-    _Py_TrueStruct.get() as *mut RawPyObject
+pub extern "C" fn _Py_True() -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("_Py_True", || unsafe {
+        _Py_TrueStruct.get() as *mut RawPyObject
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn _Py_False() -> *mut RawPyObject {
-    _Py_FalseStruct.get() as *mut RawPyObject
+pub extern "C" fn _Py_False() -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("_Py_False", || unsafe {
+        _Py_FalseStruct.get() as *mut RawPyObject
+    })
 }
 
 pub fn is_true(obj: *mut RawPyObject) -> bool {
@@ -115,19 +121,25 @@ pub fn is_bool(obj: *mut RawPyObject) -> bool {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn Py_IsTrue(obj: *mut RawPyObject) -> i32 {
-    if obj == PY_TRUE.get() { 1 } else { 0 }
+pub extern "C" fn Py_IsTrue(obj: *mut RawPyObject) -> i32 {
+    crate::ffi::panic_guard::guard_i32("Py_IsTrue", || unsafe {
+        if obj == PY_TRUE.get() { 1 } else { 0 }
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn Py_IsFalse(obj: *mut RawPyObject) -> i32 {
-    if obj == PY_FALSE.get() { 1 } else { 0 }
+pub extern "C" fn Py_IsFalse(obj: *mut RawPyObject) -> i32 {
+    crate::ffi::panic_guard::guard_i32("Py_IsFalse", || unsafe {
+        if obj == PY_FALSE.get() { 1 } else { 0 }
+    })
 }
 
 /// PyBool_Check — returns 1 if the object is a bool (True or False).
 #[no_mangle]
-pub unsafe extern "C" fn PyBool_Check(obj: *mut RawPyObject) -> std::os::raw::c_int {
-    if is_bool(obj) { 1 } else { 0 }
+pub extern "C" fn PyBool_Check(obj: *mut RawPyObject) -> std::os::raw::c_int {
+    crate::ffi::panic_guard::guard_int("PyBool_Check", || unsafe {
+        if is_bool(obj) { 1 } else { 0 }
+    })
 }
 
 pub unsafe fn init_bool_type() {

@@ -58,91 +58,109 @@ unsafe extern "C" fn tuple_dealloc(obj: *mut RawPyObject) {
 // ─── C API ───
 
 #[no_mangle]
-pub unsafe extern "C" fn PyTuple_New(size: isize) -> *mut RawPyObject {
-    if size < 0 { return ptr::null_mut(); }
-    // GC-tracked var-size allocation: GC_HEAD + 24 + 8*size
-    let obj = crate::object::gc::_PyObject_GC_NewVar(tuple_type(), size);
-    obj as *mut RawPyObject
+pub extern "C" fn PyTuple_New(size: isize) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyTuple_New", || unsafe {
+        if size < 0 { return ptr::null_mut(); }
+        // GC-tracked var-size allocation: GC_HEAD + 24 + 8*size
+        let obj = crate::object::gc::_PyObject_GC_NewVar(tuple_type(), size);
+        obj as *mut RawPyObject
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyTuple_Size(tuple: *mut RawPyObject) -> isize {
-    if tuple.is_null() { return -1; }
-    let t = tuple as *mut PyTupleObject;
-    (*t).ob_base.ob_size
+pub extern "C" fn PyTuple_Size(tuple: *mut RawPyObject) -> isize {
+    crate::ffi::panic_guard::guard_ssize("PyTuple_Size", || unsafe {
+        if tuple.is_null() { return -1; }
+        let t = tuple as *mut PyTupleObject;
+        (*t).ob_base.ob_size
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyTuple_GET_SIZE(tuple: *mut RawPyObject) -> isize {
-    PyTuple_Size(tuple)
+pub extern "C" fn PyTuple_GET_SIZE(tuple: *mut RawPyObject) -> isize {
+    crate::ffi::panic_guard::guard_ssize("PyTuple_GET_SIZE", || unsafe {
+        PyTuple_Size(tuple)
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyTuple_GetItem(tuple: *mut RawPyObject, index: isize) -> *mut RawPyObject {
-    if tuple.is_null() { return ptr::null_mut(); }
-    let t = tuple as *mut PyTupleObject;
-    let size = (*t).ob_base.ob_size;
-    if index < 0 || index >= size { return ptr::null_mut(); }
-    *ob_item(t).add(index as usize)
+pub extern "C" fn PyTuple_GetItem(tuple: *mut RawPyObject, index: isize) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyTuple_GetItem", || unsafe {
+        if tuple.is_null() { return ptr::null_mut(); }
+        let t = tuple as *mut PyTupleObject;
+        let size = (*t).ob_base.ob_size;
+        if index < 0 || index >= size { return ptr::null_mut(); }
+        *ob_item(t).add(index as usize)
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyTuple_GET_ITEM(tuple: *mut RawPyObject, index: isize) -> *mut RawPyObject {
-    let t = tuple as *mut PyTupleObject;
-    *ob_item(t).add(index as usize)
+pub extern "C" fn PyTuple_GET_ITEM(tuple: *mut RawPyObject, index: isize) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyTuple_GET_ITEM", || unsafe {
+        let t = tuple as *mut PyTupleObject;
+        *ob_item(t).add(index as usize)
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyTuple_SetItem(
+pub extern "C" fn PyTuple_SetItem(
     tuple: *mut RawPyObject, index: isize, item: *mut RawPyObject,
 ) -> c_int {
-    if tuple.is_null() { return -1; }
-    let t = tuple as *mut PyTupleObject;
-    let size = (*t).ob_base.ob_size;
-    if index < 0 || index >= size { return -1; }
-    let items = ob_item(t);
-    let old = *items.add(index as usize);
-    if !old.is_null() { (*old).decref(); }
-    *items.add(index as usize) = item; // steals reference
-    0
+    crate::ffi::panic_guard::guard_int("PyTuple_SetItem", || unsafe {
+        if tuple.is_null() { return -1; }
+        let t = tuple as *mut PyTupleObject;
+        let size = (*t).ob_base.ob_size;
+        if index < 0 || index >= size { return -1; }
+        let items = ob_item(t);
+        let old = *items.add(index as usize);
+        if !old.is_null() { (*old).decref(); }
+        *items.add(index as usize) = item; // steals reference
+        0
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyTuple_SET_ITEM(
+pub extern "C" fn PyTuple_SET_ITEM(
     tuple: *mut RawPyObject, index: isize, item: *mut RawPyObject,
 ) {
-    let t = tuple as *mut PyTupleObject;
-    *ob_item(t).add(index as usize) = item;
+    crate::ffi::panic_guard::guard_void("PyTuple_SET_ITEM", || unsafe {
+        let t = tuple as *mut PyTupleObject;
+        *ob_item(t).add(index as usize) = item;
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyTuple_GetSlice(
+pub extern "C" fn PyTuple_GetSlice(
     tuple: *mut RawPyObject, low: isize, high: isize,
 ) -> *mut RawPyObject {
-    if tuple.is_null() { return ptr::null_mut(); }
-    let t = tuple as *mut PyTupleObject;
-    let len = (*t).ob_base.ob_size;
-    let lo = low.max(0).min(len) as usize;
-    let hi = high.max(0).min(len) as usize;
-    let slice_len = if hi > lo { hi - lo } else { 0 };
-    let new_tuple = PyTuple_New(slice_len as isize);
-    let src_items = ob_item(t);
-    let dst = new_tuple as *mut PyTupleObject;
-    let dst_items = ob_item(dst);
-    for i in 0..slice_len {
-        let item = *src_items.add(lo + i);
-        if !item.is_null() { (*item).incref(); }
-        *dst_items.add(i) = item;
-    }
-    new_tuple
+    crate::ffi::panic_guard::guard_ptr("PyTuple_GetSlice", || unsafe {
+        if tuple.is_null() { return ptr::null_mut(); }
+        let t = tuple as *mut PyTupleObject;
+        let len = (*t).ob_base.ob_size;
+        let lo = low.max(0).min(len) as usize;
+        let hi = high.max(0).min(len) as usize;
+        let slice_len = if hi > lo { hi - lo } else { 0 };
+        let new_tuple = PyTuple_New(slice_len as isize);
+        let src_items = ob_item(t);
+        let dst = new_tuple as *mut PyTupleObject;
+        let dst_items = ob_item(dst);
+        for i in 0..slice_len {
+            let item = *src_items.add(lo + i);
+            if !item.is_null() { (*item).incref(); }
+            *dst_items.add(i) = item;
+        }
+        new_tuple
+    })
 }
 
 // PyTuple_Pack is implemented in csrc/varargs.c (requires C variadic args)
 
 #[no_mangle]
-pub unsafe extern "C" fn PyTuple_Check(obj: *mut RawPyObject) -> c_int {
-    if obj.is_null() { return 0; }
-    if (*obj).ob_type == tuple_type() { 1 } else { 0 }
+pub extern "C" fn PyTuple_Check(obj: *mut RawPyObject) -> c_int {
+    crate::ffi::panic_guard::guard_int("PyTuple_Check", || unsafe {
+        if obj.is_null() { return 0; }
+        if (*obj).ob_type == tuple_type() { 1 } else { 0 }
+    })
 }
 
 pub unsafe fn init_tuple_type() {

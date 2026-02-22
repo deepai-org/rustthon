@@ -93,104 +93,120 @@ pub fn bytes_value(obj: *mut RawPyObject) -> &'static [u8] {
 // ─── C API ───
 
 #[no_mangle]
-pub unsafe extern "C" fn PyBytes_FromString(s: *const c_char) -> *mut RawPyObject {
-    if s.is_null() {
-        return ptr::null_mut();
-    }
-    let len = libc::strlen(s);
-    let slice = std::slice::from_raw_parts(s as *const u8, len);
-    create_bytes_from_slice(slice)
+pub extern "C" fn PyBytes_FromString(s: *const c_char) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("PyBytes_FromString", || unsafe {
+        if s.is_null() {
+            return ptr::null_mut();
+        }
+        let len = libc::strlen(s);
+        let slice = std::slice::from_raw_parts(s as *const u8, len);
+        create_bytes_from_slice(slice)
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyBytes_FromStringAndSize(
+pub extern "C" fn PyBytes_FromStringAndSize(
     s: *const c_char,
     size: isize,
 ) -> *mut RawPyObject {
-    if size < 0 {
-        return ptr::null_mut();
-    }
-    if s.is_null() {
-        // Allocate zeroed bytes of given size
-        return alloc_bytes(size as usize);
-    }
-    let slice = std::slice::from_raw_parts(s as *const u8, size as usize);
-    create_bytes_from_slice(slice)
+    crate::ffi::panic_guard::guard_ptr("PyBytes_FromStringAndSize", || unsafe {
+        if size < 0 {
+            return ptr::null_mut();
+        }
+        if s.is_null() {
+            // Allocate zeroed bytes of given size
+            return alloc_bytes(size as usize);
+        }
+        let slice = std::slice::from_raw_parts(s as *const u8, size as usize);
+        create_bytes_from_slice(slice)
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyBytes_AsString(obj: *mut RawPyObject) -> *mut c_char {
-    if obj.is_null() {
-        return ptr::null_mut();
-    }
-    let b = obj as *mut PyBytesObject;
-    ob_sval(b) as *mut c_char
+pub extern "C" fn PyBytes_AsString(obj: *mut RawPyObject) -> *mut c_char {
+    crate::ffi::panic_guard::guard_ptr("PyBytes_AsString", || unsafe {
+        if obj.is_null() {
+            return ptr::null_mut();
+        }
+        let b = obj as *mut PyBytesObject;
+        ob_sval(b) as *mut c_char
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyBytes_AsStringAndSize(
+pub extern "C" fn PyBytes_AsStringAndSize(
     obj: *mut RawPyObject,
     s: *mut *mut c_char,
     len: *mut isize,
 ) -> c_int {
-    if obj.is_null() {
-        return -1;
-    }
-    let b = obj as *mut PyBytesObject;
-    if !s.is_null() {
-        *s = ob_sval(b) as *mut c_char;
-    }
-    if !len.is_null() {
-        *len = (*b).ob_base.ob_size;
-    }
-    0
+    crate::ffi::panic_guard::guard_int("PyBytes_AsStringAndSize", || unsafe {
+        if obj.is_null() {
+            return -1;
+        }
+        let b = obj as *mut PyBytesObject;
+        if !s.is_null() {
+            *s = ob_sval(b) as *mut c_char;
+        }
+        if !len.is_null() {
+            *len = (*b).ob_base.ob_size;
+        }
+        0
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyBytes_Size(obj: *mut RawPyObject) -> isize {
-    if obj.is_null() {
-        return -1;
-    }
-    let b = obj as *mut PyBytesObject;
-    (*b).ob_base.ob_size
+pub extern "C" fn PyBytes_Size(obj: *mut RawPyObject) -> isize {
+    crate::ffi::panic_guard::guard_ssize("PyBytes_Size", || unsafe {
+        if obj.is_null() {
+            return -1;
+        }
+        let b = obj as *mut PyBytesObject;
+        (*b).ob_base.ob_size
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyBytes_GET_SIZE(obj: *mut RawPyObject) -> isize {
-    PyBytes_Size(obj)
+pub extern "C" fn PyBytes_GET_SIZE(obj: *mut RawPyObject) -> isize {
+    crate::ffi::panic_guard::guard_ssize("PyBytes_GET_SIZE", || unsafe {
+        PyBytes_Size(obj)
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyBytes_Check(obj: *mut RawPyObject) -> c_int {
-    if obj.is_null() {
-        return 0;
-    }
-    if (*obj).ob_type == bytes_type() { 1 } else { 0 }
+pub extern "C" fn PyBytes_Check(obj: *mut RawPyObject) -> c_int {
+    crate::ffi::panic_guard::guard_int("PyBytes_Check", || unsafe {
+        if obj.is_null() {
+            return 0;
+        }
+        if (*obj).ob_type == bytes_type() { 1 } else { 0 }
+    })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PyBytes_Concat(
+pub extern "C" fn PyBytes_Concat(
     bytes: *mut *mut RawPyObject,
     new_part: *mut RawPyObject,
 ) {
-    if bytes.is_null() || (*bytes).is_null() || new_part.is_null() {
-        return;
-    }
-    let left_len = PyBytes_Size(*bytes) as usize;
-    let right_len = PyBytes_Size(new_part) as usize;
-    let total_len = left_len + right_len;
-    let new_obj = alloc_bytes(total_len);
-    let nb = new_obj as *mut PyBytesObject;
-    let dest = ob_sval(nb);
-    // Copy left
-    let left_data = ob_sval(*bytes as *mut PyBytesObject);
-    ptr::copy_nonoverlapping(left_data, dest, left_len);
-    // Copy right
-    let right_data = ob_sval(new_part as *mut PyBytesObject);
-    ptr::copy_nonoverlapping(right_data, dest.add(left_len), right_len);
-    // Decref old
-    (*(*bytes)).decref();
-    *bytes = new_obj;
+    crate::ffi::panic_guard::guard_void("PyBytes_Concat", || unsafe {
+        if bytes.is_null() || (*bytes).is_null() || new_part.is_null() {
+            return;
+        }
+        let left_len = PyBytes_Size(*bytes) as usize;
+        let right_len = PyBytes_Size(new_part) as usize;
+        let total_len = left_len + right_len;
+        let new_obj = alloc_bytes(total_len);
+        let nb = new_obj as *mut PyBytesObject;
+        let dest = ob_sval(nb);
+        // Copy left
+        let left_data = ob_sval(*bytes as *mut PyBytesObject);
+        ptr::copy_nonoverlapping(left_data, dest, left_len);
+        // Copy right
+        let right_data = ob_sval(new_part as *mut PyBytesObject);
+        ptr::copy_nonoverlapping(right_data, dest.add(left_len), right_len);
+        // Decref old
+        (*(*bytes)).decref();
+        *bytes = new_obj;
+    })
 }
 
 pub unsafe fn init_bytes_type() {
