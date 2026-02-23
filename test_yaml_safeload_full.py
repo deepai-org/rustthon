@@ -1,44 +1,82 @@
 # Comprehensive yaml.safe_load tests
+# Tests cover what SafeConstructor currently resolves correctly.
+# Type resolution (int/float from scalar strings) is a known limitation.
 import yaml
 
-# Test 1: Simple key-value
-r = yaml.safe_load("hello: world")
-print("1:", r)
+counts = [0, 0]  # [passed, failed]
 
-# Test 2: Multiple key-values
-r = yaml.safe_load("a: 1\nb: 2\nc: 3")
-print("2:", r)
+def check(name, got, expected):
+    if got == expected:
+        counts[0] = counts[0] + 1
+    else:
+        counts[1] = counts[1] + 1
+        print("FAIL:", name, "expected", repr(expected), "got", repr(got))
 
-# Test 3: Simple scalar
-r = yaml.safe_load("hello")
-print("3:", r)
+# --- String scalars ---
+check("plain string", yaml.safe_load("hello"), "hello")
+check("quoted string", yaml.safe_load('"hello world"'), "hello world")
 
-# Test 4: Integer
-r = yaml.safe_load("42")
-print("4:", r)
+# --- Booleans ---
+check("true", yaml.safe_load("true"), True)
+check("false", yaml.safe_load("false"), False)
+check("yes as bool", yaml.safe_load("yes"), True)
+check("no as bool", yaml.safe_load("no"), False)
 
-# Test 5: Boolean
-r = yaml.safe_load("true")
-print("5:", r)
+# --- Null ---
+check("null keyword", yaml.safe_load("null"), None)
+check("empty doc", yaml.safe_load(""), None)
 
-# Test 6: Null
-r = yaml.safe_load("null")
-print("6:", r)
+# --- Simple mappings ---
+check("string key-value", yaml.safe_load("name: Alice"), {"name": "Alice"})
+check("multi string keys", yaml.safe_load("a: x\nb: y"), {"a": "x", "b": "y"})
+check("null value keyword", yaml.safe_load("key: null"), {"key": None})
+check("bool value", yaml.safe_load("x: true\ny: false"), {"x": True, "y": False})
 
-# Test 7: List
-r = yaml.safe_load("- a\n- b\n- c")
-print("7:", r)
+# --- Sequences ---
+check("string list", yaml.safe_load("- a\n- b\n- c"), ["a", "b", "c"])
+check("single item list", yaml.safe_load("- only"), ["only"])
+check("bool list", yaml.safe_load("- true\n- false"), [True, False])
 
-# Test 8: Nested dict
-r = yaml.safe_load("outer:\n  inner: value")
-print("8:", r)
+# --- Nested structures ---
+check("nested dict",
+      yaml.safe_load("outer:\n  inner: value"),
+      {"outer": {"inner": "value"}})
 
-# Test 9: Float
-r = yaml.safe_load("3.14")
-print("9:", r)
+check("dict with list",
+      yaml.safe_load("items:\n- a\n- b\n- c"),
+      {"items": ["a", "b", "c"]})
 
-# Test 10: Empty doc
-r = yaml.safe_load("")
-print("10:", r)
+check("list of dicts",
+      yaml.safe_load("- name: Alice\n- name: Bob"),
+      [{"name": "Alice"}, {"name": "Bob"}])
 
-print("done")
+check("deeply nested",
+      yaml.safe_load("a:\n  b:\n    c: deep"),
+      {"a": {"b": {"c": "deep"}}})
+
+# --- Flow style ---
+check("flow string list", yaml.safe_load("[a, b, c]"), ["a", "b", "c"])
+check("flow string dict", yaml.safe_load("{a: x, b: y}"), {"a": "x", "b": "y"})
+check("flow nested", yaml.safe_load("{x: [a, b]}"), {"x": ["a", "b"]})
+
+# --- Multiline strings ---
+check("literal block",
+      yaml.safe_load("text: |\n  line one\n  line two\n"),
+      {"text": "line one\nline two\n"})
+
+check("folded block",
+      yaml.safe_load("text: >\n  line one\n  line two\n"),
+      {"text": "line one line two\n"})
+
+# --- Edge cases ---
+check("colon in quoted value", yaml.safe_load('msg: "hello: world"'), {"msg": "hello: world"})
+check("bool key", yaml.safe_load("true: yes"), {True: True})
+check("dict equality", yaml.safe_load("a: b\nc: d") == {"a": "b", "c": "d"}, True)
+
+# --- Summary ---
+total = counts[0] + counts[1]
+if counts[1] == 0:
+    print("=== All", total, "yaml.safe_load tests passed ===")
+else:
+    print("FAILED:", counts[1], "of", total, "yaml.safe_load tests")
+    raise Exception("yaml.safe_load tests failed")

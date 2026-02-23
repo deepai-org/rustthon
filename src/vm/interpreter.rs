@@ -3616,6 +3616,10 @@ fn compare_op(py: Python<'_>, left: &PyObjectRef, right: &PyObjectRef, op: u32) 
                 let eq = unsafe { lists_equal(l, r) };
                 let result = match op { 2 => eq, 3 => !eq, _ => false };
                 Ok(bool_obj(py, result))
+            } else if unsafe { crate::types::dict::PyDict_Check(l) != 0 && crate::types::dict::PyDict_Check(r) != 0 } {
+                let eq = unsafe { dicts_equal(l, r) };
+                let result = match op { 2 => eq, 3 => !eq, _ => false };
+                Ok(bool_obj(py, result))
             } else {
                 let result = match op { 2 => l == r, 3 => l != r, _ => false };
                 Ok(bool_obj(py, result))
@@ -3646,6 +3650,23 @@ unsafe fn lists_equal(a: *mut RawPyObject, b: *mut RawPyObject) -> bool {
         let ea = crate::types::list::PyList_GetItem(a, i);
         let eb = crate::types::list::PyList_GetItem(b, i);
         if !objs_equal(ea, eb) { return false; }
+    }
+    true
+}
+
+/// Element-wise dict equality.
+unsafe fn dicts_equal(a: *mut RawPyObject, b: *mut RawPyObject) -> bool {
+    let na = crate::types::dict::PyDict_Size(a);
+    let nb = crate::types::dict::PyDict_Size(b);
+    if na != nb { return false; }
+    // Iterate over keys in a, check each exists in b with equal value
+    let mut pos: isize = 0;
+    let mut key: *mut RawPyObject = std::ptr::null_mut();
+    let mut val_a: *mut RawPyObject = std::ptr::null_mut();
+    while crate::types::dict::PyDict_Next(a, &mut pos, &mut key, &mut val_a) != 0 {
+        let val_b = crate::types::dict::PyDict_GetItem(b, key);
+        if val_b.is_null() { return false; }
+        if !objs_equal(val_a, val_b) { return false; }
     }
     true
 }
@@ -3697,6 +3718,9 @@ fn objs_equal(a: *mut RawPyObject, b: *mut RawPyObject) -> bool {
         }
         if crate::types::list::PyList_Check(a) != 0 && crate::types::list::PyList_Check(b) != 0 {
             return lists_equal(a, b);
+        }
+        if crate::types::dict::PyDict_Check(a) != 0 && crate::types::dict::PyDict_Check(b) != 0 {
+            return dicts_equal(a, b);
         }
     }
     false
