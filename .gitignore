@@ -18,6 +18,34 @@
 test_abi
 test_ext_driver
 test_gc_torture
+test_markupsafe
+test_ujson
+test_prebuilt
+test_gc
+test_cython_bin
+test_bcrypt_bin
+test_pyyaml_bin
+
+# Compiled test extensions
+_testmod.dylib
+_markupsafe_speedups.dylib
+_ujson.dylib
+
+# Downloaded extension packages (from setup_tests.sh)
+test_bcrypt/bcrypt_pkg/
+test_cython/hello.cpython-311-darwin.so
+test_cython/test_cython
+test_pyyaml/test_pyyaml
+
+# Thin binary shim (built from csrc/main.c)
+rustthon
+rustthon_bin
+
+# Backup files
+*.bak
+
+# Virtual environments
+.venv311/
 
 # Python
 __pycache__/

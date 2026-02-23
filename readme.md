@@ -16,12 +16,20 @@ The interpreter successfully executes Python code with:
 | Comparisons (`<`, `<=`, `==`, `!=`, `>`, `>=`, `is`) | Working |
 | Lists (creation, append, concatenation, indexing) | Working |
 | Tuples | Working |
-| Dicts (creation, set/get) | Working |
+| Dicts (creation, set/get, iteration) | Working |
 | Sets | Working |
 | `if`/`elif`/`else` | Working |
-| `while` loops | Working |
+| `while`/`for` loops | Working |
+| Functions, closures, `*args`/`**kwargs` | Working |
+| Classes, inheritance, `super()` | Working |
+| Generators (`yield`) | Working |
+| Comprehensions (list, dict, set) | Working |
+| Exception handling (`try`/`except`/`finally`) | Working |
+| `import` of Python modules and C extensions | Working |
 | `print()`, `len()`, `range()`, `type()`, `int()`, `str()` | Working |
-| `import` of native C extensions | Working |
+| `isinstance()`, `hasattr()`, `getattr()`, `setattr()` | Working |
+| `enumerate()`, `zip()`, `sorted()`, `reversed()` | Working |
+| `yaml.safe_load()` via Cython `_yaml` C extension | Working |
 | REPL mode | Working |
 
 ## Native Import
@@ -32,9 +40,13 @@ Rustthon can import and call prebuilt C extensions directly from Python source c
 import ujson
 print(ujson.encode({"hello": "world", "n": 42, "pi": 3.14}))
 # {"hello":"world","n":42,"pi":3.14}
+
+import yaml
+print(yaml.safe_load("hello: world"))
+# {'hello': 'world'}
 ```
 
-The VM's `import` statement finds `.cpython-311-darwin.so` files on `PYTHONPATH`, loads them via `dlopen`, calls `PyInit_<module>`, and makes the resulting module object available for attribute access and function calls.
+The VM's `import` statement finds `.cpython-311-darwin.so` files in site-packages, loads them via `dlopen`, calls `PyInit_<module>`, and makes the resulting module object available for attribute access and function calls. For packages like `yaml`, the VM executes `__init__.py` from source while loading `_yaml` as a native C extension — mixed Python/C packages work seamlessly.
 
 ## C Extension Compatibility
 
@@ -50,9 +62,10 @@ Rustthon loads and runs real-world C extensions from PyPI. This works in three m
 | ujson 5.11.0 | Self-built | 48/48 pass |
 | markupsafe 3.0.3 | Prebuilt wheel | 18/18 pass |
 | ujson 5.11.0 | Prebuilt wheel | 68/68 pass |
-| propcache (Cython) | Prebuilt wheel | 20/20 pass |
+| pyyaml 6.0.2 (Cython) | Prebuilt wheel | 14/14 pass |
 | bcrypt (PyO3) | Prebuilt wheel | 10/10 pass |
-| ujson 5.11.0 | Native import | 9/9 pass |
+| ujson 5.11.0 | Native VM import | 9/9 pass |
+| yaml (pyyaml) | Native VM import | yaml.safe_load working |
 
 The prebuilt wheel tests use `.so` files extracted directly from pip wheels (`cp311-cp311-macosx_11_0_arm64`). These were compiled by their upstream projects against CPython 3.11 headers — Rustthon was not involved in their compilation.
 
@@ -172,6 +185,10 @@ build.rs                # cc crate build script for varargs.c
 
 ## Test Suites
 
+33 test suites run via `./run_tests.sh`:
+
+**C Driver Suites (9):**
+
 | Test Suite | Tests | What it verifies |
 |------------|-------|------------------|
 | `test_abi.c` | 97 | Struct layouts at byte offsets |
@@ -182,25 +199,62 @@ build.rs                # cc crate build script for varargs.c
 | `test_prebuilt.c` | 68 | Prebuilt pip wheel `.so` files |
 | `test_cython.c` | 20 | Cython-compiled extension |
 | `test_bcrypt.c` | 10 | PyO3 bcrypt extension |
-| **TOTAL** | **419** | |
+| `test_pyyaml.c` | 14 | Cython pyyaml extension |
 
-All 8 suites run via `./run_tests.sh`.
+**VM Python Suites (24):**
 
-### Build & Run
+| Test Suite | What it verifies |
+|------------|------------------|
+| `test_phase1.py` | Functions & default arguments |
+| `test_phase3.py` | Exception handling (try/except/finally) |
+| `test_phase4.py` | Classes & `__init__` |
+| `test_phase6.py` | Closures & decorators |
+| `test_phase7.py` | `*args`/`**kwargs` |
+| `test_phase8.py` | Comprehensions |
+| `test_phase9.py` | Generators (`yield`) |
+| `test_phase10.py` | String & list methods |
+| `test_phase11.py` | Stdlib stubs & builtins |
+| `test_final.py` | Comprehensive type tests |
+| `test_nonlocal.py` | Nonlocal closures |
+| `test_dict_iter.py` | Dict iteration |
+| `test_gen_isinstance.py` | Generator isinstance |
+| `test_class_inherit.py` | Class inheritance |
+| `test_cross_inherit.py` | Cross-module inheritance |
+| `test_super.py` | `super()` calls |
+| `test_vm_improvements.py` | Multiple inheritance + re module |
+| `test_import.py` | Python source imports |
+| `test_import_star.py` | `import *` with `__all__` |
+| `test_import_collections.py` | `import collections.abc` |
+| `test_native_import.py` | `import ujson` (prebuilt C ext) |
+| `test_yaml_import.py` | `import yaml` |
+| `test_yaml_full.py` | YAML CParser events |
+| `test_yaml_safeload_full.py` | `yaml.safe_load()` |
+
+### Setup & Run
+
+```bash
+# First-time setup (downloads dependencies, builds everything)
+./setup_tests.sh
+
+# Run all 33 test suites
+./run_tests.sh
+
+# Run tests without rebuilding (faster)
+./run_tests.sh --quick
+```
+
+### Manual Build
 
 ```bash
 # Build the dylib
 cargo build --release
 
 # Build the thin binary shim
-cc -o target/release/rustthon csrc/main.c -ldl
+cc -o rustthon_bin csrc/main.c -ldl
 
 # Run Python source
-PYTHONPATH=/path/to/extensions ./target/release/rustthon script.py
+./rustthon_bin script.py
 
 # Run the REPL
-./target/release/rustthon
-
-# Run all test suites
-./run_tests.sh
+./rustthon_bin
 ```
