@@ -166,6 +166,72 @@ run_suite "Phase 5: PyO3 bcrypt" ./test_bcrypt_bin
 # Phase 6: pyyaml (Cython)
 run_suite "Phase 6: pyyaml (Cython)" ./test_pyyaml_bin
 
+# ── Step 3: Run VM Python tests ──
+printf "${BOLD}Running VM Python tests...${RESET}\n\n"
+
+run_vm_test() {
+    local name="$1"
+    local script="$2"
+
+    TOTAL_SUITES=$((TOTAL_SUITES + 1))
+    printf "${CYAN}${BOLD}[%d] %s${RESET}\n" "$TOTAL_SUITES" "$name"
+
+    local output
+    local exit_code=0
+    output=$(./rustthon_bin "$script" 2>&1) || exit_code=$?
+
+    # Check for Traceback (the definitive error indicator from the VM)
+    local errors
+    errors=$(echo "$output" | grep -v '^\[' | grep 'Traceback (most recent call last)' || true)
+
+    if [ $exit_code -eq 0 ] && [ -z "$errors" ]; then
+        PASSED_SUITES=$((PASSED_SUITES + 1))
+        local last_line
+        last_line=$(echo "$output" | grep -v '^\[' | tail -1)
+        printf "    %s\n" "$last_line"
+        printf "    ${GREEN}SUITE PASSED${RESET}\n\n"
+    else
+        FAILED_SUITES=$((FAILED_SUITES + 1))
+        FAILED_NAMES="$FAILED_NAMES  - $name\n"
+        echo "$output" | grep -v '^\[' | tail -10
+        printf "    ${RED}SUITE FAILED (exit code %d)${RESET}\n\n" "$exit_code"
+    fi
+}
+
+# VM basics
+run_vm_test "VM: Functions & Defaults"        test_phase1.py
+run_vm_test "VM: Exception Handling"          test_phase3.py
+run_vm_test "VM: Classes & __init__"          test_phase4.py
+run_vm_test "VM: Closures & Decorators"       test_phase6.py
+run_vm_test "VM: *args/**kwargs"              test_phase7.py
+run_vm_test "VM: Comprehensions"              test_phase8.py
+run_vm_test "VM: Generators"                  test_phase9.py
+run_vm_test "VM: String & List Methods"       test_phase10.py
+run_vm_test "VM: Stdlib Stubs & Builtins"     test_phase11.py
+run_vm_test "VM: Comprehensive Types"         test_final.py
+run_vm_test "VM: Nonlocal Closures"           test_nonlocal.py
+run_vm_test "VM: Dict Iteration"              test_dict_iter.py
+run_vm_test "VM: Generator isinstance"        test_gen_isinstance.py
+
+# Classes & inheritance
+run_vm_test "VM: Class Inheritance"           test_class_inherit.py
+run_vm_test "VM: Cross-Module Inheritance"    test_cross_inherit.py
+run_vm_test "VM: super()"                     test_super.py
+run_vm_test "VM: Multiple Inheritance + re"   test_vm_improvements.py
+
+# Imports
+run_vm_test "VM: Python Source Imports"       test_import.py
+run_vm_test "VM: import * with __all__"       test_import_star.py
+run_vm_test "VM: import collections.abc"      test_import_collections.py
+
+# Native C extension imports from VM
+run_vm_test "VM: import ujson (prebuilt)"     test_native_import.py
+
+# YAML integration
+run_vm_test "VM: import yaml"                 test_yaml_import.py
+run_vm_test "VM: yaml CParser Events"         test_yaml_full.py
+run_vm_test "VM: yaml.safe_load"              test_yaml_safeload_full.py
+
 # ═══════════════════════════════════════════════════════════
 printf "${BOLD}═══════════════════════════════════════════════════════════${RESET}\n"
 printf "${BOLD}  FINAL RESULTS: %d/%d suites passed${RESET}" "$PASSED_SUITES" "$TOTAL_SUITES"

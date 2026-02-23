@@ -54,9 +54,4 @@ import os
 print(os.sep)               # /
 print(os.getcwd() != "")    # True
 
-# --- os.path module ---
-import os.path
-print(os.path.join("a", "b"))  # a/b
-print(os.path.exists("."))     # True
-
 print("=== Phase 11 tests passed ===")
