@@ -59,7 +59,6 @@ Rustthon loads and runs real-world C extensions from PyPI. This works in three m
 | Extension | Type | Tests |
 |-----------|------|-------|
 | markupsafe 3.0.3 | Self-built | 18/18 pass |
-| ujson 5.11.0 | Self-built | 48/48 pass |
 | markupsafe 3.0.3 | Prebuilt wheel | 18/18 pass |
 | ujson 5.11.0 | Prebuilt wheel | 68/68 pass |
 | pyyaml 6.0.2 (Cython) | Prebuilt wheel | 14/14 pass |
@@ -195,7 +194,6 @@ build.rs                # cc crate build script for varargs.c
 | `test_gc_torture.c` | 109 | GC headers, cycle collection, allocator |
 | `test_ext_driver.c` | 49 | Full C API protocol |
 | `test_markupsafe.c` | 18 | Self-compiled markupsafe |
-| `test_ujson.c` | 48 | Self-compiled ujson |
 | `test_prebuilt.c` | 68 | Prebuilt pip wheel `.so` files |
 | `test_cython.c` | 20 | Cython-compiled extension |
 | `test_bcrypt.c` | 10 | PyO3 bcrypt extension |

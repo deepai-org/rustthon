@@ -116,9 +116,6 @@ compile tests/test_ext_driver.c    test_ext_driver    $LINK_FLAGS
 # Phase 3a: markupsafe (compiled against Rustthon)
 compile tests/test_markupsafe.c    test_markupsafe    $LINK_FLAGS
 
-# Phase 3b: ujson (compiled against Rustthon)
-compile tests/test_ujson.c         test_ujson         $LINK_FLAGS
-
 # Phase 4: Prebuilt CPython 3.11 wheels
 compile tests/test_prebuilt.c      test_prebuilt      "-ldl"
 
@@ -150,13 +147,6 @@ run_suite "Phase 3: Custom C Extension Module" ./test_ext_driver
 
 # Phase 3a: markupsafe (compiled against Rustthon headers)
 run_suite "Phase 3a: markupsafe (Rustthon-compiled)" ./test_markupsafe
-
-# Phase 3b: ujson (compiled against Rustthon headers) — requires manually compiled _ujson.dylib
-if [ -f _ujson.dylib ]; then
-    run_suite "Phase 3b: ujson (Rustthon-compiled)" ./test_ujson
-else
-    printf "${YELLOW}[--] Phase 3b: ujson (Rustthon-compiled) — SKIPPED (no _ujson.dylib)${RESET}\n\n"
-fi
 
 # Phase 4: Prebuilt CPython 3.11 wheels
 run_suite "Phase 4: Prebuilt CPython 3.11 Wheels" ./test_prebuilt

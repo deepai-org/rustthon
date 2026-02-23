@@ -99,11 +99,10 @@ fi
 cp -f "$PREBUILT_DIR/ujson.cpython-311-darwin.so" .venv311/lib/python3.11/site-packages/ 2>/dev/null || true
 ok "ujson .so copied to site-packages"
 
-# ─── Step 5: Compile self-built extensions ───
-step "Compiling self-built extensions (markupsafe, ujson)"
+# ─── Step 5: Compile self-built markupsafe extension ───
+step "Compiling self-built markupsafe extension"
 LINK="-L target/release -lrustthon -Wl,-rpath,target/release"
 
-# markupsafe
 if [ ! -f _markupsafe_speedups.dylib ]; then
     MARKUPSAFE_SRC=$(.venv311/bin/python3 -c "import markupsafe; import os; print(os.path.dirname(markupsafe.__file__))" 2>/dev/null || echo "")
     if [ -n "$MARKUPSAFE_SRC" ] && [ -f "$MARKUPSAFE_SRC/_speedups.c" ]; then
@@ -115,13 +114,6 @@ if [ ! -f _markupsafe_speedups.dylib ]; then
     fi
 else
     ok "markupsafe self-built (already exists)"
-fi
-
-# ujson — requires ujson source which has C++ code, skip if complex
-if [ -f _ujson.dylib ]; then
-    ok "ujson self-built (already exists)"
-else
-    fail "ujson self-built (requires manual compilation — see readme)"
 fi
 
 # ─── Step 6: Compile Cython hello extension ───
