@@ -258,3 +258,24 @@ cc -o rustthon_bin csrc/main.c -ldl
 # Run the REPL
 ./rustthon_bin
 ```
+
+### Prerequisites
+
+- **Rust** (stable, edition 2021)
+- **Python 3.11** (`python3.11` on PATH) — needed for venv, pip, Cython include headers
+- **Xcode command-line tools** (`cc`, `ld`) — for compiling C test drivers and extensions
+- **pip** — used via `.venv311/bin/pip` to download prebuilt wheels
+
+### Troubleshooting
+
+**`symbol not found in flat namespace`** — A prebuilt `.so` references a CPython API function we haven't implemented yet. Check which symbol with `nm -u <file>.so | grep _Py`, then add a stub to the appropriate file in `src/`. Most stubs are trivial (return 0 or NULL).
+
+**Cython extension fails at `__Pyx_InitConstants`** — Cython 3.x compresses its string table with zlib by default. We compile with `-DCYTHON_COMPRESS_STRINGS=0` to disable this. If you regenerate a Cython `.c` file, make sure to compile it with this flag.
+
+**`dlopen` can't find `librustthon.dylib`** — The thin binary shim and test drivers expect `librustthon.dylib` at `target/release/librustthon.dylib`. Make sure you ran `cargo build --release` (not debug). Test drivers compiled with `$LINK_FLAGS` use `-Wl,-rpath,target/release` to find it.
+
+**macOS binary/dylib split-brain** — Never compile a Rust binary (`[[bin]]`) alongside the cdylib. Static globals end up at different addresses in the binary vs dylib, causing `Py_TYPE(obj) == &PyFloat_Type` to fail. The thin C shim (`csrc/main.c`) avoids this by `dlopen`ing the dylib so there's exactly one copy of every global.
+
+**ujson self-built test skipped** — `_ujson.dylib` requires compiling ujson's C++ source (double-conversion library) against Rustthon headers. This is a manual step not automated by `setup_tests.sh`. The prebuilt ujson wheel test (Phase 4) covers the same functionality.
+
+**Debug output** — The VM currently has `eprintln!` debug statements (prefixed with `[DEBUG]`) in `src/vm/interpreter.rs`. These print to stderr and don't affect test results. They'll be cleaned up in a future pass.
