@@ -78,6 +78,9 @@ pub struct RustFunction {
     pub name: String,
     /// Cell map for closures — shared with enclosing/inner functions via Rc.
     pub cells: Option<CellMap>,
+    /// The class in which this function was defined (set by __build_class__).
+    /// Used by super() to determine __class__.
+    pub defining_class: Option<*mut RawPyTypeObject>,
 }
 
 /// A user-defined Python class (VM-internal representation).
@@ -105,6 +108,21 @@ pub struct RustInstance {
     pub attrs: HashMap<String, PyObjectRef>,
 }
 
+/// Super proxy for super() calls.
+/// Stored as a Box<SuperProxy> pointer encoded with INSTANCE_TAG.
+/// Distinguished from RustInstance by magic field.
+#[repr(C)]
+pub struct SuperProxy {
+    /// Magic number to distinguish from RustInstance (which starts with a *mut RawPyTypeObject)
+    pub magic: usize,
+    /// The class from which to start MRO search (the class AFTER __class__ in MRO)
+    pub start_class: *mut RawPyTypeObject,
+    /// The instance (self) to bind methods to
+    pub instance: PyObjectRef,
+}
+
+const SUPER_PROXY_MAGIC: usize = 0xDEAD_BEEF_5050_5050;
+
 // Tag bits to distinguish class/instance/function pointers stored as int markers.
 // We use the high bits of the i64 value:
 // - Functions: stored as-is (heap pointers, always positive, low bits)
@@ -118,13 +136,13 @@ const TAG_MASK: i64 = 3i64 << 62;
 const PTR_MASK: i64 = !TAG_MASK;
 
 fn is_class_marker(val: i64) -> bool { val & TAG_MASK == CLASS_TAG }
-fn is_instance_marker(val: i64) -> bool { val & TAG_MASK == INSTANCE_TAG }
+pub(crate) fn is_instance_marker(val: i64) -> bool { val & TAG_MASK == INSTANCE_TAG }
 fn is_bound_method_marker(val: i64) -> bool { val & TAG_MASK == BOUND_METHOD_TAG }
 /// A function marker is a positive untagged int that looks like a heap pointer.
 /// Heap pointers on modern systems are > 4096 (page size). We use a conservative
 /// threshold to avoid false positives from small integer class variables.
 fn is_function_marker(val: i64) -> bool { val > 4096 && val & TAG_MASK == 0 }
-fn extract_ptr(val: i64) -> usize { (val & PTR_MASK) as usize }
+pub(crate) fn extract_ptr(val: i64) -> usize { (val & PTR_MASK) as usize }
 
 /// A bound builtin method: self_obj + method name
 struct BoundBuiltinMethod {
@@ -220,9 +238,24 @@ unsafe fn create_vm_type(
     *name_buf.add(name_bytes.len()) = 0;
     (*tp).tp_name = name_buf as *const c_char;
 
-    // Set basic sizes matching _Rustthon_CreateStubType: 16B PyObject + 8B dict ptr = 24B
-    (*tp).tp_basicsize = 24;
-    (*tp).tp_dictoffset = 16;
+    // Set basic sizes: check if any base has a larger basicsize
+    let mut max_basicsize: isize = 24; // minimum: 16B PyObject + 8B dict ptr
+    let mut inherited_dictoffset: isize = 16; // default: right after PyObject header
+    for &base in bases {
+        if !base.is_null() && (*base).tp_basicsize > max_basicsize {
+            max_basicsize = (*base).tp_basicsize;
+        }
+        if !base.is_null() && (*base).tp_dictoffset > 0 {
+            inherited_dictoffset = (*base).tp_dictoffset;
+        }
+    }
+    if inherited_dictoffset == 16 && max_basicsize > 24 {
+        // Base has no dictoffset: append dict pointer after base data
+        inherited_dictoffset = max_basicsize;
+        max_basicsize += 8; // room for dict pointer
+    }
+    (*tp).tp_basicsize = max_basicsize;
+    (*tp).tp_dictoffset = inherited_dictoffset;
     (*tp).tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
         | crate::object::typeobj::PY_TPFLAGS_BASETYPE;
 
@@ -242,6 +275,10 @@ unsafe fn create_vm_type(
 
     // Call PyType_Ready to inherit slots from base
     crate::object::typeobj::PyType_Ready(tp);
+
+    // Set tp_init so C code can create instances via type_call
+    // (e.g., CParser creating MappingNode objects during parsing)
+    (*tp).tp_init = Some(crate::object::typeobj::vm_tp_init);
 
     // Populate tp_dict with namespace entries
     let dict = (*tp).tp_dict;
@@ -391,6 +428,45 @@ unsafe fn is_subtype_of(tp: *mut RawPyTypeObject, target: *mut RawPyTypeObject) 
     false
 }
 
+/// Check if a VM type has a C base (a base type that doesn't have __vm_globals__).
+/// This means the type needs real C object allocation via tp_new.
+unsafe fn has_c_base(tp: *mut RawPyTypeObject) -> bool {
+    if tp.is_null() { return false; }
+    let bases = (*tp).tp_bases;
+    if !bases.is_null() && crate::types::tuple::PyTuple_Check(bases) != 0 {
+        let n = crate::types::tuple::PyTuple_Size(bases);
+        for i in 0..n {
+            let base = crate::types::tuple::PyTuple_GetItem(bases, i) as *mut RawPyTypeObject;
+            if base.is_null() || base == PyBaseObject_Type.get() { continue; }
+            // A C base: doesn't have __vm_globals__ in tp_dict
+            let vm_key = crate::types::dict::PyDict_GetItemString(
+                (*base).tp_dict,
+                b"__vm_globals__\0".as_ptr() as *const c_char,
+            );
+            if vm_key.is_null() {
+                return true;
+            }
+            // Recurse: a VM base might itself have a C base
+            if has_c_base(base) {
+                return true;
+            }
+        }
+    } else {
+        let base = (*tp).tp_base;
+        if !base.is_null() && base != PyBaseObject_Type.get() {
+            let vm_key = crate::types::dict::PyDict_GetItemString(
+                (*base).tp_dict,
+                b"__vm_globals__\0".as_ptr() as *const c_char,
+            );
+            if vm_key.is_null() {
+                return true;
+            }
+            return has_c_base(base);
+        }
+    }
+    false
+}
+
 /// Result of resuming a generator frame
 enum GeneratorResult {
     Yielded(PyObjectRef),
@@ -468,8 +544,14 @@ impl VM {
             };
             frame.builtins.insert(name.to_string(), obj);
         }
-        // Register classmethod/staticmethod/property as passthrough decorators
-        for &decorator_name in &["classmethod", "staticmethod", "property"] {
+        // Register classmethod with proper tagging, staticmethod/property as passthrough
+        {
+            let obj = unsafe {
+                PyObjectRef::from_raw(create_builtin_function("classmethod", builtin_classmethod))
+            };
+            frame.builtins.insert("classmethod".to_string(), obj);
+        }
+        for &decorator_name in &["staticmethod", "property"] {
             let obj = unsafe {
                 PyObjectRef::from_raw(create_builtin_function(decorator_name, builtin_identity))
             };
@@ -492,7 +574,9 @@ impl VM {
             }
         }
         // Register super and NotImplemented as None placeholders for now
-        frame.builtins.insert("super".to_string(), none_obj(_py));
+        frame.builtins.insert("super".to_string(), unsafe {
+            PyObjectRef::from_raw(create_builtin_function("super", builtin_super_stub))
+        });
         frame.builtins.insert("NotImplemented".to_string(), none_obj(_py));
 
         // Register exception types as builtins
@@ -946,6 +1030,7 @@ impl VM {
                             defaults,
                             name: func_name,
                             cells,
+                            defining_class: None,
                         };
                         let func_box = Box::new(rust_func);
                         let func_ptr = Box::into_raw(func_box);
@@ -1024,7 +1109,11 @@ impl VM {
 
                 // ─── Import ───
                 OpCode::ImportName => {
-                    let name = frame.code.names[instr.arg as usize].clone();
+                    // High bit (bit 31) = "return top-level for dotted names"
+                    // (set by compile_import, NOT set by compile_import_from)
+                    let return_top_level = (instr.arg & (1u32 << 31)) != 0;
+                    let name_idx = (instr.arg & !(1u32 << 31)) as usize;
+                    let name = frame.code.names[name_idx].clone();
                     // Try C API import first (for .so extensions)
                     let module = match py_import(py, &name) {
                         Ok(module) => module,
@@ -1034,29 +1123,67 @@ impl VM {
                         }
                     };
 
-                    // For dotted names like "yaml.loader", also bind the submodule
-                    // as an attribute of the parent package (CPython behavior).
-                    if let Some(dot_pos) = name.rfind('.') {
-                        let parent_name = &name[..dot_pos];
-                        let child_name = &name[dot_pos + 1..];
-                        // Try to find the parent module in cache
-                        if let Some(parent_mod) = PY_MODULE_CACHE.lock().unwrap().get(parent_name).cloned() {
-                            unsafe {
-                                // Get the module's dict — works for both PyModule objects and raw dicts
-                                let parent_dict = crate::types::moduleobject::PyModule_GetDict(parent_mod.as_raw());
-                                if !parent_dict.is_null() {
-                                    let key = std::ffi::CString::new(child_name).unwrap();
-                                    crate::types::dict::PyDict_SetItemString(
-                                        parent_dict,
-                                        key.as_ptr(),
-                                        module.as_raw(),
-                                    );
-                                }
+                    // For dotted names like "collections.abc", ensure all
+                    // parent modules are imported and bind child as attribute
+                    // of parent.
+                    if name.contains('.') {
+                        let parts: Vec<&str> = name.split('.').collect();
+                        // Ensure all ancestor modules exist in cache.
+                        let mut accumulated = String::new();
+                        let mut modules_by_level: Vec<PyObjectRef> = Vec::new();
+                        for (i, part) in parts.iter().enumerate() {
+                            if i > 0 { accumulated.push('.'); }
+                            accumulated.push_str(part);
+                            if i < parts.len() - 1 {
+                                // Parent levels: import if not already cached
+                                let cached = PY_MODULE_CACHE.lock().unwrap().get(&accumulated).cloned();
+                                let parent_mod = if let Some(m) = cached {
+                                    m
+                                } else {
+                                    // Import the parent module
+                                    match py_import(py, &accumulated) {
+                                        Ok(m) => m,
+                                        Err(_) => self.import_py_source(py, frame, &accumulated)?
+                                    }
+                                };
+                                modules_by_level.push(parent_mod);
+                            } else {
+                                // Leaf level: already imported as `module`
+                                modules_by_level.push(module.clone());
                             }
                         }
+                        // Bind each child module as attribute of its parent
+                        for i in 0..modules_by_level.len() - 1 {
+                            let parent_mod = &modules_by_level[i];
+                            let child_mod = &modules_by_level[i + 1];
+                            let child_name = parts[i + 1];
+                            unsafe {
+                                let parent_dict = crate::types::moduleobject::PyModule_GetDict(parent_mod.as_raw());
+                                let parent_dict = if !parent_dict.is_null() {
+                                    parent_dict
+                                } else if crate::types::dict::PyDict_Check(parent_mod.as_raw()) != 0 {
+                                    parent_mod.as_raw()
+                                } else {
+                                    continue;
+                                };
+                                let key = std::ffi::CString::new(child_name).unwrap();
+                                crate::types::dict::PyDict_SetItemString(
+                                    parent_dict,
+                                    key.as_ptr(),
+                                    child_mod.as_raw(),
+                                );
+                            }
+                        }
+                        if return_top_level {
+                            // `import a.b.c` → push top-level "a" module
+                            frame.push(modules_by_level.into_iter().next().unwrap());
+                        } else {
+                            // `from a.b.c import X` → push leaf module
+                            frame.push(module);
+                        }
+                    } else {
+                        frame.push(module);
                     }
-
-                    frame.push(module);
                 }
 
                 OpCode::ImportFrom => {
@@ -1198,28 +1325,128 @@ impl VM {
                             } else {
                                 let val = type_dict_lookup(tp, &name);
                                 if !val.is_null() {
-                                    // If it's a function, bind the class as first arg
-                                    if is_int(val) && is_function_marker(get_int_value(val)) {
-                                        (*val).incref();
-                                        let val_ref = PyObjectRef::from_raw(val);
-                                        let bound = build_tuple(py, vec![val_ref, obj.clone()])?;
-                                        frame.push(bound);
+                                    if is_int(val) {
+                                        let ival = get_int_value(val);
+                                        if is_class_marker(ival) || is_function_marker(ival) {
+                                            // VM function (classmethod or regular): bind the type
+                                            // For classmethod: cls will be prepended as first arg
+                                            // For regular: type is used for globals only, NOT prepended
+                                            (*val).incref();
+                                            let val_ref = PyObjectRef::from_raw(val);
+                                            let bound = build_tuple(py, vec![val_ref, obj.clone()])?;
+                                            frame.push(bound);
+                                        } else {
+                                            // Other int value (class variable, etc.)
+                                            (*val).incref();
+                                            frame.push(PyObjectRef::from_raw(val));
+                                        }
                                     } else {
-                                        (*val).incref();
-                                        frame.push(PyObjectRef::from_raw(val));
+                                        // Check for descriptor protocol (C method descriptors)
+                                        let val_tp = (*val).ob_type;
+                                        if !val_tp.is_null() {
+                                            if let Some(descr_get) = (*val_tp).tp_descr_get {
+                                                let bound = descr_get(val, ptr::null_mut(), tp as *mut RawPyObject);
+                                                if !bound.is_null() {
+                                                    frame.push(PyObjectRef::from_raw(bound));
+                                                } else {
+                                                    crate::runtime::error::PyErr_Clear();
+                                                    (*val).incref();
+                                                    frame.push(PyObjectRef::from_raw(val));
+                                                }
+                                            } else {
+                                                (*val).incref();
+                                                frame.push(PyObjectRef::from_raw(val));
+                                            }
+                                        } else {
+                                            (*val).incref();
+                                            frame.push(PyObjectRef::from_raw(val));
+                                        }
+                                    }
+                                } else if name == "__init__" {
+                                    // For C types: wrap tp_init as __init__
+                                    if let Some(_) = (*tp).tp_init {
+                                        let wrapper = create_tp_init_wrapper(tp);
+                                        crate::types::dict::PyDict_SetItemString(
+                                            (*tp).tp_dict,
+                                            b"__init__\0".as_ptr() as *const c_char,
+                                            wrapper,
+                                        );
+                                        frame.push(PyObjectRef::from_raw(wrapper));
+                                    } else {
+                                        return Err(PyErr::attribute_error(&format!(
+                                            "type object '{}' has no attribute '{}'",
+                                            type_name(tp), name
+                                        )));
                                     }
                                 } else {
-                                    return Err(PyErr::attribute_error(&format!(
-                                        "type object '{}' has no attribute '{}'",
-                                        type_name(tp), name
-                                    )));
+                                    // Try C API (for types with tp_getattro)
+                                    match py_get_attr(py, &obj, &name) {
+                                        Ok(attr) => frame.push(attr),
+                                        Err(_) => {
+                                            return Err(PyErr::attribute_error(&format!(
+                                                "type object '{}' has no attribute '{}'",
+                                                type_name(tp), name
+                                            )));
+                                        }
+                                    }
                                 }
                             }
                         }
                     } else if is_int(obj.as_raw()) {
                         let marker_val = get_int_value(obj.as_raw());
                         if is_instance_marker(marker_val) {
-                            let inst = unsafe { &*(extract_ptr(marker_val) as *const RustInstance) };
+                            // Check if this is a SuperProxy
+                            let raw_ptr = extract_ptr(marker_val);
+                            let maybe_magic = unsafe { *(raw_ptr as *const usize) };
+                            if maybe_magic == SUPER_PROXY_MAGIC {
+                                let proxy = unsafe { &*(raw_ptr as *const SuperProxy) };
+                                // Look up name in start_class and its bases
+                                let class_val = unsafe { type_dict_lookup(proxy.start_class, &name) };
+                                if !class_val.is_null() {
+                                    unsafe {
+                                        if is_int(class_val) {
+                                            let cv = get_int_value(class_val);
+                                            if is_class_marker(cv) || is_function_marker(cv) {
+                                                // Method found: bind to the original instance
+                                                (*class_val).incref();
+                                                let val_ref = PyObjectRef::from_raw(class_val);
+                                                let bound = build_tuple(py, vec![val_ref, proxy.instance.clone()])?;
+                                                frame.push(bound);
+                                            } else {
+                                                (*class_val).incref();
+                                                frame.push(PyObjectRef::from_raw(class_val));
+                                            }
+                                        } else {
+                                            // Descriptor protocol for C methods
+                                            let descr_tp = (*class_val).ob_type;
+                                            if !descr_tp.is_null() {
+                                                if let Some(descr_get) = (*descr_tp).tp_descr_get {
+                                                    let bound = descr_get(class_val, proxy.instance.as_raw(), proxy.start_class as *mut RawPyObject);
+                                                    if !bound.is_null() {
+                                                        frame.push(PyObjectRef::from_raw(bound));
+                                                    } else {
+                                                        crate::runtime::error::PyErr_Clear();
+                                                        (*class_val).incref();
+                                                        frame.push(PyObjectRef::from_raw(class_val));
+                                                    }
+                                                } else {
+                                                    (*class_val).incref();
+                                                    frame.push(PyObjectRef::from_raw(class_val));
+                                                }
+                                            } else {
+                                                (*class_val).incref();
+                                                frame.push(PyObjectRef::from_raw(class_val));
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    return Err(PyErr::attribute_error(&format!(
+                                        "'super' object has no attribute '{}'", name
+                                    )));
+                                }
+                            } else {
+                            // Regular RustInstance
+                            let inst = unsafe { &*(raw_ptr as *const RustInstance) };
                             // Look in instance attrs first, then class tp_dict
                             if let Some(val) = inst.attrs.get(&name) {
                                 frame.push(val.clone());
@@ -1227,12 +1454,26 @@ impl VM {
                                 unsafe {
                                     let class_val = type_dict_lookup(inst.class, &name);
                                     if !class_val.is_null() {
-                                        // If it's a method (function), create a bound method
-                                        if is_int(class_val) && is_function_marker(get_int_value(class_val)) {
-                                            (*class_val).incref();
-                                            let val_ref = PyObjectRef::from_raw(class_val);
-                                            let bound = build_tuple(py, vec![val_ref, obj.clone()])?;
-                                            frame.push(bound);
+                                        if is_int(class_val) {
+                                            let cv = get_int_value(class_val);
+                                            if is_class_marker(cv) {
+                                                // @classmethod: keep CLASS_TAG so call_function knows to prepend cls
+                                                (*class_val).incref();
+                                                let val_ref = PyObjectRef::from_raw(class_val);
+                                                (*(inst.class as *mut RawPyObject)).incref();
+                                                let class_ref = PyObjectRef::from_raw(inst.class as *mut RawPyObject);
+                                                let bound = build_tuple(py, vec![val_ref, class_ref])?;
+                                                frame.push(bound);
+                                            } else if is_function_marker(cv) {
+                                                // Regular method: bind the instance
+                                                (*class_val).incref();
+                                                let val_ref = PyObjectRef::from_raw(class_val);
+                                                let bound = build_tuple(py, vec![val_ref, obj.clone()])?;
+                                                frame.push(bound);
+                                            } else {
+                                                (*class_val).incref();
+                                                frame.push(PyObjectRef::from_raw(class_val));
+                                            }
                                         } else {
                                             (*class_val).incref();
                                             frame.push(PyObjectRef::from_raw(class_val));
@@ -1245,6 +1486,7 @@ impl VM {
                                     }
                                 }
                             }
+                            } // close else (regular RustInstance vs SuperProxy)
                         } else if is_regex_marker(marker_val) && (is_regex_method(&name) || name == "pattern") {
                             if name == "pattern" {
                                 // .pattern is a property, not a method
@@ -1290,25 +1532,106 @@ impl VM {
                             let marker = new_int(py, bm_ptr | BOUND_METHOD_TAG)?;
                             frame.push(marker);
                         } else {
-                            // Non-int object — use C API
-                            let attr = py_get_attr(py, &obj, &name)
-                                .or_else(|_| {
-                                    unsafe {
-                                        if crate::types::dict::PyDict_Check(obj.as_raw()) != 0 {
+                            // Check if obj's type is a VM type (real C object with VM type)
+                            let obj_type = unsafe { (*raw).ob_type };
+                            let is_vm_type_instance = !obj_type.is_null() && unsafe {
+                                !type_dict_lookup_cstr(obj_type,
+                                    b"__vm_globals__\0".as_ptr() as *const c_char).is_null()
+                            };
+
+                            if is_vm_type_instance {
+                                // VM type instance on a real C object
+                                unsafe {
+                                    // 1. Check instance __dict__ at tp_dictoffset
+                                    let offset = (*obj_type).tp_dictoffset;
+                                    let mut found = false;
+                                    if offset > 0 {
+                                        let dict_ptr = (raw as *mut u8).add(offset as usize) as *mut *mut RawPyObject;
+                                        let dict = *dict_ptr;
+                                        if !dict.is_null() {
                                             let name_cstr = std::ffi::CString::new(name.as_str()).unwrap();
-                                            let item = crate::types::dict::PyDict_GetItemString(
-                                                obj.as_raw(),
-                                                name_cstr.as_ptr(),
-                                            );
-                                            PyObjectRef::borrow_or_err(item)
-                                        } else {
-                                            Err(PyErr::attribute_error(&format!(
-                                                "object has no attribute '{}'", name
-                                            )))
+                                            let item = crate::types::dict::PyDict_GetItemString(dict, name_cstr.as_ptr());
+                                            if !item.is_null() {
+                                                (*item).incref();
+                                                frame.push(PyObjectRef::from_raw(item));
+                                                found = true;
+                                            }
                                         }
                                     }
-                                })?;
-                            frame.push(attr);
+                                    if !found {
+                                        // 2. Search type hierarchy via type_dict_lookup
+                                        let class_val = type_dict_lookup(obj_type, &name);
+                                        if !class_val.is_null() {
+                                            if is_int(class_val) {
+                                                let cv = get_int_value(class_val);
+                                                if is_class_marker(cv) {
+                                                    // @classmethod: keep CLASS_TAG, bind the class
+                                                    (*class_val).incref();
+                                                    let val_ref = PyObjectRef::from_raw(class_val);
+                                                    (*(obj_type as *mut RawPyObject)).incref();
+                                                    let class_ref = PyObjectRef::from_raw(obj_type as *mut RawPyObject);
+                                                    let bound = build_tuple(py, vec![val_ref, class_ref])?;
+                                                    frame.push(bound);
+                                                } else if is_function_marker(cv) {
+                                                    // Regular method → bind instance
+                                                    (*class_val).incref();
+                                                    let val_ref = PyObjectRef::from_raw(class_val);
+                                                    let bound = build_tuple(py, vec![val_ref, obj.clone()])?;
+                                                    frame.push(bound);
+                                                } else {
+                                                    (*class_val).incref();
+                                                    frame.push(PyObjectRef::from_raw(class_val));
+                                                }
+                                            } else {
+                                                // Check descriptor protocol (C method descriptors)
+                                                let descr_tp = (*class_val).ob_type;
+                                                if !descr_tp.is_null() {
+                                                    if let Some(descr_get) = (*descr_tp).tp_descr_get {
+                                                        let bound = descr_get(class_val, raw, obj_type as *mut RawPyObject);
+                                                        if !bound.is_null() {
+                                                            frame.push(PyObjectRef::from_raw(bound));
+                                                        } else {
+                                                            crate::runtime::error::PyErr_Clear();
+                                                            (*class_val).incref();
+                                                            frame.push(PyObjectRef::from_raw(class_val));
+                                                        }
+                                                    } else {
+                                                        (*class_val).incref();
+                                                        frame.push(PyObjectRef::from_raw(class_val));
+                                                    }
+                                                } else {
+                                                    (*class_val).incref();
+                                                    frame.push(PyObjectRef::from_raw(class_val));
+                                                }
+                                            }
+                                        } else {
+                                            // Fall through to C API
+                                            let attr = py_get_attr(py, &obj, &name)?;
+                                            frame.push(attr);
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Non-int object — use C API
+                                let attr = py_get_attr(py, &obj, &name)
+                                    .or_else(|_| {
+                                        unsafe {
+                                            if crate::types::dict::PyDict_Check(obj.as_raw()) != 0 {
+                                                let name_cstr = std::ffi::CString::new(name.as_str()).unwrap();
+                                                let item = crate::types::dict::PyDict_GetItemString(
+                                                    obj.as_raw(),
+                                                    name_cstr.as_ptr(),
+                                                );
+                                                PyObjectRef::borrow_or_err(item)
+                                            } else {
+                                                Err(PyErr::attribute_error(&format!(
+                                                    "object has no attribute '{}'", name
+                                                )))
+                                            }
+                                        }
+                                    })?;
+                                frame.push(attr);
+                            }
                         }
                     }
                 }
@@ -1696,57 +2019,50 @@ impl VM {
                     let self_item = crate::types::tuple::PyTuple_GetItem(func.as_raw(), 1);
                     if !func_item.is_null() && is_int(func_item) && !self_item.is_null() {
                         let func_val = get_int_value(func_item);
-                        if is_function_marker(func_val) {
-                            // Bound method call — prepend self
-                            (*self_item).incref();
-                            let self_obj = PyObjectRef::from_raw(self_item);
-                            let mut bound_args = vec![self_obj];
-                            bound_args.extend_from_slice(args);
+                        // Check for classmethod (CLASS_TAG) or regular function
+                        let (real_func_val, is_classmethod) = if is_class_marker(func_val) {
+                            (extract_ptr(func_val) as i64, true)
+                        } else if is_function_marker(func_val) {
+                            (func_val, false)
+                        } else {
+                            (0i64, false)
+                        };
+                        if real_func_val > 4096 {
+                            let rust_func = &*(real_func_val as usize as *const RustFunction);
 
-                            let rust_func = &*(func_val as usize as *const RustFunction);
-                            // Use class globals for method execution
-                            let self_marker = get_int_value(self_item);
-                            if is_instance_marker(self_marker) {
-                                let inst = &*(extract_ptr(self_marker) as *const RustInstance);
-                                let class_name = type_name(inst.class);
-                                // Create a caller frame with class globals
-                                let mut method_frame = Frame::new(CodeObject::new("<method>".to_string(), "<method>".to_string()));
-                                method_frame.globals = extract_vm_globals(inst.class);
-                                // Add class name to globals
-                                (*(inst.class as *mut RawPyObject)).incref();
-                                method_frame.globals.insert(class_name, PyObjectRef::from_raw(inst.class as *mut RawPyObject));
-                                for (k, v) in &caller_frame.locals {
-                                    if !method_frame.globals.contains_key(k) {
-                                        method_frame.globals.insert(k.clone(), v.clone());
-                                    }
+                            // Build args: for instance/classmethod → prepend self_item
+                            // For type-level regular method → don't prepend (caller passes self explicitly)
+                            let bound_args = if is_type_object(self_item) && !is_classmethod {
+                                // Type.regular_method(args) → args passed as-is
+                                args.to_vec()
+                            } else {
+                                // instance.method(args) OR Type.classmethod(args) → prepend self_item
+                                (*self_item).incref();
+                                let self_obj = PyObjectRef::from_raw(self_item);
+                                let mut ba = vec![self_obj];
+                                ba.extend_from_slice(args);
+                                ba
+                            };
+
+                            // Find globals/builtins from the context object
+                            if is_int(self_item) {
+                                let self_marker = get_int_value(self_item);
+                                if is_instance_marker(self_marker) {
+                                    let inst = &*(extract_ptr(self_marker) as *const RustInstance);
+                                    let method_frame = self.build_class_frame(py, caller_frame, inst.class);
+                                    return self.call_rust_function(py, &method_frame, rust_func, &bound_args, &HashMap::new());
                                 }
-                                for (k, v) in &caller_frame.globals {
-                                    if !method_frame.globals.contains_key(k) {
-                                        method_frame.globals.insert(k.clone(), v.clone());
-                                    }
-                                }
-                                method_frame.builtins = extract_vm_builtins(inst.class);
-                                return self.call_rust_function(py, &method_frame, rust_func, &bound_args, &HashMap::new());
                             }
-                            // self might be a type object (class method call)
                             if is_type_object(self_item) {
                                 let tp = self_item as *mut RawPyTypeObject;
-                                let class_name = type_name(tp);
-                                let mut method_frame = Frame::new(CodeObject::new("<method>".to_string(), "<method>".to_string()));
-                                method_frame.globals = extract_vm_globals(tp);
-                                (*(tp as *mut RawPyObject)).incref();
-                                method_frame.globals.insert(class_name, PyObjectRef::from_raw(tp as *mut RawPyObject));
-                                for (k, v) in &caller_frame.locals {
-                                    if !method_frame.globals.contains_key(k) {
-                                        method_frame.globals.insert(k.clone(), v.clone());
-                                    }
-                                }
-                                for (k, v) in &caller_frame.globals {
-                                    if !method_frame.globals.contains_key(k) {
-                                        method_frame.globals.insert(k.clone(), v.clone());
-                                    }
-                                }
-                                method_frame.builtins = extract_vm_builtins(tp);
+                                let method_frame = self.build_class_frame(py, caller_frame, tp);
+                                return self.call_rust_function(py, &method_frame, rust_func, &bound_args, &HashMap::new());
+                            }
+                            // self is a real C object (VM type instance with C base)
+                            let self_type = (*self_item).ob_type;
+                            if !self_type.is_null() && !type_dict_lookup_cstr(self_type,
+                                    b"__vm_globals__\0".as_ptr() as *const c_char).is_null() {
+                                let method_frame = self.build_class_frame(py, caller_frame, self_type);
                                 return self.call_rust_function(py, &method_frame, rust_func, &bound_args, &HashMap::new());
                             }
                             return self.call_rust_function(py, caller_frame, rust_func, &bound_args, &HashMap::new());
@@ -1756,11 +2072,16 @@ impl VM {
             }
         }
 
-        // Check if func is a type object (VM class constructor)
+        // Check if func is a type object (VM class constructor or C type)
         unsafe {
             if is_type_object(func.as_raw()) {
                 let tp = func.as_raw() as *mut RawPyTypeObject;
-                return self.construct_instance(py, caller_frame, tp, args);
+                // Check if this is a VM-created type (has __vm_globals__ in tp_dict)
+                let has_vm = type_dict_lookup_cstr(tp, b"__vm_globals__\0".as_ptr() as *const c_char);
+                if !has_vm.is_null() {
+                    return self.construct_instance(py, caller_frame, tp, args);
+                }
+                // Pure C type → fall through to call_function_raii (type_call → tp_new + tp_init)
             }
         }
 
@@ -1776,16 +2097,18 @@ impl VM {
             }
         }
 
-        // Check if it's a __build_class__ call
+        // Check if it's a __build_class__ or super() call
         unsafe {
             let f = func.as_raw();
             if (*f).ob_type == crate::types::funcobject::cfunction_type() {
-                // Check if this is __build_class__
                 let data = crate::object::pyobject::PyObjectWithData::<crate::types::funcobject::CFunctionData>::data_from_raw(f);
                 if !data.name.is_null() {
                     let name = std::ffi::CStr::from_ptr(data.name);
                     if name.to_bytes() == b"__build_class__" {
                         return self.builtin_build_class(py, caller_frame, args);
+                    }
+                    if name.to_bytes() == b"super" {
+                        return self.builtin_super(py, caller_frame, args);
                     }
                 }
             }
@@ -1804,11 +2127,77 @@ impl VM {
         pos_args: &[PyObjectRef],
         kwargs: &[(String, PyObjectRef)],
     ) -> PyResult {
-        // Check if func is a type object (VM class constructor)
+        // Check for bound method (2-tuple: (func_marker, instance_marker))
+        unsafe {
+            if crate::types::tuple::PyTuple_Check(func.as_raw()) != 0 {
+                let size = crate::types::tuple::PyTuple_Size(func.as_raw());
+                if size == 2 {
+                    let func_item = crate::types::tuple::PyTuple_GetItem(func.as_raw(), 0);
+                    let self_item = crate::types::tuple::PyTuple_GetItem(func.as_raw(), 1);
+                    if !func_item.is_null() && is_int(func_item) && !self_item.is_null() {
+                        let func_val = get_int_value(func_item);
+                        let (real_func_val, is_classmethod) = if is_class_marker(func_val) {
+                            (extract_ptr(func_val) as i64, true)
+                        } else if is_function_marker(func_val) {
+                            (func_val, false)
+                        } else {
+                            (0i64, false)
+                        };
+                        if real_func_val > 4096 {
+                            let rust_func = &*(real_func_val as usize as *const RustFunction);
+                            let kw_map: HashMap<String, PyObjectRef> = kwargs.iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+
+                            // Build args: prepend self unless type-level non-classmethod
+                            let bound_args = if is_type_object(self_item) && !is_classmethod {
+                                pos_args.to_vec()
+                            } else {
+                                (*self_item).incref();
+                                let self_obj = PyObjectRef::from_raw(self_item);
+                                let mut ba = vec![self_obj];
+                                ba.extend_from_slice(pos_args);
+                                ba
+                            };
+
+                            // Find context for call
+                            if is_int(self_item) {
+                                let self_marker = get_int_value(self_item);
+                                if is_instance_marker(self_marker) {
+                                    let inst = &*(extract_ptr(self_marker) as *const RustInstance);
+                                    let method_frame = self.build_class_frame(py, caller_frame, inst.class);
+                                    return self.call_rust_function(py, &method_frame, rust_func, &bound_args, &kw_map);
+                                }
+                            }
+                            if is_type_object(self_item) {
+                                let tp = self_item as *mut RawPyTypeObject;
+                                let method_frame = self.build_class_frame(py, caller_frame, tp);
+                                return self.call_rust_function(py, &method_frame, rust_func, &bound_args, &kw_map);
+                            }
+                            // self is a real C object (VM type instance with C base)
+                            let self_type = (*self_item).ob_type;
+                            if !self_type.is_null() && !type_dict_lookup_cstr(self_type,
+                                    b"__vm_globals__\0".as_ptr() as *const c_char).is_null() {
+                                let method_frame = self.build_class_frame(py, caller_frame, self_type);
+                                return self.call_rust_function(py, &method_frame, rust_func, &bound_args, &kw_map);
+                            }
+                            return self.call_rust_function(py, caller_frame, rust_func, &bound_args, &kw_map);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check if func is a type object (VM class constructor or C type)
         unsafe {
             if is_type_object(func.as_raw()) {
                 let tp = func.as_raw() as *mut RawPyTypeObject;
-                return self.construct_instance(py, caller_frame, tp, pos_args);
+                // Check if this is a VM-created type (has __vm_globals__ in tp_dict)
+                let has_vm = type_dict_lookup_cstr(tp, b"__vm_globals__\0".as_ptr() as *const c_char);
+                if !has_vm.is_null() {
+                    return self.construct_instance(py, caller_frame, tp, pos_args);
+                }
+                // Pure C type → fall through to call_function_raii (type_call → tp_new + tp_init)
             }
         }
 
@@ -1826,7 +2215,7 @@ impl VM {
             }
         }
 
-        // Check __build_class__
+        // Check __build_class__ or super()
         unsafe {
             let f = func.as_raw();
             if (*f).ob_type == crate::types::funcobject::cfunction_type() {
@@ -1835,6 +2224,9 @@ impl VM {
                     let name = std::ffi::CStr::from_ptr(data.name);
                     if name.to_bytes() == b"__build_class__" {
                         return self.builtin_build_class(py, caller_frame, pos_args);
+                    }
+                    if name.to_bytes() == b"super" {
+                        return self.builtin_super(py, caller_frame, pos_args);
                     }
                 }
             }
@@ -1845,7 +2237,7 @@ impl VM {
     }
 
     /// Call a user-defined Rust function
-    fn call_rust_function(
+    pub(crate) fn call_rust_function(
         &mut self,
         py: Python<'_>,
         caller_frame: &Frame,
@@ -1879,6 +2271,17 @@ impl VM {
         for (k, v) in &caller_frame.builtins {
             if !child_frame.builtins.contains_key(k) {
                 child_frame.builtins.insert(k.clone(), v.clone());
+            }
+        }
+
+        // Inject __class__ for super() support
+        if let Some(defining_class) = func.defining_class {
+            unsafe {
+                (*(defining_class as *mut RawPyObject)).incref();
+                child_frame.locals.insert(
+                    "__class__".to_string(),
+                    PyObjectRef::from_raw(defining_class as *mut RawPyObject),
+                );
             }
         }
 
@@ -1982,6 +2385,9 @@ impl VM {
     }
 
     /// Construct an instance of a type object (VM class).
+    /// For VM types with C bases (e.g. CSafeLoader(CParser, SafeConstructor)),
+    /// allocate via tp_new (inherited from C base) so the C memory layout is correct,
+    /// then call the Python __init__ from tp_dict.
     fn construct_instance(
         &mut self,
         py: Python<'_>,
@@ -1989,7 +2395,45 @@ impl VM {
         tp: *mut RawPyTypeObject,
         args: &[PyObjectRef],
     ) -> PyResult {
-        // Create a new RustInstance
+        // Check if this VM type has a C base (a base that is NOT a VM type)
+        let has_c = unsafe { has_c_base(tp) };
+
+        if has_c {
+            // Mixed VM/C type: allocate real C object via tp_new
+            unsafe {
+                let args_tuple = crate::types::tuple::PyTuple_New(args.len() as isize);
+                for (i, arg) in args.iter().enumerate() {
+                    (*arg.as_raw()).incref();
+                    crate::types::tuple::PyTuple_SET_ITEM(args_tuple, i as isize, arg.as_raw());
+                }
+                let new_fn = (*tp).tp_new.unwrap_or(crate::object::typeobj::PyType_GenericNew);
+                let obj = new_fn(tp, args_tuple, ptr::null_mut());
+                (*args_tuple).decref();
+                if obj.is_null() {
+                    return Err(PyErr::type_error(&format!(
+                        "tp_new failed for mixed type '{}'", type_name(tp)
+                    )));
+                }
+                // The object is now a real C allocation. Look for Python __init__ in tp_dict.
+                let init_func = type_dict_lookup(tp, "__init__");
+                if !init_func.is_null() && is_int(init_func) {
+                    let init_val = get_int_value(init_func);
+                    if is_function_marker(init_val) {
+                        (*obj).incref();
+                        let obj_ref = PyObjectRef::from_raw(obj);
+                        let mut init_args = vec![obj_ref];
+                        init_args.extend_from_slice(args);
+
+                        let combined_frame = self.build_class_frame(py, caller_frame, tp);
+                        let rust_func = &*(init_val as usize as *const RustFunction);
+                        let _result = self.call_rust_function(py, &combined_frame, rust_func, &init_args, &HashMap::new())?;
+                    }
+                }
+                return PyObjectRef::steal_or_err(obj);
+            }
+        }
+
+        // Pure VM type: create a RustInstance (tagged int)
         let instance = RustInstance {
             class: tp,
             attrs: HashMap::new(),
@@ -2005,27 +2449,10 @@ impl VM {
             if !init_func.is_null() && is_int(init_func) {
                 let init_val = get_int_value(init_func);
                 if is_function_marker(init_val) {
-                    // Prepend self to args
                     let mut init_args = vec![instance_obj.clone()];
                     init_args.extend_from_slice(args);
 
-                    // Build a temporary frame with class globals
-                    let class_name = type_name(tp);
-                    let mut combined_frame = Frame::new(CodeObject::new("<init>".to_string(), "<init>".to_string()));
-                    combined_frame.globals = extract_vm_globals(tp);
-                    // Add the class itself to globals so methods can reference it
-                    (*tp).ob_base.incref();
-                    combined_frame.globals.insert(class_name, PyObjectRef::from_raw(tp as *mut RawPyObject));
-                    for (k, v) in &caller_frame.locals {
-                        combined_frame.globals.insert(k.clone(), v.clone());
-                    }
-                    for (k, v) in &caller_frame.globals {
-                        if !combined_frame.globals.contains_key(k) {
-                            combined_frame.globals.insert(k.clone(), v.clone());
-                        }
-                    }
-                    combined_frame.builtins = extract_vm_builtins(tp);
-
+                    let combined_frame = self.build_class_frame(py, caller_frame, tp);
                     let rust_func = &*(init_val as usize as *const RustFunction);
                     let _result = self.call_rust_function(py, &combined_frame, rust_func, &init_args, &HashMap::new())?;
                 }
@@ -2033,6 +2460,137 @@ impl VM {
         }
 
         Ok(instance_obj)
+    }
+
+    /// Build a frame with class globals/builtins + caller context for method execution.
+    fn build_class_frame(
+        &self,
+        py: Python<'_>,
+        caller_frame: &Frame,
+        tp: *mut RawPyTypeObject,
+    ) -> Frame {
+        unsafe {
+            let class_name = type_name(tp);
+            let mut combined_frame = Frame::new(CodeObject::new("<init>".to_string(), "<init>".to_string()));
+            combined_frame.globals = extract_vm_globals(tp);
+            (*tp).ob_base.incref();
+            combined_frame.globals.insert(class_name, PyObjectRef::from_raw(tp as *mut RawPyObject));
+            for (k, v) in &caller_frame.locals {
+                combined_frame.globals.insert(k.clone(), v.clone());
+            }
+            for (k, v) in &caller_frame.globals {
+                if !combined_frame.globals.contains_key(k) {
+                    combined_frame.globals.insert(k.clone(), v.clone());
+                }
+            }
+            combined_frame.builtins = extract_vm_builtins(tp);
+            combined_frame
+        }
+    }
+
+    /// super() implementation — creates a SuperProxy.
+    /// super() with no args: finds __class__ and self from caller's frame.
+    /// super(type, obj): explicit class and instance.
+    fn builtin_super(
+        &self,
+        py: Python<'_>,
+        caller_frame: &Frame,
+        args: &[PyObjectRef],
+    ) -> PyResult {
+        unsafe {
+        let (cls, instance) = if args.is_empty() {
+            // super() with no args: find __class__ and self from caller frame
+            let cls_obj = caller_frame.locals.get("__class__")
+                .or_else(|| caller_frame.globals.get("__class__"))
+                .ok_or_else(|| PyErr::runtime_error("super(): __class__ cell not found"))?;
+            if !is_type_object(cls_obj.as_raw()) {
+                return Err(PyErr::runtime_error("super(): __class__ is not a type"));
+            }
+            let cls = cls_obj.as_raw() as *mut RawPyTypeObject;
+
+            // Find 'self' — first positional argument (usually first local)
+            let self_obj = caller_frame.locals.get("self")
+                .ok_or_else(|| PyErr::runtime_error("super(): no self argument found"))?;
+            (cls, self_obj.clone())
+        } else if args.len() == 2 {
+            // super(type, obj)
+            if !is_type_object(args[0].as_raw()) {
+                return Err(PyErr::type_error("super() argument 1 must be a type"));
+            }
+            (args[0].as_raw() as *mut RawPyTypeObject, args[1].clone())
+        } else {
+            return Err(PyErr::type_error("super() takes 0 or 2 arguments"));
+        };
+
+        // Find the MRO-next class after `cls`.
+        // Walk the instance's type MRO (or cls's MRO) to find cls, then use the next one.
+        let inst_type = if is_type_object(instance.as_raw()) {
+            instance.as_raw() as *mut RawPyTypeObject
+        } else if is_int(instance.as_raw()) && is_instance_marker(get_int_value(instance.as_raw())) {
+            let inst = &*(extract_ptr(get_int_value(instance.as_raw())) as *const RustInstance);
+            inst.class
+        } else {
+            (*instance.as_raw()).ob_type
+        };
+
+        // Walk MRO to find the class AFTER cls
+        let start_class = self.find_mro_next(inst_type, cls);
+
+        let proxy = Box::new(SuperProxy {
+            magic: SUPER_PROXY_MAGIC,
+            start_class,
+            instance,
+        });
+        let proxy_ptr = Box::into_raw(proxy) as usize as i64;
+        new_int(py, proxy_ptr | INSTANCE_TAG)
+        }
+    }
+
+    /// Find the next class in the MRO after `target`.
+    unsafe fn find_mro_next(
+        &self,
+        inst_type: *mut RawPyTypeObject,
+        target: *mut RawPyTypeObject,
+    ) -> *mut RawPyTypeObject {
+        // Walk tp_bases chain to build a linearized MRO
+        let mut mro: Vec<*mut RawPyTypeObject> = Vec::new();
+        self.collect_mro(inst_type, &mut mro);
+        // Find target in MRO and return next
+        for (i, &tp) in mro.iter().enumerate() {
+            if tp == target {
+                if i + 1 < mro.len() {
+                    return mro[i + 1];
+                }
+            }
+        }
+        // Fallback: return base if available
+        if !(*inst_type).tp_base.is_null() {
+            return (*inst_type).tp_base;
+        }
+        use crate::object::typeobj::PyBaseObject_Type;
+        PyBaseObject_Type.get() as *mut RawPyTypeObject
+    }
+
+    /// Collect MRO (C3-like) by walking tp_bases in order.
+    unsafe fn collect_mro(
+        &self,
+        tp: *mut RawPyTypeObject,
+        result: &mut Vec<*mut RawPyTypeObject>,
+    ) {
+        if tp.is_null() || result.contains(&tp) {
+            return;
+        }
+        result.push(tp);
+        let bases = (*tp).tp_bases;
+        if !bases.is_null() && crate::types::tuple::PyTuple_Check(bases as *mut RawPyObject) != 0 {
+            let nbases = crate::types::tuple::PyTuple_Size(bases as *mut RawPyObject);
+            for i in 0..nbases {
+                let base = crate::types::tuple::PyTuple_GetItem(bases as *mut RawPyObject, i) as *mut RawPyTypeObject;
+                self.collect_mro(base, result);
+            }
+        } else if !(*tp).tp_base.is_null() {
+            self.collect_mro((*tp).tp_base, result);
+        }
     }
 
     /// __build_class__ implementation — creates a real PyTypeObject.
@@ -2104,6 +2662,20 @@ impl VM {
                         }
                     }
                 }
+                // Collect function pointers from class body (before consuming ns_frame.locals)
+                // Only these should have defining_class set to the new type
+                let mut own_func_ptrs: Vec<usize> = Vec::new();
+                for v in ns_frame.locals.values() {
+                    if is_int(v.as_raw()) {
+                        let val = get_int_value(v.as_raw());
+                        if is_class_marker(val) {
+                            own_func_ptrs.push(extract_ptr(val));
+                        } else if is_function_marker(val) {
+                            own_func_ptrs.push(val as usize);
+                        }
+                    }
+                }
+
                 // Derived class body overrides base methods
                 for (k, v) in ns_frame.locals {
                     merged_ns.insert(k, v);
@@ -2113,6 +2685,18 @@ impl VM {
                 let tp = unsafe {
                     create_vm_type(py, &class_name, &base_tps, &merged_ns, &merged_globals, &caller_frame.builtins)
                 };
+
+                // Set defining_class ONLY on methods defined in this class body
+                unsafe {
+                    for &ptr in &own_func_ptrs {
+                        if ptr > 4096 {
+                            let func = &mut *(ptr as *mut RustFunction);
+                            if func.defining_class.is_none() {
+                                func.defining_class = Some(tp);
+                            }
+                        }
+                    }
+                }
 
                 // Return the type object as a PyObjectRef (no tag bits needed)
                 unsafe {
@@ -2443,7 +3027,12 @@ impl VM {
             "collections.abc" => {
                 let mut p = Vec::new();
                 p.push((new_str(py, "__name__")?, new_str(py, "collections.abc")?));
-                p.push((new_str(py, "Hashable")?, none_obj(py)));
+                // Hashable = object (everything is hashable by default)
+                unsafe {
+                    let obj_tp = crate::object::typeobj::PyBaseObject_Type.get();
+                    (*(obj_tp as *mut RawPyObject)).incref();
+                    p.push((new_str(py, "Hashable")?, PyObjectRef::from_raw(obj_tp as *mut RawPyObject)));
+                }
                 p.push((new_str(py, "Mapping")?, none_obj(py)));
                 p.push((new_str(py, "MutableMapping")?, none_obj(py)));
                 p.push((new_str(py, "Set")?, none_obj(py)));
@@ -2479,7 +3068,13 @@ impl VM {
                 p.push((new_str(py, "__name__")?, new_str(py, "types")?));
                 p.push((new_str(py, "FunctionType")?, none_obj(py)));
                 p.push((new_str(py, "BuiltinFunctionType")?, none_obj(py)));
-                p.push((new_str(py, "GeneratorType")?, none_obj(py)));
+                // GeneratorType: real type object so isinstance(gen, types.GeneratorType) works
+                let gen_tp = unsafe {
+                    let tp = crate::object::typeobj::PyGenerator_Type.get();
+                    (*(tp as *mut RawPyObject)).incref();
+                    PyObjectRef::from_raw(tp as *mut RawPyObject)
+                };
+                p.push((new_str(py, "GeneratorType")?, gen_tp));
                 p.push((new_str(py, "ModuleType")?, none_obj(py)));
                 p.push((new_str(py, "MethodType")?, none_obj(py)));
                 p.push((new_str(py, "SimpleNamespace")?, none_obj(py)));
@@ -2536,6 +3131,18 @@ fn get_iterator(py: Python<'_>, obj: &PyObjectRef) -> PyResult {
                 if !iter.is_null() {
                     return PyObjectRef::steal_or_err(iter);
                 }
+            }
+        }
+    }
+
+    // For dicts, iterate over keys: convert to key list first
+    unsafe {
+        if crate::types::dict::PyDict_Check(raw) != 0 {
+            let keys = crate::types::dict::PyDict_Keys(raw);
+            if !keys.is_null() {
+                let keys_ref = PyObjectRef::steal_or_err(keys)?;
+                let idx = new_int(py, 0)?;
+                return build_tuple(py, vec![keys_ref, idx]);
             }
         }
     }
@@ -3224,6 +3831,10 @@ fn call_function_raii(_py: Python<'_>, func: &PyObjectRef, args: &[PyObjectRef])
                 if let Some(tp_call) = (*tp).tp_call {
                     tp_call(f, args_tuple, ptr::null_mut())
                 } else {
+                    let tp_name = if !(*tp).tp_name.is_null() {
+                        std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy().to_string()
+                    } else { "??".into() };
+                    eprintln!("[call_function_raii] NOT CALLABLE: type={}, f={:p}, nargs={}", tp_name, f, args.len());
                     (*args_tuple).decref();
                     return Err(PyErr::type_error("object is not callable"));
                 }
@@ -3239,7 +3850,7 @@ fn call_function_raii(_py: Python<'_>, func: &PyObjectRef, args: &[PyObjectRef])
 
 // ─── Built-in function implementations ───
 
-/// Identity function — used as placeholder for classmethod/staticmethod/property decorators.
+/// Identity function — used as placeholder for staticmethod/property decorators.
 /// Returns the first argument unchanged.
 unsafe extern "C" fn builtin_identity(
     _self: *mut RawPyObject, args: *mut RawPyObject,
@@ -3249,6 +3860,28 @@ unsafe extern "C" fn builtin_identity(
         (*item).incref();
     }
     item
+}
+
+/// classmethod(func) — wraps a function marker with CLASS_TAG so the VM knows
+/// to auto-pass cls when accessed via type-level attribute lookup.
+unsafe extern "C" fn builtin_classmethod(
+    _self: *mut RawPyObject, args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let item = crate::types::tuple::PyTuple_GetItem(args, 0);
+    if item.is_null() || !is_int(item) {
+        // Non-int arg (e.g. already a C function): return as-is
+        if !item.is_null() { (*item).incref(); }
+        return item;
+    }
+    let val = get_int_value(item);
+    if is_function_marker(val) {
+        // Tag with CLASS_TAG so LoadAttr knows to bind cls
+        let tagged = val | CLASS_TAG;
+        create_int(tagged)
+    } else {
+        (*item).incref();
+        item
+    }
 }
 
 unsafe fn create_builtin_function(
@@ -3265,8 +3898,58 @@ unsafe fn create_builtin_function(
     )
 }
 
+/// tp_init wrapper: PyCFunction that wraps a C type's tp_init slot.
+/// When called as `Type.__init__(instance, *args)`, calls tp_init(instance, args, NULL).
+/// The target type is passed via ml_self.
+unsafe extern "C" fn tp_init_wrapper_fn(
+    target_type: *mut RawPyObject,
+    args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    let tp = target_type as *mut RawPyTypeObject;
+    let nargs = crate::types::tuple::PyTuple_Size(args);
+    if nargs < 1 {
+        return crate::object::safe_api::return_none();
+    }
+    let instance = crate::types::tuple::PyTuple_GetItem(args, 0);
+    // Build args for tp_init (without self)
+    let init_args = crate::types::tuple::PyTuple_New(nargs - 1);
+    for i in 1..nargs {
+        let item = crate::types::tuple::PyTuple_GetItem(args, i);
+        (*item).incref();
+        crate::types::tuple::PyTuple_SetItem(init_args, i - 1, item);
+    }
+    if let Some(init_fn) = (*tp).tp_init {
+        let res = init_fn(instance, init_args, ptr::null_mut());
+        (*init_args).decref();
+        if res < 0 {
+            return ptr::null_mut();
+        }
+    } else {
+        (*init_args).decref();
+    }
+    crate::object::safe_api::return_none()
+}
+
+/// Create a PyCFunction that wraps tp_init for a C type.
+unsafe fn create_tp_init_wrapper(tp: *mut RawPyTypeObject) -> *mut RawPyObject {
+    crate::types::funcobject::create_cfunction(
+        b"__init__\0".as_ptr() as *const c_char,
+        Some(tp_init_wrapper_fn),
+        crate::object::typeobj::METH_VARARGS,
+        tp as *mut RawPyObject, // ml_self carries the target type
+    )
+}
+
 // Stub for __build_class__ — actual work is done in VM::builtin_build_class
 unsafe extern "C" fn builtin_build_class_stub(
+    _self: *mut RawPyObject,
+    _args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    return_none()
+}
+
+// super() stub — actual work is done in VM::call_function
+unsafe extern "C" fn builtin_super_stub(
     _self: *mut RawPyObject,
     _args: *mut RawPyObject,
 ) -> *mut RawPyObject {
@@ -3566,11 +4249,22 @@ unsafe fn isinstance_check(obj: *mut RawPyObject, tp: *mut RawPyObject) -> bool 
     // Type-object-aware isinstance: check if obj is an instance of a VM type
     if is_type_object(tp) {
         let target_tp = tp as *mut RawPyTypeObject;
+
+        // Special case: GeneratorType check for generator markers
+        if target_tp == crate::object::typeobj::PyGenerator_Type.get() {
+            if is_int(obj) {
+                let val = get_int_value(obj);
+                return is_generator_marker(val);
+            }
+            return false;
+        }
+
         // Check if obj is a tagged instance marker
         if is_int(obj) {
             let obj_val = get_int_value(obj);
             if is_instance_marker(obj_val) {
-                let inst = &*(extract_ptr(obj_val) as *const RustInstance);
+                let inst_ptr = extract_ptr(obj_val);
+                let inst = &*(inst_ptr as *const RustInstance);
                 return is_subtype_of(inst.class, target_tp);
             }
         }
@@ -4053,13 +4747,49 @@ unsafe extern "C" fn builtin_next(
     _self: *mut RawPyObject, args: *mut RawPyObject,
 ) -> *mut RawPyObject {
     let obj = crate::types::tuple::PyTuple_GetItem(args, 0);
-    let tp = (*obj).ob_type;
-    if !tp.is_null() {
-        if let Some(tp_iternext) = (*tp).tp_iternext {
-            return tp_iternext(obj);
+
+    // Check for generator markers (negative int with low bits 0)
+    if is_int(obj) {
+        let val = get_int_value(obj);
+        if is_generator_marker(val) {
+            let gen_ptr = (-val) as usize as *mut RustGenerator;
+            let gen = &mut *gen_ptr;
+            if gen.exhausted {
+                // Set StopIteration and return NULL
+                crate::runtime::error::PyErr_SetNone(
+                    *crate::runtime::error::PyExc_StopIteration.get(),
+                );
+                return std::ptr::null_mut();
+            }
+            crate::runtime::gil::Python::with_gil(|py| {
+                match resume_generator(py, gen) {
+                    GeneratorResult::Yielded(value) => {
+                        let raw = value.as_raw();
+                        (*raw).incref();
+                        std::mem::forget(value);
+                        raw
+                    }
+                    GeneratorResult::Returned => {
+                        gen.exhausted = true;
+                        crate::runtime::error::PyErr_SetNone(
+                            *crate::runtime::error::PyExc_StopIteration.get(),
+                        );
+                        std::ptr::null_mut()
+                    }
+                }
+            })
+        } else {
+            return_none()
         }
+    } else {
+        let tp = (*obj).ob_type;
+        if !tp.is_null() {
+            if let Some(tp_iternext) = (*tp).tp_iternext {
+                return tp_iternext(obj);
+            }
+        }
+        return_none()
     }
-    return_none()
 }
 
 unsafe extern "C" fn builtin_list_ctor(
@@ -5126,4 +5856,32 @@ fn format_pyobj(raw: *mut RawPyObject) -> String {
             format!("<object at {:?}>", raw)
         }
     }
+}
+
+// ─── C→VM Bridge ───
+// When C extension code calls back into Python methods on mixed C/VM types,
+// we need a trampoline that re-enters the VM eval loop.
+
+/// Execute a VM function from a C code callback.
+/// `func_ptr` is the raw pointer to a RustFunction (the function marker value).
+/// `args` includes self as the first element.
+pub fn execute_vm_function(
+    func_ptr: usize,
+    args: &[PyObjectRef],
+) -> PyResult {
+    use crate::runtime::gil::Python;
+
+    // GIL is already held (we're being called from C code which is in the VM).
+    // Python::with_gil is reentrant (depth counter), so this is safe.
+    Python::with_gil(|py| {
+        let rust_func = unsafe { &*(func_ptr as *const RustFunction) };
+        let mut vm = VM::new();
+        let dummy_frame = Frame::new(
+            crate::compiler::bytecode::CodeObject::new(
+                "<c-callback>".to_string(),
+                "<c-callback>".to_string(),
+            ),
+        );
+        vm.call_rust_function(py, &dummy_frame, rust_func, args, &HashMap::new())
+    })
 }

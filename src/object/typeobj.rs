@@ -570,6 +570,189 @@ pub unsafe fn is_type_object(obj: *mut RawPyObject) -> bool {
     false
 }
 
+/// Walk tp_dict and tp_bases recursively to find a name (MRO-like lookup).
+/// Returns a borrowed reference (not incref'd) or null.
+unsafe fn mro_lookup(tp: *mut RawPyTypeObject, name: *mut RawPyObject) -> *mut RawPyObject {
+    if tp.is_null() { return ptr::null_mut(); }
+    // Check own tp_dict
+    let dict = (*tp).tp_dict;
+    if !dict.is_null() {
+        let result = crate::types::dict::PyDict_GetItem(dict, name);
+        if !result.is_null() {
+            return result;
+        }
+    }
+    // Walk tp_bases tuple (multiple inheritance)
+    let bases = (*tp).tp_bases;
+    if !bases.is_null() && crate::types::tuple::PyTuple_Check(bases) != 0 {
+        let n = crate::types::tuple::PyTuple_Size(bases);
+        for i in 0..n {
+            let base = crate::types::tuple::PyTuple_GetItem(bases, i) as *mut RawPyTypeObject;
+            if !base.is_null() {
+                let result = mro_lookup(base, name);
+                if !result.is_null() {
+                    return result;
+                }
+            }
+        }
+    } else if !(*tp).tp_base.is_null() {
+        // Fallback: walk single tp_base chain
+        return mro_lookup((*tp).tp_base, name);
+    }
+    ptr::null_mut()
+}
+
+// ─── VM Method Trampoline ───
+// When C code calls a Python method on a mixed C/VM type (e.g., CSafeLoader.resolve()),
+// PyObject_GenericGetAttr finds a VM function marker in tp_dict. C code can't call a
+// tagged int, so we wrap it in a PyCFunction trampoline that re-enters the VM.
+
+/// VM method trampoline — PyCFunction (METH_VARARGS) that bridges C→VM calls.
+/// ml_self = PyCapsule containing the RustFunction raw pointer.
+/// args = tuple of (self, arg1, ...) — self already prepended by method_call.
+unsafe extern "C" fn vm_method_trampoline(
+    capsule: *mut RawPyObject,
+    args: *mut RawPyObject,
+) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("vm_method_trampoline", || unsafe {
+        // Extract function pointer from capsule
+        let func_ptr = crate::types::capsule::PyCapsule_GetPointer(
+            capsule,
+            ptr::null(),
+        ) as usize;
+        if func_ptr == 0 {
+            return ptr::null_mut();
+        }
+
+        // Convert args tuple to Vec<PyObjectRef>
+        let nargs = crate::types::tuple::PyTuple_Size(args);
+        let mut arg_vec: Vec<crate::object::pyobject::PyObjectRef> =
+            Vec::with_capacity(nargs as usize);
+        for i in 0..nargs {
+            let item = crate::types::tuple::PyTuple_GetItem(args, i);
+            (*item).incref();
+            arg_vec.push(crate::object::pyobject::PyObjectRef::from_raw(item));
+        }
+
+        // Execute via VM bridge
+        match crate::vm::interpreter::execute_vm_function(func_ptr, &arg_vec) {
+            Ok(result) => {
+                let raw = result.as_raw();
+                (*raw).incref();
+                std::mem::forget(result);
+                raw
+            }
+            Err(err) => {
+                // Restore exception into CPython error state
+                err.restore();
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Create a bound method wrapping a VM function marker for C code to call.
+/// Returns a PyMethod(PyCFunction(trampoline), instance).
+unsafe fn create_vm_bound_method(
+    func_marker_val: i64,
+    instance: *mut RawPyObject,
+) -> *mut RawPyObject {
+    // Strip CLASS_TAG if present (for classmethods, instance should be the class)
+    let raw_ptr = if func_marker_val & (3i64 << 62) != 0 {
+        (func_marker_val & !(3i64 << 62)) as usize
+    } else {
+        func_marker_val as usize
+    };
+
+    // Create a PyCapsule holding the RustFunction pointer
+    let capsule = crate::types::capsule::PyCapsule_New(
+        raw_ptr as *mut c_void,
+        ptr::null(),
+        None,
+    );
+    if capsule.is_null() {
+        return ptr::null_mut();
+    }
+
+    // Create PyCFunction with the trampoline
+    let func = crate::types::funcobject::create_cfunction(
+        b"<vm-method>\0".as_ptr() as *const c_char,
+        Some(vm_method_trampoline),
+        METH_VARARGS,
+        capsule,
+    );
+    (*capsule).decref(); // create_cfunction increfs ml_self
+
+    if func.is_null() {
+        return ptr::null_mut();
+    }
+
+    // Wrap in a bound method: method_call will prepend self to args
+    let method = crate::ffi::object_api::PyMethod_New(func, instance);
+    (*func).decref(); // PyMethod_New increfs im_func
+
+    method
+}
+
+/// Check if a raw PyObject is a VM function marker (a PyLong with value > 4096).
+#[inline]
+unsafe fn is_vm_function_marker(obj: *mut RawPyObject) -> bool {
+    if obj.is_null() { return false; }
+    if !crate::object::safe_api::is_int(obj) { return false; }
+    let val = crate::object::safe_api::get_int_value(obj);
+    // Regular function marker or classmethod marker
+    val > 4096 && (val & (3i64 << 62) == 0) || (val & (3i64 << 62) == (1i64 << 62))
+}
+
+/// tp_init for VM-defined types. When C code creates a VM type instance via type_call,
+/// this looks up __init__ in tp_dict and calls it through the VM trampoline.
+pub unsafe extern "C" fn vm_tp_init(
+    self_obj: *mut RawPyObject,
+    args: *mut RawPyObject,
+    _kwargs: *mut RawPyObject,
+) -> c_int {
+    crate::ffi::panic_guard::guard_int("vm_tp_init", || unsafe {
+        let tp = (*self_obj).ob_type;
+        if tp.is_null() { return 0; }
+
+        // Find __init__ in the type's MRO
+        let init_name = crate::types::unicode::PyUnicode_InternFromString(
+            b"__init__\0".as_ptr() as *const c_char,
+        );
+        let init_func = mro_lookup(tp, init_name);
+        if init_func.is_null() { return 0; }
+        if !is_vm_function_marker(init_func) { return 0; }
+
+        let marker_val = crate::object::safe_api::get_int_value(init_func);
+        let raw_ptr = if marker_val & (3i64 << 62) != 0 {
+            (marker_val & !(3i64 << 62)) as usize
+        } else {
+            marker_val as usize
+        };
+
+        // Build args: (self, *args)
+        let nargs = if args.is_null() { 0 }
+            else { crate::types::tuple::PyTuple_Size(args) };
+        let mut arg_vec: Vec<crate::object::pyobject::PyObjectRef> =
+            Vec::with_capacity((nargs + 1) as usize);
+        (*self_obj).incref();
+        arg_vec.push(crate::object::pyobject::PyObjectRef::from_raw(self_obj));
+        for i in 0..nargs {
+            let item = crate::types::tuple::PyTuple_GetItem(args, i);
+            (*item).incref();
+            arg_vec.push(crate::object::pyobject::PyObjectRef::from_raw(item));
+        }
+
+        match crate::vm::interpreter::execute_vm_function(raw_ptr, &arg_vec) {
+            Ok(_) => 0,
+            Err(err) => {
+                err.restore();
+                -1
+            }
+        }
+    })
+}
+
 /// PyObject_GenericGetAttr — look up attribute in type's tp_dict.
 #[no_mangle]
 pub unsafe extern "C" fn PyObject_GenericGetAttr(
@@ -588,27 +771,11 @@ pub unsafe extern "C" fn PyObject_GenericGetAttr(
         // If obj IS a type object, search its own tp_dict and MRO
         if is_type_object(obj) {
             let type_obj = obj as *mut RawPyTypeObject;
-            // Search own tp_dict
-            let dict = (*type_obj).tp_dict;
-            if !dict.is_null() {
-                let result = crate::types::dict::PyDict_GetItem(dict, name);
-                if !result.is_null() {
-                    (*result).incref();
-                    return result;
-                }
-            }
-            // Walk tp_base chain of the type itself
-            let mut base = (*type_obj).tp_base;
-            while !base.is_null() {
-                let bdict = (*base).tp_dict;
-                if !bdict.is_null() {
-                    let result = crate::types::dict::PyDict_GetItem(bdict, name);
-                    if !result.is_null() {
-                        (*result).incref();
-                        return result;
-                    }
-                }
-                base = (*base).tp_base;
+            // Use mro_lookup to support multiple inheritance
+            let result = mro_lookup(type_obj, name);
+            if !result.is_null() {
+                (*result).incref();
+                return result;
             }
             // Debug trace
             if std::env::var("RUSTTHON_TRACE").is_ok() {
@@ -619,8 +786,9 @@ pub unsafe extern "C" fn PyObject_GenericGetAttr(
                 let self_name = if !(*type_obj).tp_name.is_null() {
                     std::ffi::CStr::from_ptr((*type_obj).tp_name).to_string_lossy().into_owned()
                 } else { "(null)".to_string() };
-                let dict_size = if !dict.is_null() {
-                    crate::types::dict::PyDict_Size(dict)
+                let tp_dict = (*type_obj).tp_dict;
+                let dict_size = if !tp_dict.is_null() {
+                    crate::types::dict::PyDict_Size(tp_dict)
                 } else { -1 };
                 eprintln!("[rustthon] GenericGetAttr(type): '{}' NOT FOUND on '{}' (dict_size={}, tp_base={:p})",
                     attr, self_name, dict_size, (*type_obj).tp_base);
@@ -658,22 +826,17 @@ pub unsafe extern "C" fn PyObject_GenericGetAttr(
         }
 
         // Then check the type's tp_dict and base chain (with descriptor protocol)
-        let mut descr: *mut RawPyObject = ptr::null_mut();
-        let dict = (*tp).tp_dict;
-        if !dict.is_null() {
-            descr = crate::types::dict::PyDict_GetItem(dict, name);
-        }
-        if descr.is_null() {
-            let mut base = (*tp).tp_base;
-            while !base.is_null() && descr.is_null() {
-                let bdict = (*base).tp_dict;
-                if !bdict.is_null() {
-                    descr = crate::types::dict::PyDict_GetItem(bdict, name);
-                }
-                base = (*base).tp_base;
-            }
-        }
+        // Uses mro_lookup to support multiple inheritance via tp_bases
+        let descr = mro_lookup(tp, name);
         if !descr.is_null() {
+            // VM function marker: create a bound method trampoline for C code
+            if is_vm_function_marker(descr) {
+                let marker_val = crate::object::safe_api::get_int_value(descr);
+                let method = create_vm_bound_method(marker_val, obj);
+                if !method.is_null() {
+                    return method;
+                }
+            }
             // Descriptor protocol: check if the found object has tp_descr_get
             let descr_tp = (*descr).ob_type;
             if !descr_tp.is_null() {
@@ -1474,6 +1637,14 @@ pub static PyCFunction_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::n
 pub static PyMethod_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
     let mut tp = RawPyTypeObject::zeroed();
     tp.tp_name = b"method\0".as_ptr() as *const _;
+    tp.tp_basicsize = 0;
+    tp
+});
+
+/// PyGenerator_Type — type object for generators (used by isinstance check).
+pub static PyGenerator_Type: SyncUnsafeCell<RawPyTypeObject> = SyncUnsafeCell::new({
+    let mut tp = RawPyTypeObject::zeroed();
+    tp.tp_name = b"generator\0".as_ptr() as *const _;
     tp.tp_basicsize = 0;
     tp
 });

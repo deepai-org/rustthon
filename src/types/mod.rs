@@ -82,6 +82,15 @@ pub fn init_types() {
 
         // 6. Initialize method type
         crate::ffi::object_api::init_method_type();
+
+        // 7. Initialize generator type (for isinstance checks)
+        {
+            let tp = crate::object::typeobj::PyGenerator_Type.get();
+            (*tp).ob_base.ob_type = crate::object::typeobj::PyType_Type.get();
+            (*tp).ob_base.ob_refcnt = std::sync::atomic::AtomicIsize::new(isize::MAX / 2);
+            (*tp).tp_flags = crate::object::typeobj::PY_TPFLAGS_DEFAULT
+                | crate::object::typeobj::PY_TPFLAGS_READY;
+        }
     }
 
     // Touch singletons to force lazy initialization

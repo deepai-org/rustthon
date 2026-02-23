@@ -1365,7 +1365,9 @@ impl<'py> Compiler<'py> {
         for alias in &import.names {
             let module_name = alias.name.to_string();
             let name_idx = self.code().add_name(&module_name);
-            self.emit(OpCode::ImportName, name_idx);
+            // Set high bit (bit 31) to signal "return top-level module for dotted names"
+            let flag = if module_name.contains('.') { 1u32 << 31 } else { 0 };
+            self.emit(OpCode::ImportName, name_idx | flag);
             let store_name = if let Some(ref asname) = alias.asname {
                 asname.to_string()
             } else {
