@@ -155,3 +155,12 @@ pub unsafe extern "C" fn PyTraceBack_Here(
         0
     })
 }
+
+/// PyTraceBack_Print — print traceback to file. No-op stub.
+#[no_mangle]
+pub unsafe extern "C" fn PyTraceBack_Print(
+    _tb: *mut RawPyObject,
+    _f: *mut std::os::raw::c_void,
+) -> c_int {
+    0
+}

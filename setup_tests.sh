@@ -48,9 +48,9 @@ if [ ! -d .venv311 ]; then
 else
     ok ".venv311 already exists"
 fi
-.venv311/bin/pip install --quiet pyyaml==6.0.2 cython 2>/dev/null || \
-    .venv311/bin/pip install pyyaml cython
-ok "pyyaml + cython installed"
+.venv311/bin/pip install --quiet pyyaml==6.0.2 cython markupsafe 2>/dev/null || \
+    .venv311/bin/pip install pyyaml cython markupsafe
+ok "pyyaml + cython + markupsafe installed"
 
 # ─── Step 4: Download and extract prebuilt wheels ───
 step "Downloading prebuilt pip wheels"
@@ -60,9 +60,9 @@ mkdir -p "$PREBUILT_DIR"
 # ujson prebuilt wheel
 if [ ! -f "$PREBUILT_DIR/ujson.cpython-311-darwin.so" ]; then
     WHEEL_DIR=$(mktemp -d)
-    pip download --quiet --no-deps --python-version 3.11 --platform macosx_11_0_arm64 \
+    .venv311/bin/pip download --quiet --no-deps --python-version 3.11 --platform macosx_11_0_arm64 \
         --only-binary :all: ujson==5.10.0 -d "$WHEEL_DIR" 2>/dev/null || \
-    pip download --no-deps --python-version 3.11 --platform macosx_11_0_arm64 \
+    .venv311/bin/pip download --no-deps --python-version 3.11 --platform macosx_11_0_arm64 \
         --only-binary :all: "ujson>=5.0" -d "$WHEEL_DIR"
     WHEEL=$(ls "$WHEEL_DIR"/ujson*.whl 2>/dev/null | head -1)
     if [ -n "$WHEEL" ]; then
@@ -79,9 +79,9 @@ fi
 # markupsafe prebuilt wheel
 if [ ! -d "$PREBUILT_DIR/markupsafe" ]; then
     WHEEL_DIR=$(mktemp -d)
-    pip download --quiet --no-deps --python-version 3.11 --platform macosx_10_12_universal2 \
+    .venv311/bin/pip download --quiet --no-deps --python-version 3.11 --platform macosx_10_12_universal2 \
         --only-binary :all: MarkupSafe==3.0.2 -d "$WHEEL_DIR" 2>/dev/null || \
-    pip download --no-deps --python-version 3.11 --platform macosx_10_12_universal2 \
+    .venv311/bin/pip download --no-deps --python-version 3.11 --platform macosx_10_12_universal2 \
         --only-binary :all: "MarkupSafe>=3.0" -d "$WHEEL_DIR"
     WHEEL=$(ls "$WHEEL_DIR"/MarkupSafe*.whl 2>/dev/null | head -1)
     if [ -n "$WHEEL" ]; then
@@ -128,10 +128,11 @@ fi
 step "Compiling Cython hello extension"
 if [ ! -f test_cython/hello.cpython-311-darwin.so ]; then
     if [ -f test_cython/hello.c ]; then
-        cc -shared -fPIC -o test_cython/hello.cpython-311-darwin.so \
+        PYINC=$(.venv311/bin/python3 -c "import sysconfig; print(sysconfig.get_path('include'))" 2>/dev/null || echo "")
+        cc -shared -fPIC -DCYTHON_COMPRESS_STRINGS=0 \
+            -o test_cython/hello.cpython-311-darwin.so \
             test_cython/hello.c \
-            -I include $LINK \
-            $(.venv311/bin/python3 -c "import sysconfig; print('-I ' + sysconfig.get_path('include'))" 2>/dev/null || echo "") \
+            ${PYINC:+-I "$PYINC"} -I include $LINK \
             2>/dev/null && ok "hello.cpython-311-darwin.so" || fail "hello.cpython-311-darwin.so"
     else
         fail "test_cython/hello.c not found"
@@ -154,7 +155,7 @@ if [ ! -f "$YAML_SO" ]; then
     else
         # Download pyyaml wheel and extract
         WHEEL_DIR=$(mktemp -d)
-        pip download --quiet --no-deps --python-version 3.11 --platform macosx_11_0_arm64 \
+        .venv311/bin/pip download --quiet --no-deps --python-version 3.11 --platform macosx_11_0_arm64 \
             --only-binary :all: PyYAML==6.0.2 -d "$WHEEL_DIR" 2>/dev/null || true
         WHEEL=$(ls "$WHEEL_DIR"/PyYAML*.whl 2>/dev/null | head -1)
         if [ -n "$WHEEL" ]; then
@@ -178,7 +179,7 @@ if [ -f test_bcrypt/bcrypt_pkg/bcrypt/_bcrypt.abi3.so ]; then
 else
     mkdir -p test_bcrypt/bcrypt_pkg/bcrypt
     WHEEL_DIR=$(mktemp -d)
-    pip download --quiet --no-deps --python-version 3.11 --platform macosx_10_12_universal2 \
+    .venv311/bin/pip download --quiet --no-deps --python-version 3.11 --platform macosx_10_12_universal2 \
         --only-binary :all: bcrypt -d "$WHEEL_DIR" 2>/dev/null || true
     WHEEL=$(ls "$WHEEL_DIR"/bcrypt*.whl 2>/dev/null | head -1)
     if [ -n "$WHEEL" ]; then

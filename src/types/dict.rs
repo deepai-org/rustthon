@@ -551,6 +551,33 @@ pub unsafe extern "C" fn PyDict_DelItemString(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn _PyDict_Pop(
+    dict: *mut RawPyObject,
+    key: *mut RawPyObject,
+    deflt: *mut RawPyObject,
+) -> *mut RawPyObject {
+    crate::ffi::panic_guard::guard_ptr("_PyDict_Pop", || unsafe {
+        if dict.is_null() || key.is_null() { return deflt; }
+        let d = dict as *mut PyDictObject;
+        let hash = hash_object(key);
+        let ix = lookup_key((*d).ma_keys, hash, key);
+        if ix < 0 {
+            // Key not found — return default (with incref)
+            if !deflt.is_null() { (*deflt).incref(); }
+            return deflt;
+        }
+        // Get the value before removing
+        let keys = (*d).ma_keys;
+        let entry_ptr = dk_entries(keys).add(ix as usize);
+        let value = (*entry_ptr).me_value;
+        if !value.is_null() { (*value).incref(); }
+        // Remove the entry
+        PyDict_DelItem(dict, key);
+        value
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn PyDict_Contains(
     dict: *mut RawPyObject,
     key: *mut RawPyObject,

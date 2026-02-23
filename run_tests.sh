@@ -48,7 +48,7 @@ run_suite() {
 
     # Extract the results line (look for PASS/FAIL counts)
     local results
-    results=$(echo "$output" | grep -iE '(results:|Total:|PASS|ALL.*PASS)' | tail -3)
+    results=$(echo "$output" | grep -iE '(results:|Total:|PASS|ALL.*PASS)' | tail -3 || true)
 
     if [ $exit_code -eq 0 ]; then
         PASSED_SUITES=$((PASSED_SUITES + 1))
@@ -151,8 +151,12 @@ run_suite "Phase 3: Custom C Extension Module" ./test_ext_driver
 # Phase 3a: markupsafe (compiled against Rustthon headers)
 run_suite "Phase 3a: markupsafe (Rustthon-compiled)" ./test_markupsafe
 
-# Phase 3b: ujson (compiled against Rustthon headers)
-run_suite "Phase 3b: ujson (Rustthon-compiled)" ./test_ujson
+# Phase 3b: ujson (compiled against Rustthon headers) — requires manually compiled _ujson.dylib
+if [ -f _ujson.dylib ]; then
+    run_suite "Phase 3b: ujson (Rustthon-compiled)" ./test_ujson
+else
+    printf "${YELLOW}[--] Phase 3b: ujson (Rustthon-compiled) — SKIPPED (no _ujson.dylib)${RESET}\n\n"
+fi
 
 # Phase 4: Prebuilt CPython 3.11 wheels
 run_suite "Phase 4: Prebuilt CPython 3.11 Wheels" ./test_prebuilt
